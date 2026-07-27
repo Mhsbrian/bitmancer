@@ -1,0 +1,55 @@
+[package]
+name = "bitmancer"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal client for the BitChat mesh and its geohash location channels."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "bitmancer"
+path = "src/main.rs"
+
+[dependencies]
+# Dependencies for all platforms
+ratatui = { version = "0.26.2", features = ["all-widgets"] }
+crossterm = "0.27.0"
+tui-input = "0.8.0"
+futures-util = "0.3.30"
+regex = "1"
+strip-ansi-escapes = "0.2"
+tokio = { version = "1", features = ["full", "process"] }
+btleplug = "0.11"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+sha2 = "0.10"
+hkdf = "0.12"
+pbkdf2 = "0.12"
+futures = "0.3"
+flate2 = "1.0"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+getrandom = "0.2"
+thiserror = "1.0"
+
+# For Cryptography
+x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+aes-gcm = { version = "0.10", features = ["aes"] }
+curve25519-dalek = "4.1.1"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+generic-array = "0.14"
+secp256k1 = { version = "0.31.1", features = ["std", "rand", "global-context"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
+unicode-width = "0.2.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+base64 = "0.23.0"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls", "rustls-webpki-roots", "gzip"] }
+
+# Platform-specific dependencies for Linux builds
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = { version = "0.9", features = ["vendored"] } 

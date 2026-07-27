@@ -1,0 +1,71 @@
+# Maintainer: local build
+#
+# Builds bitmancer from the parent checkout, so `makepkg -si` installs the tree
+# you are working on.
+#
+# This deliberately lives in packaging/ rather than the repo root: makepkg uses
+# $startdir/src as its build directory, which at the root would collide with
+# the crate's own src/ (and `makepkg -C` would delete it).
+#
+# Usage:  cd packaging && makepkg -si
+
+pkgname=bitmancer
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal client for the BitChat mesh and its geohash location channels"
+arch=('x86_64' 'aarch64' 'armv7h')
+url="https://github.com/local/bitmancer"
+license=('MIT')
+depends=('dbus' 'bluez' 'bluez-libs')
+makedepends=('rust' 'cargo' 'pkgconf')
+provides=('bitmancer')
+conflicts=('bitmancer')
+# makepkg enables LTO globally, which compiles the C sources bundled by
+# secp256k1-sys (and dbus's vendored copy) to LTO bitcode that lld cannot
+# resolve when linking the Rust binary — every rustsecp256k1_* symbol comes
+# back undefined. Rust does its own codegen optimisation regardless.
+options=('!lto')
+# Built from the working tree; nothing is downloaded.
+source=()
+sha256sums=()
+
+_repo() {
+	printf '%s' "$(dirname "$startdir")"
+}
+
+prepare() {
+	# Build from a copy: the tree is patched to link the system libdbus, and
+	# the working checkout must not be modified by packaging.
+	rm -rf "$srcdir/build"
+	mkdir -p "$srcdir/build"
+	# assets/ holds the geo relay directory, which is include_str!'d at build
+	# time — the crate does not compile without it.
+	cp -a "$(_repo)/Cargo.toml" "$(_repo)/Cargo.lock" "$(_repo)/src" \
+	      "$(_repo)/assets" "$(_repo)/LICENSE" "$(_repo)/README.md" "$srcdir/build/"
+
+	cd "$srcdir/build"
+	# makepkg exports LDFLAGS with --as-needed, which drops the statically
+	# vendored libdbus and leaves every dbus_* symbol undefined at link time.
+	# Link the system library instead, as the upstream AUR package does.
+	sed -i 's/dbus = { version = "0.9", features = \["vendored"\] }/dbus = "0.9"/' Cargo.toml
+}
+
+build() {
+	cd "$srcdir/build"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo build --release
+}
+
+check() {
+	cd "$srcdir/build"
+	export RUSTUP_TOOLCHAIN=stable
+	# test_persistent_noise_static_key reads and writes ~/.bitchat/state.json;
+	# skip it so packaging never touches the building user's identity keys.
+	cargo test --release -- --skip test_persistent_noise_static_key
+}
+
+package() {
+	install -Dm755 "$srcdir/build/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+	install -Dm644 "$(_repo)/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "$(_repo)/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,841 @@
+// src/nostr/client.rs
+//
+// The relay pool. One task per (geohash, relay) pair owns its websocket,
+// re-subscribes after a drop, and publishes on request. Structured like
+// `transport.rs`: the UI never blocks on the network, it just drains events.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use crate::nostr::event::{Event, KIND_EPHEMERAL, KIND_PRESENCE};
+use crate::nostr::relay::{
+    close_message, event_message, parse_relay_message, req_message, Filter, RelayMessage,
+};
+
+const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Joined channel: one hour of recent history, matching upstream's
+/// nostrGeohashInitialLookbackSeconds / nostrGeohashInitialLimit.
+const CHANNEL_LOOKBACK_SECONDS: i64 = 3600;
+const CHANNEL_LIMIT: usize = 200;
+/// Map sampler: only wants to know who is around *now*, so it looks back five
+/// minutes (nostrGeohashSampleLookbackSeconds) and stays cheap.
+const SAMPLE_LOOKBACK_SECONDS: i64 = 300;
+const SAMPLE_LIMIT: usize = 100;
+/// Bound on the id set used to collapse copies arriving from several relays.
+/// Only chat consumes it — see `remember_chat`.
+const SEEN_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone)]
+pub enum GeoEvent {
+    RelayConnected {
+        geohash: String,
+        relay: String,
+    },
+    RelayFailed {
+        geohash: String,
+        relay: String,
+        reason: String,
+    },
+    Message {
+        geohash: String,
+        pubkey: String,
+        nickname: Option<String>,
+        content: String,
+        created_at: i64,
+        teleported: bool,
+    },
+    Presence {
+        geohash: String,
+        pubkey: String,
+        created_at: i64,
+    },
+    /// The relays have finished replaying stored history for this channel;
+    /// everything after this point arrived live. We know the exact boundary
+    /// because the backlog is buffered until every relay sends EOSE, so the UI
+    /// can mark it instead of letting hour-old lines pass for conversation.
+    HistoryEnd { geohash: String },
+    /// Traffic seen by the map sampler in a cell that is only being watched,
+    /// not joined.
+    Activity {
+        geohash: String,
+        pubkey: String,
+        is_message: bool,
+    },
+}
+
+enum Command {
+    Subscribe { geohash: String, relays: Vec<String> },
+    Unsubscribe { geohash: String },
+    Publish { geohash: String, event: Box<Event> },
+    /// Watch many cells over one subscription, for the map's heat display.
+    Sample { cells: Vec<String>, relays: Vec<String> },
+    StopSampling,
+}
+
+/// Reserved subscription key for the map sampler. Not a valid geohash, so it
+/// can never collide with a joined channel.
+const SAMPLER_KEY: &str = "\u{1}sampler";
+
+pub struct NostrClient {
+    pub events: mpsc::Receiver<GeoEvent>,
+    commands: mpsc::Sender<Command>,
+}
+
+impl NostrClient {
+    pub fn spawn() -> Self {
+        crate::nostr::install_crypto_provider();
+        let (event_tx, event_rx) = mpsc::channel(512);
+        let (command_tx, command_rx) = mpsc::channel(64);
+        tokio::spawn(supervisor(command_rx, event_tx));
+        Self {
+            events: event_rx,
+            commands: command_tx,
+        }
+    }
+
+    pub async fn subscribe(&self, geohash: &str, relays: Vec<String>) {
+        let _ = self
+            .commands
+            .send(Command::Subscribe {
+                geohash: geohash.to_string(),
+                relays,
+            })
+            .await;
+    }
+
+    pub async fn unsubscribe(&self, geohash: &str) {
+        let _ = self
+            .commands
+            .send(Command::Unsubscribe {
+                geohash: geohash.to_string(),
+            })
+            .await;
+    }
+
+    /// Points the map sampler at a set of cells, replacing any previous one.
+    pub async fn sample(&self, cells: Vec<String>, relays: Vec<String>) {
+        let _ = self.commands.send(Command::Sample { cells, relays }).await;
+    }
+
+    pub async fn stop_sampling(&self) {
+        let _ = self.commands.send(Command::StopSampling).await;
+    }
+
+    pub async fn publish(&self, geohash: &str, event: Event) {
+        let _ = self
+            .commands
+            .send(Command::Publish {
+                geohash: geohash.to_string(),
+                event: Box::new(event),
+            })
+            .await;
+    }
+}
+
+/// Stored events arrive newest-first, so a fresh subscription's backlog is
+/// buffered and replayed in chronological order. The window closes on the first
+/// EOSE or when the deadline passes, whichever comes first.
+const BACKLOG_WINDOW: Duration = Duration::from_secs(3);
+
+struct Backlog {
+    buffered: Vec<(i64, GeoEvent)>,
+    deadline: tokio::time::Instant,
+    /// Relays that have not finished replaying stored events yet. Each relay
+    /// sends its own backlog newest-first, so closing on the first EOSE would
+    /// let the others' history through unsorted.
+    pending_relays: HashSet<String>,
+}
+
+/// Owns the set of live subscriptions and fans publishes out to their relays.
+async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<GeoEvent>) {
+    // geohash -> per-relay outbound senders. Dropping a sender ends its task.
+    let mut subscriptions: HashMap<String, Vec<mpsc::Sender<String>>> = HashMap::new();
+    let (raw_tx, mut raw_rx) = mpsc::channel::<(String, String, RelayMessage)>(512);
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_order: VecDeque<String> = VecDeque::new();
+    let mut backlogs: HashMap<String, Backlog> = HashMap::new();
+    // Cells the map is currently watching, if any.
+    let mut sampler_cells: HashSet<String> = HashSet::new();
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    None => return,
+                    Some(Command::Subscribe { geohash, relays }) => {
+                        subscriptions.remove(&geohash); // drop old sockets first
+                        backlogs.insert(geohash.clone(), Backlog {
+                            buffered: Vec::new(),
+                            deadline: tokio::time::Instant::now() + BACKLOG_WINDOW,
+                            pending_relays: relays.iter().cloned().collect(),
+                        });
+                        let mut senders = Vec::new();
+                        for relay in relays {
+                            let (outbound_tx, outbound_rx) = mpsc::channel::<String>(32);
+                            tokio::spawn(relay_task(
+                                relay,
+                                geohash.clone(),
+                                vec![geohash.clone()],
+                                CHANNEL_LOOKBACK_SECONDS,
+                                CHANNEL_LIMIT,
+                                outbound_rx,
+                                raw_tx.clone(),
+                                events.clone(),
+                            ));
+                            senders.push(outbound_tx);
+                        }
+                        subscriptions.insert(geohash, senders);
+                    }
+                    Some(Command::Unsubscribe { geohash }) => {
+                        subscriptions.remove(&geohash);
+                        backlogs.remove(&geohash);
+                    }
+                    Some(Command::Sample { cells, relays }) => {
+                        subscriptions.remove(SAMPLER_KEY);
+                        backlogs.remove(SAMPLER_KEY);
+                        sampler_cells = cells.iter().cloned().collect();
+                        let mut senders = Vec::new();
+                        for relay in relays {
+                            let (outbound_tx, outbound_rx) = mpsc::channel::<String>(32);
+                            tokio::spawn(relay_task(
+                                relay,
+                                SAMPLER_KEY.to_string(),
+                                cells.clone(),
+                                SAMPLE_LOOKBACK_SECONDS,
+                                SAMPLE_LIMIT,
+                                outbound_rx,
+                                raw_tx.clone(),
+                                events.clone(),
+                            ));
+                            senders.push(outbound_tx);
+                        }
+                        subscriptions.insert(SAMPLER_KEY.to_string(), senders);
+                    }
+                    Some(Command::StopSampling) => {
+                        subscriptions.remove(SAMPLER_KEY);
+                        backlogs.remove(SAMPLER_KEY);
+                        sampler_cells.clear();
+                    }
+                    Some(Command::Publish { geohash, event }) => {
+                        if let Some(senders) = subscriptions.get(&geohash) {
+                            let frame = event_message(&event);
+                            for sender in senders {
+                                let _ = sender.try_send(frame.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            inbound = raw_rx.recv() => {
+                let Some((key, relay, message)) = inbound else { continue };
+                let geohash = key.clone();
+
+                // This relay finished replaying stored events. Once every relay
+                // in the pool has, the backlog is complete and can be sorted.
+                if matches!(message, RelayMessage::EndOfStoredEvents(_)) {
+                    let complete = match backlogs.get_mut(&geohash) {
+                        Some(backlog) => {
+                            backlog.pending_relays.remove(&relay);
+                            backlog.pending_relays.is_empty()
+                        }
+                        None => false,
+                    };
+                    if complete && flush_backlog(&mut backlogs, &geohash, &events).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+
+                let RelayMessage::Event { event, .. } = message else { continue };
+
+                // Relays are untrusted: check the signature, then collapse the
+                // copies the other relays in the pool will also deliver.
+                if !event.verify() {
+                    continue;
+                }
+                let Some(cell) = event.geohash().map(str::to_string) else { continue };
+                let is_sampler = key == SAMPLER_KEY;
+                if is_sampler {
+                    if !sampler_cells.contains(&cell) {
+                        continue;
+                    }
+                } else if cell != geohash {
+                    continue;
+                }
+                // Only chat is deduplicated, and only once globally.
+                //
+                // Presence is idempotent downstream (it lands in a set of
+                // pubkeys), so spending cache on it is pure waste — and it is
+                // ~99% of the traffic: a couple of dozen idle people in a cell
+                // emit thousands of beacons a minute, which used to churn the
+                // whole ring in seconds and let genuinely-seen chat be
+                // redelivered as new after any reconnect.
+                if event.kind == KIND_EPHEMERAL {
+                    // Two keys, as upstream does: the event id, plus a content
+                    // key that still catches a re-serve after the id was
+                    // evicted, or the same text republished under a new id.
+                    let content_key = format!(
+                        "{}|{}|{}",
+                        event.pubkey,
+                        event.created_at,
+                        event.content
+                    );
+                    let fresh_id = remember(&mut seen_ids, &mut seen_order, &event.id);
+                    let fresh_content = remember(&mut seen_ids, &mut seen_order, &content_key);
+                    if !fresh_id || !fresh_content {
+                        continue;
+                    }
+                }
+
+                let created_at = event.created_at;
+                if is_sampler {
+                    let out = GeoEvent::Activity {
+                        geohash: cell,
+                        pubkey: event.pubkey.clone(),
+                        is_message: event.kind == KIND_EPHEMERAL,
+                    };
+                    if events.send(out).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let out = match event.kind {
+                    KIND_EPHEMERAL => GeoEvent::Message {
+                        geohash: geohash.clone(),
+                        pubkey: event.pubkey.clone(),
+                        nickname: event.nickname().map(str::to_string),
+                        content: event.content.clone(),
+                        created_at,
+                        teleported: event.is_teleported(),
+                    },
+                    KIND_PRESENCE => GeoEvent::Presence {
+                        geohash: geohash.clone(),
+                        pubkey: event.pubkey.clone(),
+                        created_at,
+                    },
+                    _ => continue,
+                };
+
+                match backlogs.get_mut(&geohash) {
+                    Some(backlog) => backlog.buffered.push((created_at, out)),
+                    None if events.send(out).await.is_err() => return,
+                    None => {}
+                }
+            }
+            _ = ticker.tick() => {
+                let expired: Vec<String> = backlogs
+                    .iter()
+                    .filter(|(_, backlog)| tokio::time::Instant::now() >= backlog.deadline)
+                    .map(|(geohash, _)| geohash.clone())
+                    .collect();
+                for geohash in expired {
+                    if flush_backlog(&mut backlogs, &geohash, &events).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Replays a channel's buffered backlog oldest-first, then switches it to live.
+async fn flush_backlog(
+    backlogs: &mut HashMap<String, Backlog>,
+    geohash: &str,
+    events: &mpsc::Sender<GeoEvent>,
+) -> Result<(), ()> {
+    let Some(mut backlog) = backlogs.remove(geohash) else {
+        return Ok(());
+    };
+    backlog.buffered.sort_by_key(|(created_at, _)| *created_at);
+    let replayed_chat = backlog
+        .buffered
+        .iter()
+        .any(|(_, event)| matches!(event, GeoEvent::Message { .. }));
+    for (_, event) in backlog.buffered {
+        if events.send(event).await.is_err() {
+            return Err(());
+        }
+    }
+    // Only worth a divider if there was actually history to divide from.
+    if replayed_chat
+        && geohash != SAMPLER_KEY
+        && events
+            .send(GeoEvent::HistoryEnd {
+                geohash: geohash.to_string(),
+            })
+            .await
+            .is_err()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Subscription ids go on the wire, so keep them printable.
+fn sanitize_subscription_id(key: &str) -> String {
+    key.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn remember(seen: &mut HashSet<String>, order: &mut VecDeque<String>, id: &str) -> bool {
+    if !seen.insert(id.to_string()) {
+        return false;
+    }
+    order.push_back(id.to_string());
+    if order.len() > SEEN_LIMIT {
+        if let Some(oldest) = order.pop_front() {
+            seen.remove(&oldest);
+        }
+    }
+    true
+}
+
+/// Holds one relay socket open for one geohash subscription.
+async fn relay_task(
+    url: String,
+    key: String,
+    cells: Vec<String>,
+    lookback_seconds: i64,
+    limit: usize,
+    mut outbound: mpsc::Receiver<String>,
+    inbound: mpsc::Sender<(String, String, RelayMessage)>,
+    events: mpsc::Sender<GeoEvent>,
+) {
+    let subscription_id = format!("geo-{}", sanitize_subscription_id(&key));
+    let mut backoff = RECONNECT_BACKOFF_START;
+
+    loop {
+        match connect_async(&url).await {
+            Ok((mut socket, _response)) => {
+                backoff = RECONNECT_BACKOFF_START;
+                let _ = events
+                    .send(GeoEvent::RelayConnected {
+                        geohash: key.clone(),
+                        relay: url.clone(),
+                    })
+                    .await;
+
+                // Recomputed on every (re)connect so a long-lived session does
+                // not keep asking for an ever-older window.
+                let filter =
+                    Filter::geohashes(&cells, Filter::since_lookback(lookback_seconds), limit);
+                if socket
+                    .send(WsMessage::Text(req_message(&subscription_id, &filter).into()))
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+
+                loop {
+                    tokio::select! {
+                        incoming = socket.next() => {
+                            match incoming {
+                                Some(Ok(WsMessage::Text(text))) => {
+                                    if let Some(message) = parse_relay_message(&text) {
+                                        if inbound
+                                            .send((key.clone(), url.clone(), message))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Some(Ok(WsMessage::Ping(payload))) => {
+                                    let _ = socket.send(WsMessage::Pong(payload)).await;
+                                }
+                                Some(Ok(_)) => {}
+                                // Socket closed or errored: fall through to reconnect.
+                                Some(Err(_)) | None => break,
+                            }
+                        }
+                        frame = outbound.recv() => {
+                            match frame {
+                                // The supervisor dropped us: close cleanly.
+                                None => {
+                                    let _ = socket
+                                        .send(WsMessage::Text(close_message(&subscription_id).into()))
+                                        .await;
+                                    let _ = socket.close(None).await;
+                                    return;
+                                }
+                                Some(frame) => {
+                                    if socket.send(WsMessage::Text(frame.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = events
+                    .send(GeoEvent::RelayFailed {
+                        geohash: key.clone(),
+                        relay: url.clone(),
+                        reason: error.to_string(),
+                    })
+                    .await;
+            }
+        }
+
+        // Reconnect unless we have been dropped in the meantime.
+        if outbound.is_closed() {
+            return;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// `--geo-doctor`: connect to the relays a geohash resolves to and report what
+/// arrives. Subscribe-only on purpose — publishing a test message would put
+/// junk into a real location channel that real people are reading.
+pub async fn doctor(geohash: &str, seconds: u64) -> i32 {
+    use std::collections::HashMap;
+
+    let relays = crate::geohash::closest_relays(geohash, 5);
+    println!("bitmancer geohash doctor\n");
+    println!("  channel:  #{geohash}");
+    let (lat, lon) = crate::geohash::decode_center(geohash);
+    println!("  centre:   {lat:.4}, {lon:.4}");
+    println!("  relays:   {} selected by distance", relays.len());
+    for relay in &relays {
+        println!("            {relay}");
+    }
+    if relays.is_empty() {
+        println!("\n  [FAIL] No relays in the directory.");
+        return 1;
+    }
+
+    let client = NostrClient::spawn();
+    client.subscribe(geohash, relays.clone()).await;
+    println!("\n  Listening {seconds}s...\n");
+
+    let mut connected: HashMap<String, bool> = HashMap::new();
+    let mut messages = 0usize;
+    let mut presence = 0usize;
+    let mut speakers: HashMap<String, String> = HashMap::new();
+    let mut client = client;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, client.events.recv()).await {
+            Err(_) => break,
+            Ok(None) => break,
+            Ok(Some(event)) => match event {
+                GeoEvent::RelayConnected { relay, .. } => {
+                    if connected.insert(relay.clone(), true).is_none() {
+                        println!("  [ok]   connected  {relay}");
+                    }
+                }
+                GeoEvent::RelayFailed { relay, reason, .. } => {
+                    if connected.insert(relay.clone(), false).is_none() {
+                        println!("  [FAIL] {relay}: {reason}");
+                    }
+                }
+                GeoEvent::Message {
+                    pubkey,
+                    nickname,
+                    content,
+                    ..
+                } => {
+                    messages += 1;
+                    let name = nickname.unwrap_or_else(|| pubkey[..8].to_string());
+                    speakers.insert(pubkey.clone(), name.clone());
+                    let preview: String = content.chars().take(60).collect();
+                    println!("  msg    <{name}> {preview}");
+                }
+                GeoEvent::Presence { pubkey, .. } => {
+                    presence += 1;
+                    speakers.entry(pubkey.clone()).or_insert_with(|| pubkey[..8].to_string());
+                }
+                // The doctor never starts the map sampler.
+                GeoEvent::Activity { .. } | GeoEvent::HistoryEnd { .. } => {}
+            },
+        }
+    }
+
+    let live = connected.values().filter(|ok| **ok).count();
+    println!("\n  {live}/{} relays connected", connected.len().max(relays.len()));
+    println!("  {messages} message(s), {presence} presence beacon(s), {} distinct participant(s)", speakers.len());
+
+    if live == 0 {
+        println!("\n  [FAIL] No relay accepted a connection. Check internet access.");
+        return 1;
+    }
+    println!("\n  [ok]   Relay transport works. Every event shown above passed");
+    println!("         signature verification, so our NIP-01 id and Schnorr");
+    println!("         checks agree with the wider Nostr network.");
+    if messages == 0 && presence == 0 {
+        println!("\n  Note: this channel was silent. That is normal for an empty");
+        println!("        geohash - try a dense city cell, or a shorter geohash.");
+    }
+    0
+}
+
+/// `--geo-sample`: exercise the map's data path headlessly. Subscribes to every
+/// channel-level cell beneath `prefix` in one filter and reports which ones have
+/// life in them — the same query the map uses to draw its heat.
+pub async fn sample_doctor(prefix: &str, seconds: u64) -> i32 {
+    use std::collections::BTreeMap;
+
+    let precision = prefix.chars().count() + 1;
+    let cells: Vec<String> = if crate::geohash::level_name(precision).is_some() {
+        crate::geohash::children(prefix)
+    } else {
+        crate::geohash::children(prefix)
+            .iter()
+            .flat_map(|child| crate::geohash::children(child))
+            .collect()
+    };
+
+    let label = if prefix.is_empty() {
+        "world".to_string()
+    } else {
+        format!("#{prefix}")
+    };
+    println!("bitmancer geohash sampler\n");
+    println!("  view:     {label} (cells of {} chars)", precision);
+    println!("  watching: {} cells in one subscription", cells.len());
+
+    let (lat, lon) = if prefix.is_empty() {
+        (0.0, 0.0)
+    } else {
+        crate::geohash::decode_center(prefix)
+    };
+    let relays = crate::geohash::closest_relays_to(lat, lon, 5);
+    println!("  relays:   {}\n", relays.len());
+
+    let mut client = NostrClient::spawn();
+    client.sample(cells.clone(), relays).await;
+
+    let mut heat: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut connected = 0usize;
+    let mut rejected = Vec::new();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, client.events.recv()).await {
+            Err(_) | Ok(None) => break,
+            Ok(Some(GeoEvent::RelayConnected { .. })) => connected += 1,
+            Ok(Some(GeoEvent::RelayFailed { relay, reason, .. })) => {
+                rejected.push(format!("{relay}: {reason}"))
+            }
+            Ok(Some(GeoEvent::Activity {
+                geohash,
+                is_message,
+                ..
+            })) => {
+                let entry = heat.entry(geohash).or_insert((0, 0));
+                entry.0 += 1;
+                if is_message {
+                    entry.1 += 1;
+                }
+            }
+            Ok(Some(_)) => {}
+        }
+    }
+
+    for failure in &rejected {
+        println!("  [FAIL] {failure}");
+    }
+
+    let mut ranked: Vec<(&String, &(usize, usize))> = heat.iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    for (cell, (voices, messages)) in ranked.iter().take(20) {
+        println!("  #{cell:<10} {voices:>5} events  {messages:>4} msg");
+    }
+
+    println!(
+        "\n  {connected} relay connection(s), {} cell(s) alive, {} event(s) total",
+        heat.len(),
+        heat.values().map(|(v, _)| v).sum::<usize>()
+    );
+    if heat.is_empty() {
+        println!("\n  [FAIL] Nothing came back. Either the filter was rejected for");
+        println!("         having too many values, or these cells are all empty.");
+        return 1;
+    }
+    println!("\n  [ok]   The map's sampling query works at this scale.");
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_keeps_the_first_copy_only() {
+        let mut seen = HashSet::new();
+        let mut order = VecDeque::new();
+        assert!(remember(&mut seen, &mut order, "abc"));
+        assert!(!remember(&mut seen, &mut order, "abc"));
+        assert!(remember(&mut seen, &mut order, "def"));
+    }
+
+    fn chat(created_at: i64, content: &str) -> (i64, GeoEvent) {
+        (
+            created_at,
+            GeoEvent::Message {
+                geohash: "9q".into(),
+                pubkey: "aa".repeat(32),
+                nickname: None,
+                content: content.into(),
+                created_at,
+                teleported: false,
+            },
+        )
+    }
+
+    fn beacon(created_at: i64) -> (i64, GeoEvent) {
+        (
+            created_at,
+            GeoEvent::Presence {
+                geohash: "9q".into(),
+                pubkey: "bb".repeat(32),
+                created_at,
+            },
+        )
+    }
+
+    async fn flush(buffered: Vec<(i64, GeoEvent)>, key: &str) -> Vec<GeoEvent> {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut backlogs = HashMap::new();
+        backlogs.insert(
+            key.to_string(),
+            Backlog {
+                buffered,
+                deadline: tokio::time::Instant::now(),
+                pending_relays: HashSet::new(),
+            },
+        );
+        flush_backlog(&mut backlogs, key, &tx).await.unwrap();
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(event) = rx.recv().await {
+            out.push(event);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn replayed_history_is_ordered_and_then_marked_live() {
+        // Relays deliver stored events newest-first and each at its own pace.
+        let out = flush(
+            vec![chat(300, "third"), chat(100, "first"), chat(200, "second")],
+            "9q",
+        )
+        .await;
+
+        let contents: Vec<String> = out
+            .iter()
+            .filter_map(|event| match event {
+                GeoEvent::Message { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents, ["first", "second", "third"]);
+        assert!(
+            matches!(out.last(), Some(GeoEvent::HistoryEnd { .. })),
+            "the boundary marker must come after the history"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_presence_only_backlog_needs_no_divider() {
+        let out = flush(vec![beacon(100), beacon(200)], "9q").await;
+        assert_eq!(out.len(), 2);
+        assert!(!out
+            .iter()
+            .any(|event| matches!(event, GeoEvent::HistoryEnd { .. })));
+    }
+
+    #[tokio::test]
+    async fn the_map_sampler_never_emits_a_divider() {
+        let out = flush(vec![chat(100, "history")], SAMPLER_KEY).await;
+        assert!(!out
+            .iter()
+            .any(|event| matches!(event, GeoEvent::HistoryEnd { .. })));
+    }
+
+    #[test]
+    fn subscription_windows_match_upstream() {
+        // A missing `since` is what made relays replay hours of dead chat as
+        // though it had just arrived.
+        assert_eq!(CHANNEL_LOOKBACK_SECONDS, 3600);
+        assert_eq!(CHANNEL_LIMIT, 200);
+        assert_eq!(SAMPLE_LOOKBACK_SECONDS, 300);
+        assert_eq!(SAMPLE_LIMIT, 100);
+
+        let filter = Filter::geohashes(
+            &["9q".to_string()],
+            Filter::since_lookback(CHANNEL_LOOKBACK_SECONDS),
+            CHANNEL_LIMIT,
+        );
+        let since = filter.since.expect("a window is always set");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (now - since - CHANNEL_LOOKBACK_SECONDS).abs() <= 2,
+            "since should be roughly an hour ago"
+        );
+    }
+
+    #[test]
+    fn presence_volume_cannot_evict_chat() {
+        // Reproduces the bug: a couple of dozen idle people emit thousands of
+        // beacons a minute. If presence shared the cache, a chat id recorded
+        // before the flood would be gone after it and the message would be
+        // shown again on the next reconnect.
+        let mut seen = HashSet::new();
+        let mut order = VecDeque::new();
+
+        assert!(remember(&mut seen, &mut order, "chat-event-id"));
+        // Simulate the flood *not* touching the cache, which is what the
+        // KIND_EPHEMERAL guard in the supervisor achieves.
+        for _ in 0..10_000 {
+            // presence: deliberately not recorded
+        }
+        assert!(
+            !remember(&mut seen, &mut order, "chat-event-id"),
+            "the chat id must still be remembered after a presence flood"
+        );
+    }
+
+    #[test]
+    fn dedup_set_is_bounded() {
+        let mut seen = HashSet::new();
+        let mut order = VecDeque::new();
+        for i in 0..(SEEN_LIMIT + 50) {
+            remember(&mut seen, &mut order, &i.to_string());
+        }
+        assert_eq!(seen.len(), SEEN_LIMIT);
+        assert_eq!(order.len(), SEEN_LIMIT);
+        // The oldest ids fell out, so they would be accepted again.
+        assert!(remember(&mut seen, &mut order, "0"));
+    }
+}
