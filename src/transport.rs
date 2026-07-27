@@ -16,12 +16,27 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::data_structures::{BITCHAT_CHARACTERISTIC_UUID, BITCHAT_SERVICE_UUID};
+use crate::discovery::{self, Candidate, FailureLog};
 
 /// How long one scan pass looks for an advertiser before reporting back.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Backoff between reconnect attempts, capped.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(20);
+/// Connecting to an address that no longer exists does not fail — it hangs.
+/// Every step of bringing a link up is bounded so a dead peer costs seconds
+/// rather than the whole session.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(6);
+/// A BLE link can stay open after the peer's app is gone: the radio holds the
+/// connection while nothing is left to talk to it. A live BitChat node
+/// re-announces continuously, so silence this long means the link is a corpse
+/// and reconnecting beats waiting on it. Kept far above the announce interval
+/// so an idle-but-healthy peer is never dropped.
+const LINK_SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
+/// BlueZ frequently refuses an immediate reconnect to a device it just
+/// dropped, so let the stack settle first.
+const SETTLE_AFTER_LINK_LOSS: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum TransportEvent {
@@ -59,15 +74,17 @@ async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<
     };
 
     let mut backoff = RECONNECT_BACKOFF_START;
+    let mut failures = FailureLog::default();
     loop {
+        failures.prune();
         let _ = events
             .send(TransportEvent::Status(
                 "» Scanning for bitchat service...".to_string(),
             ))
             .await;
 
-        let peripheral = match scan_for_peer(&adapter).await {
-            Ok(Some(peripheral)) => peripheral,
+        let (peripheral, candidate) = match scan_for_peer(&adapter, &failures).await {
+            Ok(Some(found)) => found,
             Ok(None) => {
                 let _ = events
                     .send(TransportEvent::Disconnected(format!(
@@ -81,7 +98,9 @@ async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<
             }
             Err(error) => {
                 let _ = events
-                    .send(TransportEvent::Disconnected(format!("Scan failed: {error}")))
+                    .send(TransportEvent::Disconnected(format!(
+                        "Scan failed: {error}. Another Bluetooth program may be using the adapter."
+                    )))
                     .await;
                 time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
@@ -89,25 +108,46 @@ async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<
             }
         };
 
+        // Name the peer being tried. When several ghosts are in the list this
+        // is the difference between "it is stuck" and "it is working through
+        // stale entries".
         let _ = events
-            .send(TransportEvent::Status(
-                "» Found bitchat service! Connecting...".to_string(),
-            ))
+            .send(TransportEvent::Status(format!(
+                "» Connecting to {}",
+                candidate.label()
+            )))
             .await;
 
+        let started = std::time::Instant::now();
         match session(&peripheral, &events, &mut outbound).await {
-            Ok(()) => {
-                let _ = events
-                    .send(TransportEvent::Disconnected(
-                        "Link lost. Reconnecting...".to_string(),
-                    ))
-                    .await;
-                backoff = RECONNECT_BACKOFF_START;
-            }
-            Err(error) => {
+            Ok(ending) => {
+                failures.forget(&candidate.address);
+                let reason = match ending {
+                    LinkEnd::PeerGone => "Link lost".to_string(),
+                    LinkEnd::WentQuiet => format!(
+                        "Peer went silent for {}s",
+                        LINK_SILENCE_TIMEOUT.as_secs()
+                    ),
+                };
                 let _ = events
                     .send(TransportEvent::Disconnected(format!(
-                        "{error}\nRetrying automatically..."
+                        "{reason} after {}. Reconnecting...",
+                        format_duration(started.elapsed())
+                    )))
+                    .await;
+                backoff = RECONNECT_BACKOFF_START;
+                let _ = peripheral.disconnect().await;
+                time::sleep(SETTLE_AFTER_LINK_LOSS).await;
+                continue;
+            }
+            Err(error) => {
+                // Remember the address so the next pass prefers a different
+                // one rather than hammering a device that is not there.
+                failures.record(&candidate.address);
+                let _ = events
+                    .send(TransportEvent::Disconnected(format!(
+                        "{} failed: {error}. Trying another peer...",
+                        candidate.address
                     )))
                     .await;
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
@@ -269,50 +309,146 @@ async fn first_adapter() -> Result<Adapter, String> {
 
 /// One scan pass. Returns `Ok(None)` when the window elapses with no peer,
 /// which is a normal outcome rather than an error.
-async fn scan_for_peer(adapter: &Adapter) -> Result<Option<Peripheral>, btleplug::Error> {
-    adapter.start_scan(ScanFilter::default()).await?;
+/// BlueZ reports "operation already in progress" when something else already
+/// has discovery running — another BLE tool, or a second copy of this client.
+/// That is the state we wanted, not a failure, and treating it as fatal used to
+/// wedge the transport permanently once it happened.
+fn is_already_in_progress(error: &btleplug::Error) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("already in progress") || text.contains("inprogress")
+}
+
+async fn scan_for_peer(
+    adapter: &Adapter,
+    failures: &FailureLog,
+) -> Result<Option<(Peripheral, Candidate)>, btleplug::Error> {
+    if let Err(error) = adapter.start_scan(ScanFilter::default()).await {
+        if !is_already_in_progress(&error) {
+            return Err(error);
+        }
+        // Someone else is scanning; enumerate what they turn up.
+    }
     let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
 
-    let found = loop {
-        if let Some(peripheral) = advertising_peer(adapter).await? {
-            break Some(peripheral);
+    // Every exit from here stops the scan. Returning early with one running
+    // makes the *next* start_scan fail, which used to strand the client.
+    let outcome = async {
+        loop {
+            let found = bitchat_peers(adapter).await?;
+            // Give the adapter a moment to attach signal strength before
+            // committing: an entry with no RSSI is usually a cached ghost, and
+            // the first sweep after start_scan often has none at all.
+            let heard_any = found.iter().any(|(_, candidate)| candidate.rssi.is_some());
+            let past_grace = tokio::time::Instant::now() + SCAN_TIMEOUT - deadline
+                > Duration::from_millis(1500);
+
+            if !found.is_empty() && (heard_any || past_grace) {
+                let candidates: Vec<Candidate> =
+                    found.iter().map(|(_, candidate)| candidate.clone()).collect();
+                if let Some(chosen) = discovery::choose(&candidates, failures) {
+                    if let Some((peripheral, candidate)) = found
+                        .into_iter()
+                        .find(|(_, candidate)| candidate.address == chosen.address)
+                    {
+                        return Ok(Some((peripheral, candidate)));
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            time::sleep(Duration::from_millis(500)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            break None;
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    };
+    }
+    .await;
 
     let _ = adapter.stop_scan().await;
+    outcome
+}
+
+/// Everything currently claiming to speak BitChat, ghosts included — the
+/// filtering is `discovery::choose`'s job.
+async fn bitchat_peers(
+    adapter: &Adapter,
+) -> Result<Vec<(Peripheral, Candidate)>, btleplug::Error> {
+    let mut found = Vec::new();
+    for peripheral in adapter.peripherals().await? {
+        let Ok(Some(properties)) = peripheral.properties().await else {
+            continue;
+        };
+        if !properties.services.contains(&BITCHAT_SERVICE_UUID) {
+            continue;
+        }
+        let candidate = Candidate {
+            address: properties.address.to_string(),
+            rssi: properties.rssi,
+            name: properties.local_name.clone(),
+        };
+        found.push((peripheral, candidate));
+    }
     Ok(found)
 }
 
-async fn advertising_peer(adapter: &Adapter) -> Result<Option<Peripheral>, btleplug::Error> {
-    for peripheral in adapter.peripherals().await? {
-        if let Ok(Some(properties)) = peripheral.properties().await {
-            if properties.services.contains(&BITCHAT_SERVICE_UUID) {
-                return Ok(Some(peripheral));
-            }
+/// Polls until the peripheral reports connected, for callers that have to let
+/// an in-flight attempt from the stack finish.
+async fn await_connection(peripheral: &Peripheral, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if peripheral.is_connected().await.unwrap_or(false) {
+            return true;
         }
+        time::sleep(Duration::from_millis(250)).await;
     }
-    Ok(None)
+    false
+}
+
+fn format_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    }
 }
 
 /// Holds one connection open, pumping frames both ways until it drops.
+/// How a link that was working ended. Neither case says the peer's address is
+/// bad, so neither is held against it when choosing the next candidate.
+enum LinkEnd {
+    /// The radio reported the peer gone, or the notification stream ended.
+    PeerGone,
+    /// The link stayed open but nothing arrived for [`LINK_SILENCE_TIMEOUT`].
+    WentQuiet,
+}
+
 async fn session(
     peripheral: &Peripheral,
     events: &mpsc::Sender<TransportEvent>,
     outbound: &mut mpsc::Receiver<Vec<u8>>,
-) -> Result<(), String> {
-    peripheral
-        .connect()
-        .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+) -> Result<LinkEnd, String> {
+    // A connect to an address that has rotated away never returns, so it is
+    // bounded rather than trusted.
+    if !peripheral.is_connected().await.unwrap_or(false) {
+        match time::timeout(CONNECT_TIMEOUT, peripheral.connect()).await {
+            Err(_) => return Err(format!("no answer in {}s", CONNECT_TIMEOUT.as_secs())),
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if is_already_in_progress(&error) => {
+                // BlueZ is already dialling this device. Wait for it rather
+                // than racing it with a second attempt.
+                if !await_connection(peripheral, CONNECT_TIMEOUT).await {
+                    return Err("a connection attempt was already running and did not finish"
+                        .to_string());
+                }
+            }
+            Ok(Err(error)) => return Err(format!("connection refused ({error})")),
+        }
+    }
 
-    peripheral
-        .discover_services()
-        .await
-        .map_err(|e| format!("Service discovery failed: {e}"))?;
+    match time::timeout(SETUP_TIMEOUT, peripheral.discover_services()).await {
+        Err(_) => return Err("service discovery timed out".to_string()),
+        Ok(Err(error)) => return Err(format!("service discovery failed ({error})")),
+        Ok(Ok(())) => {}
+    }
 
     let characteristic: Characteristic = peripheral
         .characteristics()
@@ -320,10 +456,11 @@ async fn session(
         .find(|c| c.uuid == BITCHAT_CHARACTERISTIC_UUID)
         .ok_or_else(|| "Peer is not a BitChat node (characteristic missing)".to_string())?;
 
-    peripheral
-        .subscribe(&characteristic)
-        .await
-        .map_err(|e| format!("Could not subscribe to the BitChat characteristic: {e}"))?;
+    match time::timeout(SETUP_TIMEOUT, peripheral.subscribe(&characteristic)).await {
+        Err(_) => return Err("subscribe timed out".to_string()),
+        Ok(Err(error)) => return Err(format!("could not subscribe ({error})")),
+        Ok(Ok(())) => {}
+    }
 
     let mut notifications = peripheral
         .notifications()
@@ -337,18 +474,20 @@ async fn session(
 
     let mut liveness = time::interval(Duration::from_secs(2));
     liveness.tick().await;
+    let mut last_heard = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             notification = notifications.next() => {
                 match notification {
                     Some(notification) => {
+                        last_heard = tokio::time::Instant::now();
                         if events.send(TransportEvent::Frame(notification.value)).await.is_err() {
-                            return Ok(());
+                            return Ok(LinkEnd::PeerGone);
                         }
                     }
                     // Stream end means the peripheral went away.
-                    None => return Ok(()),
+                    None => return Ok(LinkEnd::PeerGone),
                 }
             }
             frame = outbound.recv() => {
@@ -361,16 +500,42 @@ async fn session(
                             return Err(format!("Write failed: {error}"));
                         }
                     }
-                    None => return Ok(()),
+                    None => return Ok(LinkEnd::PeerGone),
                 }
             }
             _ = liveness.tick() => {
                 // btleplug does not surface disconnects on every platform, so
                 // poll rather than trust the stream to end.
                 if !peripheral.is_connected().await.unwrap_or(false) {
-                    return Ok(());
+                    return Ok(LinkEnd::PeerGone);
+                }
+                if last_heard.elapsed() >= LINK_SILENCE_TIMEOUT {
+                    return Ok(LinkEnd::WentQuiet);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silence_is_judged_well_above_the_announce_rate() {
+        // Lowering this into announce range would drop healthy idle peers, which
+        // is the churn this timeout exists to avoid causing.
+        assert!(
+            LINK_SILENCE_TIMEOUT >= crate::mesh::ANNOUNCE_INTERVAL * 6,
+            "a quiet-but-live peer must get several announces' grace"
+        );
+    }
+
+    #[test]
+    fn formats_link_durations_the_way_an_operator_reads_them() {
+        assert_eq!(format_duration(Duration::from_secs(9)), "9s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_duration(Duration::from_secs(3725)), "62m05s");
     }
 }

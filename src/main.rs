@@ -7,6 +7,7 @@ mod announce;
 mod commands;
 mod compression;
 mod data_structures;
+mod discovery;
 mod file_packet;
 mod fragment;
 mod geo;
