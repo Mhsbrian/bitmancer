@@ -125,6 +125,23 @@ Not supported: native mesh file transfer. Upstream carries real image bytes over
 BLE (`fileTransfer = 0x22` plus `fragment = 0x20` reassembly); that is a
 separate piece of work from links.
 
+### Layout
+
+Panels are divided by hairlines, not boxes. Six rows were going to box drawing
+that carried no information; a rule divides just as clearly and gives the rows
+to the log. Because there are no borders left to light up, **focus is carried by
+the brightness of a section label** (`theme::section`) and by the compose
+prompt glyph.
+
+The top band is a readout rather than a header: callsign and short peer ID on
+the left, then MESH / GEO / UP / clock in fixed-width fields on the right. The
+widths are padded deliberately and there is a test for it — a peer count going
+from 9 to 10 must not shift the clock sideways while someone is reading it.
+
+Telemetry appears in the band and nowhere else. It used to be duplicated on the
+key strip; saying the same thing twice on one screen trains the eye to ignore
+both.
+
 ### Visual system
 
 `tui/theme.rs` is the single source of style; no widget defines its own colour.

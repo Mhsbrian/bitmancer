@@ -4,8 +4,8 @@
 use ratatui::{
     prelude::{Frame, Rect},
     style::Style,
-    text::Span,
-    widgets::{Block, Borders, Paragraph},
+    text::{Line, Span},
+    widgets::Paragraph,
 };
 
 use crate::tui::app::{App, FocusArea};
@@ -35,28 +35,43 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .unwrap_or_else(|| "→ public".to_string());
 
-    let input = Paragraph::new(lines)
-        .style(Style::default().fg(theme::TEXT))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    format!(" {destination} "),
-                    Style::default().fg(if focused { theme::LIVE } else { theme::DIM }),
-                ))
-                .border_style(theme::border(focused)),
-        );
+    // A prompt, not a box: the rule above already separates it from the log,
+    // and the destination belongs next to what you are typing rather than in a
+    // border title.
+    let prompt = Span::styled(
+        "▌ ",
+        Style::default().fg(if focused { theme::CURSOR } else { theme::FAINT }),
+    );
+    let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        let mut spans = vec![if index == 0 {
+            prompt.clone()
+        } else {
+            Span::raw("  ")
+        }];
+        if index == 0 && line.spans.iter().all(|span| span.content.is_empty()) {
+            // Empty compose line: say where it would go rather than nothing.
+            spans.push(Span::styled(
+                destination.clone(),
+                Style::default().fg(theme::FAINT),
+            ));
+        } else {
+            spans.extend(line.spans);
+        }
+        rendered.push(Line::from(spans));
+    }
 
-    f.render_widget(input, area);
+    f.render_widget(
+        Paragraph::new(rendered).style(Style::default().fg(theme::TEXT)),
+        area,
+    );
 
     // Calculate cursor position for multi-line input
     let cursor_pos = app.input.visual_cursor();
     let (cursor_line, cursor_col) = calculate_cursor_position(&input_text, cursor_pos, available_width);
     
-    f.set_cursor(
-        area.x + cursor_col as u16 + 1,
-        area.y + cursor_line as u16 + 1,
-    );
+    // Two columns for the prompt glyph, no border row to skip.
+    f.set_cursor(area.x + cursor_col as u16 + 2, area.y + cursor_line as u16);
 }
 
 fn wrap_text(text: &str, max_width: usize) -> Vec<ratatui::text::Line<'static>> {

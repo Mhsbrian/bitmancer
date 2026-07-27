@@ -185,11 +185,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(theme::panel_title("nav"))
-            .border_style(theme::border(focused)),
-    );
-    f.render_widget(list, area);
+    // No box: the column is already bounded by the hairline to its left, and
+    // the heading carries focus by brightness.
+    let mut rows = vec![ListItem::new(Line::from(vec![
+        Span::raw(" "),
+        theme::section("nav", focused),
+    ]))];
+    rows.extend(items);
+    f.render_widget(List::new(rows), area);
 }

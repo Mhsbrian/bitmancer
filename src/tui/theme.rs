@@ -91,6 +91,54 @@ pub fn hint(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(DIM))
 }
 
+/// Hairlines. Panels are separated by single rules rather than boxed, which
+/// spends the rows on information instead of on chrome.
+pub const RULE_H: &str = "─";
+pub const RULE_V: &str = "│";
+
+/// A horizontal hairline of the given width.
+pub fn rule(width: u16) -> Span<'static> {
+    Span::styled(
+        RULE_H.repeat(width as usize),
+        Style::default().fg(FAINT),
+    )
+}
+
+/// A labelled telemetry field: dim label, bright value, fixed spacing. The
+/// readout is meant to be scanned, not read, so labels stay quiet and values
+/// sit in a predictable place.
+pub fn field(label: &str, value: impl Into<String>, tone: Color) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("{} ", label.to_uppercase()),
+            Style::default().fg(FAINT),
+        ),
+        Span::styled(value.into(), Style::default().fg(tone)),
+    ]
+}
+
+/// Section heading used where a panel border used to be. Focus is carried by
+/// brightness now that panels are not boxed.
+pub fn section(label: &str, focused: bool) -> Span<'static> {
+    let spaced: String = label
+        .to_uppercase()
+        .chars()
+        .flat_map(|c| [c, ' '])
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    Span::styled(
+        spaced,
+        Style::default()
+            .fg(if focused { LIVE } else { DIM })
+            .add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+    )
+}
+
 /// Gutter mark for the selected row. A bar rather than a filled background:
 /// inverse blocks read as a spreadsheet, a bar reads as a cursor.
 pub const GUTTER_CURSOR: &str = "▌";

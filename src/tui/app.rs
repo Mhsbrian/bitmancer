@@ -134,6 +134,10 @@ pub struct App {
 
     /// Frame counter, used only to animate the connection spinner.
     pub tick: usize,
+    /// When this session began, for the uptime readout.
+    pub started: std::time::Instant,
+    /// First half of our mesh peer ID, as shown in the status band.
+    pub short_peer_id: String,
 
     // Images posted as links
     pub viewer: crate::tui::viewer::Viewer,
@@ -214,6 +218,8 @@ impl App {
             popup_title: String::new(),
             connection_popup_dismissed: false,
             tick: 0,
+            started: std::time::Instant::now(),
+            short_peer_id: String::new(),
             viewer: crate::tui::viewer::Viewer::new(),
             images: crate::media::ImageCache::new(),
             image_dimensions: std::collections::HashMap::new(),

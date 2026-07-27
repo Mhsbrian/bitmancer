@@ -77,55 +77,45 @@ mod tests {
     }
 }
 
-pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(0),    // Message history
-        ])
-        .split(area);
-    
-    let header_area = chunks[0];
-    let messages_area = chunks[1];
-    
-    // Update the viewport height before borrowing `app` for messages
-    app.message_viewport_height = messages_area.height.saturating_sub(2) as usize;
-
-    /// A location channel can be full of people and completely silent, so state
-    /// the headcount rather than letting an empty message pane imply an empty
-    /// room.
-    fn channel_header(app: &App, channel: &str) -> String {
-        if channel == "#public" {
-            return "public".to_string();
-        }
-        match app.people.len() {
-            0 => channel.to_string(),
-            1 => format!("{channel}  ·  1 here"),
-            count => format!("{channel}  ·  {count} here"),
-        }
-    }
-    
-    // Get the current conversation messages
-    let (messages, dm_target, channel_name) = app.get_current_messages();
-    
-    // --- Header Rendering ---
-    let header_text = if let Some(user) = dm_target {
-        format!("Direct Message with {}", user)
-    } else if let Some(channel) = channel_name {
-        channel_header(app, &channel)
-    } else {
-        channel_header(app, &app.get_selected_channel_name())
+/// One line naming the conversation, with the headcount on the right.
+pub fn render_context(f: &mut Frame, app: &App, area: Rect) {
+    let (_, dm_target, channel_name) = app.get_current_messages();
+    let (label, count) = match (dm_target, channel_name) {
+        (Some(user), _) => (format!("dm  {user}"), None),
+        (_, Some(channel)) if channel == "#public" => ("public".to_string(), None),
+        (_, Some(channel)) => (channel.clone(), Some(app.people.len())),
+        _ => ("public".to_string(), None),
     };
-    let header = Paragraph::new(header_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(theme::panel_title("channel"))
-                .border_style(Style::default().fg(theme::CHROME)),
-        )
-        .style(Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD));
-    f.render_widget(header, header_area);
+
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(count) = count.filter(|count| *count > 0) {
+        spans.push(Span::styled(
+            format!("   {count} here"),
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
+    // No border to subtract now that the log is divided by rules instead.
+    app.message_viewport_height = area.height as usize;
+    let (messages, _, _) = app.get_current_messages();
+    // One column of air on the left so text does not sit against the edge; the
+    // scrollbar still uses the full width on the right.
+    let messages_area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
 
     // --- Message Panel Rendering ---
     let messages_height = app.message_viewport_height;
@@ -252,44 +242,36 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }).collect();
 
-    let list = List::new(msg_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(theme::panel_title("log"))
-                .border_style(theme::border(app.focus_area == FocusArea::MainPanel)),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    // An empty pane says nothing; say what is true instead.
+    let msg_items = if msg_items.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "no traffic",
+            Style::default().fg(theme::FAINT),
+        )))]
+    } else {
+        msg_items
+    };
+    let list = List::new(msg_items);
 
     f.render_widget(list, messages_area);
-    
-    // --- Scrollbar Rendering ---
-    let max_scroll = total_messages.saturating_sub(messages_height);
 
-    // Fix: Use scroll positions as content length, and invert app.msg_scroll for correct direction
-    let (scrollbar_content_length, scrollbar_viewport_length, scrollbar_position) = if total_messages > messages_height {
+    // --- Scroll indicator ---
+    let max_scroll = total_messages.saturating_sub(messages_height);
+    if total_messages > messages_height {
         let content_length = max_scroll + 1;
         let position = max_scroll.saturating_sub(app.msg_scroll);
-        // Set viewport length to a reasonable fraction of the content length for consistent thumb size
-        let viewport_length = std::cmp::max(1, content_length / 10);
-        (content_length, viewport_length, position)
-    } else {
-        (1, 1, 0)
-    };
-
-    let mut scrollbar_state = ScrollbarState::default()
-        .content_length(scrollbar_content_length)
-        .viewport_content_length(scrollbar_viewport_length)
-        .position(scrollbar_position);
-
-    // Render the scrollbar only if scrolling is actually possible (prevents unnecessary rendering)
-    if total_messages > messages_height {
+        let mut scrollbar_state = ScrollbarState::default()
+            .content_length(content_length)
+            .viewport_content_length(std::cmp::max(1, content_length / 10))
+            .position(position);
         f.render_stateful_widget(
             Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼")),
-            messages_area, // Use full area to allow scrollbar to extend to bottom
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_symbol("▐")
+                .track_symbol(None),
+            area,
             &mut scrollbar_state,
         );
     }

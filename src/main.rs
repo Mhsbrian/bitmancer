@@ -122,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
     let mut app = App::new_with_nickname(mesh.nickname.clone());
+    app.short_peer_id = crate::peer_id::short_display(&mesh.my_peer_id);
     app.add_popup_message(format!("You are {} ({})", mesh.nickname, mesh.my_peer_id));
     app.add_popup_message("Esc dismisses this; /geo #<geohash> joins a location channel.".into());
 

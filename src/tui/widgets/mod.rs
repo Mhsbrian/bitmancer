@@ -6,4 +6,5 @@ pub mod main_panel;
 pub mod popup;
 pub mod map_panel;
 pub mod sidebar;
+pub mod status_band;
 pub mod help_bar;
