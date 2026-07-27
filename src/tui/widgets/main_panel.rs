@@ -131,25 +131,40 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let nickname = app.nickname.clone();
+    // How lit each rendered row is, collected alongside the rows themselves so
+    // the gutter beside the text can fade in step with a message that wraps.
+    let mut gutter: Vec<f32> = Vec::new();
     let msg_items: Vec<ListItem> = visible_messages.iter().flat_map(|msg| {
+        // A line lands lit and cools to the resting palette. Anything that was
+        // never new to us reports zero and is drawn exactly as it always was.
+        let intensity = msg
+            .arrived
+            .map(|at| theme::settle_intensity(at.elapsed()))
+            .unwrap_or(0.0);
         // System lines are chrome, yours are mint, everyone else keeps a stable
         // hue so a busy channel stays legible without turning into confetti.
         let is_system = msg.sender == "system";
-        let color = if is_system {
+        let resting = if is_system {
             theme::DIM
         } else if msg.is_self {
             theme::MINE
         } else {
             theme::speaker_color(&msg.sender)
         };
+        let color = theme::arriving(resting, intensity);
         // A line that says your name is the one thing worth interrupting for.
-        let body_style = if !msg.is_self && !is_system && msg.content.contains(nickname.as_str()) {
-            theme::mention()
+        let is_mention = !msg.is_self && !is_system && msg.content.contains(nickname.as_str());
+        let body_resting = if is_mention {
+            theme::ALERT
         } else if is_system {
-            Style::default().fg(theme::DIM)
+            theme::DIM
         } else {
-            Style::default().fg(theme::TEXT)
+            theme::TEXT
         };
+        let mut body_style = Style::default().fg(theme::arriving(body_resting, intensity));
+        if is_mention {
+            body_style = body_style.add_modifier(Modifier::BOLD);
+        }
 
         // Names sit in a fixed, right-aligned column so every message body
         // starts on the same character. Ragged left edges are what make a chat
@@ -162,15 +177,18 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
         let available_width = messages_area.width.saturating_sub(2) as usize; // Account for borders
         let content_width = available_width.saturating_sub(prefix_width);
         
-        if content_width == 0 {
+        let rows: Vec<ListItem> = if content_width == 0 {
             // Fallback if no space for content
             let line = Line::from(vec![
-                Span::styled(msg.timestamp.clone(), Style::default().fg(theme::FAINT)),
+                Span::styled(
+                    msg.timestamp.clone(),
+                    Style::default().fg(theme::arriving(theme::FAINT, intensity)),
+                ),
                 Span::raw(" "),
                 Span::styled(sender.clone(), Style::default().fg(color)),
                 Span::styled(
                     if carries_image { " ▣ " } else { "   " },
-                    Style::default().fg(theme::LIVE),
+                    Style::default().fg(theme::arriving(theme::LIVE, intensity)),
                 ),
                 Span::styled(msg.content.clone(), body_style),
             ]);
@@ -212,7 +230,10 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
                 // Create the line
                 if first_line {
                     let line = Line::from(vec![
-                        Span::styled(msg.timestamp.clone(), Style::default().fg(theme::FAINT)),
+                        Span::styled(
+                    msg.timestamp.clone(),
+                    Style::default().fg(theme::arriving(theme::FAINT, intensity)),
+                ),
                         Span::raw(" "),
                         Span::styled(sender.clone(), Style::default().fg(color)),
                         Span::styled(
@@ -239,7 +260,11 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
             }
             
             lines
-        }
+        };
+        // The whole block a message occupies carries the mark, not only its
+        // first row, so a wrapped paragraph settles as one thing.
+        gutter.extend(std::iter::repeat(intensity).take(rows.len()));
+        rows
     }).collect();
 
     // An empty pane says nothing; say what is true instead.
@@ -254,6 +279,10 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(msg_items);
 
     f.render_widget(list, messages_area);
+
+    // The marks sit in the column of air to the left of the text, so arrival
+    // reads as motion at the edge of vision without the text itself moving.
+    render_arrival_gutter(f, Rect { width: 1, ..area }, &gutter);
 
     // --- Scroll indicator ---
     let max_scroll = total_messages.saturating_sub(messages_height);
@@ -275,4 +304,22 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
             &mut scrollbar_state,
         );
     }
+}
+
+
+/// Draws the fading marks beside lines that are still settling. Rows that have
+/// come to rest draw nothing at all, so the column is empty in a quiet channel.
+fn render_arrival_gutter(f: &mut Frame, area: Rect, intensities: &[f32]) {
+    if area.width == 0 || !intensities.iter().any(|intensity| *intensity > 0.0) {
+        return;
+    }
+    let lines: Vec<Line> = intensities
+        .iter()
+        .take(area.height as usize)
+        .map(|intensity| match theme::arrival_mark(*intensity) {
+            Some((glyph, colour)) => Line::from(Span::styled(glyph, Style::default().fg(colour))),
+            None => Line::from(" "),
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }

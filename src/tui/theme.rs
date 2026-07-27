@@ -14,6 +14,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use std::time::Duration;
 
 // MARK: - Palette
 
@@ -211,5 +212,160 @@ mod tests {
         for role in [CHROME, FAINT, TEXT, DIM, LIVE, MINE, ALERT, FAULT] {
             assert_ne!(role, CURSOR);
         }
+    }
+}
+
+
+// ── Arrival ─────────────────────────────────────────────────────────────────
+//
+// The palette rule is that brightness is spent only on what changed. Held
+// still that is a rule about roles; given a clock it becomes a rule about time.
+// A line lands lit and cools into the resting palette over about a second and a
+// half, so a conversation reads as something arriving rather than something
+// that was already there.
+
+/// How long a line takes to cool from arrival to rest.
+pub const SETTLE: Duration = Duration::from_millis(1500);
+
+/// The opening fraction of that time spent at full brightness. Without a hold,
+/// the brightest frame is also the shortest one, and an arrival registers as a
+/// flicker rather than an entrance.
+const HOLD: f32 = 0.2;
+
+/// The cool white a line is lifted toward as it lands. Lifting toward a colour
+/// rather than substituting one keeps every hue's identity: a speaker's colour
+/// and an amber mention both brighten without either becoming something else,
+/// and no hue has to travel through grey to get there.
+const PHOSPHOR: Color = Color::Rgb(226, 248, 252);
+
+/// How far toward that white a line goes at the instant it arrives. Enough to
+/// carry across a full screen, short of washing the hue out.
+const LIFT: f32 = 0.55;
+
+/// Where a line sits between arrival (1.0) and rest (0.0).
+pub fn settle_intensity(age: Duration) -> f32 {
+    let elapsed = age.as_secs_f32() / SETTLE.as_secs_f32();
+    if elapsed >= 1.0 {
+        return 0.0;
+    }
+    if elapsed <= HOLD {
+        return 1.0;
+    }
+    let after = (elapsed - HOLD) / (1.0 - HOLD);
+    // Quadratic ease-out: most of the fall happens early and then trails off, so
+    // the line settles instead of switching off.
+    (1.0 - after) * (1.0 - after)
+}
+
+/// Mixes two colours. An `amount` of 0 gives `from`, 1 gives `to`. Colours
+/// outside the 24-bit palette have nothing to interpolate and so step over.
+pub fn blend(from: Color, to: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) => {
+            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
+            Color::Rgb(mix(fr, tr), mix(fg, tg), mix(fb, tb))
+        }
+        _ => {
+            if amount < 0.5 {
+                from
+            } else {
+                to
+            }
+        }
+    }
+}
+
+/// A resting colour lifted by how recently its line arrived.
+pub fn arriving(resting: Color, intensity: f32) -> Color {
+    blend(resting, PHOSPHOR, LIFT * intensity)
+}
+
+/// The mark down the left edge of a line that is still settling. It thins as it
+/// fades, because a terminal cell cannot be half-lit: the ramp has to live in
+/// glyph weight as well as in colour.
+pub fn arrival_mark(intensity: f32) -> Option<(&'static str, Color)> {
+    if intensity <= 0.02 {
+        return None;
+    }
+    let glyph = if intensity > 0.6 { "▎" } else { "▏" };
+    Some((glyph, blend(FAINT, LIVE, intensity)))
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::*;
+
+    #[test]
+    fn a_line_lands_lit_holds_then_reaches_rest() {
+        assert_eq!(settle_intensity(Duration::ZERO), 1.0);
+        assert_eq!(settle_intensity(SETTLE.mul_f32(HOLD * 0.5)), 1.0);
+        assert_eq!(settle_intensity(SETTLE), 0.0);
+        assert_eq!(settle_intensity(SETTLE * 10), 0.0, "no glow outlives the settle");
+    }
+
+    #[test]
+    fn brightness_only_ever_falls() {
+        // A line that brightened again partway through would read as a second
+        // arrival that never happened.
+        let mut previous = f32::INFINITY;
+        for step in 0..=60 {
+            let intensity = settle_intensity(SETTLE.mul_f32(step as f32 / 60.0));
+            assert!(intensity <= previous, "brightness rose at step {step}");
+            previous = intensity;
+        }
+    }
+
+    #[test]
+    fn a_settled_line_is_indistinguishable_from_one_that_never_animated() {
+        // The whole animation has to leave no residue: an hour-old line and a
+        // just-settled one must render identically, or the log ends up striped.
+        for resting in [TEXT, DIM, ALERT, MINE, LIVE, speaker_color("anon")] {
+            assert_eq!(arriving(resting, 0.0), resting);
+        }
+        assert_eq!(arrival_mark(0.0), None);
+    }
+
+    #[test]
+    fn arrival_lifts_toward_white_without_discarding_the_hue() {
+        // Amber must still read as amber while it is lit, or a mention stops
+        // looking like a mention exactly when it matters most.
+        let lit = arriving(ALERT, 1.0);
+        let Color::Rgb(r, g, b) = lit else {
+            panic!("expected rgb")
+        };
+        assert!(r > g && g > b, "amber must stay warm while lit: {lit:?}");
+
+        // Brightness is the thing that rises, not any one channel: lifting a
+        // warm hue toward a cool white takes a little red out of it while still
+        // making the line lighter.
+        let luminance = |colour: Color| {
+            let Color::Rgb(r, g, b) = colour else {
+                panic!("expected rgb")
+            };
+            0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+        };
+        for resting in [TEXT, DIM, ALERT, MINE, FAULT] {
+            assert!(
+                luminance(arriving(resting, 1.0)) > luminance(resting),
+                "arrival must brighten {resting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blending_hits_both_ends_exactly() {
+        let a = Color::Rgb(0, 0, 0);
+        let b = Color::Rgb(200, 100, 50);
+        assert_eq!(blend(a, b, 0.0), a);
+        assert_eq!(blend(a, b, 1.0), b);
+        assert_eq!(blend(a, b, 0.5), Color::Rgb(100, 50, 25));
+        assert_eq!(blend(a, b, 9.0), b, "out of range cannot overshoot");
+    }
+
+    #[test]
+    fn the_mark_thins_as_it_fades() {
+        assert_eq!(arrival_mark(1.0).unwrap().0, "▎");
+        assert_eq!(arrival_mark(0.3).unwrap().0, "▏");
     }
 }

@@ -157,6 +157,31 @@ The rules it encodes, in priority order:
    mark (`▌` cursor, `▏` active); panel titles are spaced small-caps; structure
    is thin rules and negative space.
 3. **Dim by default.** Brightness is spent only on what changed.
+4. **And what changed is a matter of time, not just of role.** A line lands
+   lit and cools into the resting palette over 1.5s (`theme::SETTLE`), with a
+   short hold at full brightness first so an arrival reads as an entrance
+   rather than a flicker. Colours are *lifted toward* a cool white rather than
+   replaced, so a speaker's hue and an amber mention both brighten without
+   either changing what it is, and no hue has to travel through grey to get
+   there. A fading mark in the gutter column carries the cyan.
+
+   Two rules keep that from becoming a strobe, and both are load-bearing:
+
+   - **Only a line that lands at the *end* of the log is new.** One that sorts
+     into the middle is an hour-old message a slow relay finally got round to,
+     and lighting it would advertise it as fresh.
+   - **A flood is not news.** More than `BURST_LIMIT` lines inside
+     `BURST_WINDOW` — a relay flushing its backlog, or `/help` printing fifteen
+     rows — arrive dark, *including the ones already lit when the flood became
+     recognisable*. The count lives in `ArrivalGate` rather than in the
+     messages, because clearing a line's arrival stamp is exactly what marks it
+     as part of a burst, which also destroys the evidence that it was one:
+     counting in the messages restarted the tally every time a group was
+     cleared and lit a fresh group every few lines all the way down a backlog.
+
+   A settled line must render *identically* to one that never animated, or the
+   log ends up permanently striped; `theme::arriving(colour, 0.0)` returning
+   the resting colour exactly is enforced by a test.
 
 Speakers get a stable hue from a deliberately narrow cool palette of six, so a
 busy channel stays legible without becoming confetti.

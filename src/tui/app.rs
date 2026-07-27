@@ -1,7 +1,8 @@
 // src/tui/app.rs
 
 use tui_input::Input;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use regex::Regex;
 use chrono;
 
@@ -15,6 +16,10 @@ pub struct Message {
     /// events at their own pace, so a slow one can deliver an hour-old message
     /// after the live ones; appending in arrival order puts it at the bottom.
     pub epoch: i64,
+    /// When this line landed, which drives the arrival animation. `None` means
+    /// it was never new to us — replayed history, or one of a flood — and it is
+    /// drawn at rest.
+    pub arrived: Option<Instant>,
 }
 
 impl Message {
@@ -26,6 +31,7 @@ impl Message {
             content,
             is_self,
             epoch: now.timestamp(),
+            arrived: Some(Instant::now()),
         }
     }
 }
@@ -159,18 +165,92 @@ pub struct App {
     pub joined_geohashes: std::collections::HashSet<String>,
     /// Set when the map asks to join the cell under the cursor.
     pub pending_geohash_join: Option<String>,
+    /// Recognises floods of arriving lines so they do not all light up.
+    arrival_gate: ArrivalGate,
 }
+
+/// A flood is not news. A relay flushing its backlog delivers dozens of lines
+/// in one instant, and lighting all of them turns a cascade into a flash, so a
+/// burst settles silently instead.
+const BURST_WINDOW: Duration = Duration::from_millis(400);
+const BURST_LIMIT: usize = 4;
 
 /// Places a message by time rather than by arrival, so a slow relay replaying
 /// an old backlog cannot drop an hour-old line under the live conversation.
 /// Walks from the end because the common case is "newest, goes last".
-fn insert_in_time_order(messages: &mut Vec<Message>, message: Message) {
+fn insert_in_time_order(
+    messages: &mut Vec<Message>,
+    mut message: Message,
+    admitted: Option<Instant>,
+) {
     let position = messages
         .iter()
         .rposition(|existing| existing.epoch <= message.epoch)
         .map(|index| index + 1)
         .unwrap_or(0);
+
+    // Only a line that lands at the end of the log is new. One that sorts into
+    // the middle is an old message a slow relay only just got round to, and
+    // lighting it would advertise it as fresh.
+    if position != messages.len() {
+        message.arrived = None;
+    } else {
+        apply_admission(messages, &mut message, admitted);
+    }
     messages.insert(position, message);
+}
+
+/// Counts how fast lines are landing, so a flood can be recognised as one.
+///
+/// This has to live outside the messages themselves: clearing a line's arrival
+/// stamp is exactly what marks it as part of a burst, which also destroys the
+/// evidence that it was ever part of one. Counting here instead means the run
+/// is measured from the first line of the flood rather than from the last one
+/// that happened to still be lit.
+#[derive(Debug, Default)]
+pub struct ArrivalGate {
+    recent: VecDeque<Instant>,
+}
+
+impl ArrivalGate {
+    /// Stamps a line as newly arrived, or refuses it because too many have
+    /// landed together to be worth announcing individually.
+    fn admit(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= BURST_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
+        (self.recent.len() <= BURST_LIMIT).then_some(now)
+    }
+}
+
+/// Appends a line and applies the same arrival policy the time-ordered path
+/// uses, so a command that prints fifteen rows at once settles quietly instead
+/// of lighting the whole pane.
+fn push_arrival(messages: &mut Vec<Message>, mut message: Message, admitted: Option<Instant>) {
+    apply_admission(messages, &mut message, admitted);
+    messages.push(message);
+}
+
+/// Carries the gate's verdict onto a line, and retracts the glow from any that
+/// went up before the flood was recognisable — the first few lines of a backlog
+/// should not flicker before the client works out what is happening.
+fn apply_admission(messages: &mut [Message], message: &mut Message, admitted: Option<Instant>) {
+    message.arrived = admitted;
+    if admitted.is_some() {
+        return;
+    }
+    for earlier in messages.iter_mut().rev() {
+        if earlier.arrived.is_none() {
+            break;
+        }
+        earlier.arrived = None;
+    }
 }
 
 impl App {
@@ -189,6 +269,7 @@ impl App {
         
         let mut app = Self {
             input: Input::default(),
+            arrival_gate: ArrivalGate::default(),
             phase: TuiPhase::Connecting,
             should_quit: false,
             focus_area: FocusArea::InputBox,
@@ -304,9 +385,10 @@ impl App {
                 let timestamp = if timestamp_raw.len() == 4 { format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4]) } else { timestamp_raw };
 
                 let sender_clone = sender.clone();
-                let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp() };
+                let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), arrived: Some(Instant::now()) };
 
-                self.dm_messages.entry(sender_clone.clone()).or_default().push(msg);
+                let admitted = self.arrival_gate.admit();
+                push_arrival(self.dm_messages.entry(sender_clone.clone()).or_default(), msg, admitted);
                 
                 let dm_key = format!("dm:{}", sender_clone);
                 let (_, current_dm_target, _) = self.get_current_messages();
@@ -332,9 +414,14 @@ impl App {
                     .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
 
                 self.note_image_link(&sender, &channel, &content);
-                let msg = Message { sender, timestamp, content, is_self: false, epoch };
+                let msg = Message { sender, timestamp, content, is_self: false, epoch, arrived: Some(Instant::now()) };
 
-                insert_in_time_order(self.channel_messages.entry(channel.clone()).or_default(), msg);
+                let admitted = self.arrival_gate.admit();
+                insert_in_time_order(
+                    self.channel_messages.entry(channel.clone()).or_default(),
+                    msg,
+                    admitted,
+                );
                 
                 let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
                 let in_dm = dm_target.is_some();
@@ -370,9 +457,10 @@ impl App {
             
             if sender == self.nickname { return; }
             
-            let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp() };
+            let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), arrived: Some(Instant::now()) };
             let current_channel = self.get_selected_channel_name();
-            self.channel_messages.entry(current_channel).or_default().push(msg);
+            let admitted = self.arrival_gate.admit();
+            push_arrival(self.channel_messages.entry(current_channel).or_default(), msg, admitted);
             self.scroll_to_bottom_current_conversation();
             return;
         }
@@ -393,14 +481,17 @@ impl App {
                         let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
                         if let Some(target) = dm_target {
                             // We're in a DM, add to DM messages
-                            self.dm_messages.entry(target).or_default().push(msg);
+                            let admitted = self.arrival_gate.admit();
+                            push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
                         } else if let Some(channel) = channel_name {
                             // We're in a channel, add to channel messages
-                            self.channel_messages.entry(channel).or_default().push(msg);
+                            let admitted = self.arrival_gate.admit();
+                            push_arrival(self.channel_messages.entry(channel).or_default(), msg, admitted);
                         } else {
                             // Fallback to current channel (shouldn't happen but just in case)
                             let current_channel = self.get_selected_channel_name();
-                            self.channel_messages.entry(current_channel.clone()).or_default().push(msg);
+                            let admitted = self.arrival_gate.admit();
+                            push_arrival(self.channel_messages.entry(current_channel.clone()).or_default(), msg, admitted);
                         }
                     }
                 }
@@ -418,7 +509,8 @@ impl App {
             let trimmed_line = line.trim();
             if !trimmed_line.is_empty() {
                 let msg = Message::now("system".to_string(), trimmed_line.to_string(), false);
-                self.channel_messages.entry(current_channel.clone()).or_default().push(msg);
+                let admitted = self.arrival_gate.admit();
+                push_arrival(self.channel_messages.entry(current_channel.clone()).or_default(), msg, admitted);
             }
         }
         self.scroll_to_bottom_current_conversation();
@@ -435,9 +527,11 @@ impl App {
 
         let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
         if let Some(target) = dm_target {
-            self.dm_messages.entry(target).or_default().push(msg);
+            let admitted = self.arrival_gate.admit();
+            push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
         } else if let Some(channel) = channel_name {
-            self.channel_messages.entry(channel).or_default().push(msg);
+            let admitted = self.arrival_gate.admit();
+            push_arrival(self.channel_messages.entry(channel).or_default(), msg, admitted);
         }
         self.scroll_to_bottom_current_conversation();
     }
@@ -445,7 +539,8 @@ impl App {
     pub fn add_dm_message(&mut self, target_nickname: String, content: String) {
         let timestamp = chrono::Local::now().format("%H:%M").to_string();
         let msg = Message::now(self.nickname.clone(), content, true);
-        self.dm_messages.entry(target_nickname).or_default().push(msg);
+        let admitted = self.arrival_gate.admit();
+        push_arrival(self.dm_messages.entry(target_nickname).or_default(), msg, admitted);
         self.scroll_to_bottom_current_conversation();
     }
 
@@ -718,5 +813,123 @@ impl App {
         
         // Ensure minimum height and reasonable maximum
         std::cmp::max(3, std::cmp::min(lines_needed + 2, 10)) // +2 for borders, max 10 lines
+    }
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::*;
+
+    fn message(epoch: i64) -> Message {
+        Message {
+            sender: "anon".to_string(),
+            timestamp: "12:00".to_string(),
+            content: "hello".to_string(),
+            is_self: false,
+            epoch,
+            arrived: Some(Instant::now()),
+        }
+    }
+
+    /// Runs a batch of lines through the gate the way the client does.
+    fn land(epochs: impl IntoIterator<Item = i64>) -> Vec<Message> {
+        let (mut log, mut gate) = (Vec::new(), ArrivalGate::default());
+        for epoch in epochs {
+            let admitted = gate.admit();
+            insert_in_time_order(&mut log, message(epoch), admitted);
+        }
+        log
+    }
+
+    #[test]
+    fn a_line_landing_at_the_end_is_new() {
+        let log = land([100, 200]);
+        assert!(log.iter().all(|m| m.arrived.is_some()));
+    }
+
+    #[test]
+    fn a_line_that_sorts_into_the_past_is_not_new() {
+        // The hour-old message a slow relay finally delivered. It belongs in the
+        // log at its own time, but it is not something that just happened.
+        let log = land([500, 100]);
+        assert_eq!(log[0].epoch, 100);
+        assert!(log[0].arrived.is_none(), "replayed history must not light up");
+        assert!(log[1].arrived.is_some(), "the live line keeps its arrival");
+    }
+
+    #[test]
+    fn a_flood_arrives_completely_dark() {
+        // A backlog flush lands in one instant. Not even its opening lines may
+        // glow: the flood has to be retracted once it becomes recognisable, or
+        // joining a busy channel opens with a strobe.
+        let log = land(0..40);
+        assert!(
+            log.iter().all(|m| m.arrived.is_none()),
+            "every line of a burst must be dark, including the first few"
+        );
+    }
+
+    #[test]
+    fn the_flood_stays_dark_however_long_it_runs() {
+        // The regression a screenshot caught: counting only the lines still lit
+        // restarted the tally each time a group was cleared, so a long burst lit
+        // a fresh group every few lines all the way down.
+        let log = land(0..(BURST_LIMIT as i64 * 5));
+        assert_eq!(
+            log.iter().filter(|m| m.arrived.is_some()).count(),
+            0,
+            "no group anywhere in the flood may light up"
+        );
+    }
+
+    #[test]
+    fn a_handful_of_live_lines_still_animate() {
+        // The ordinary case: a few people talking at once should cascade.
+        let log = land(0..BURST_LIMIT as i64);
+        assert!(log.iter().all(|m| m.arrived.is_some()));
+    }
+
+    #[test]
+    fn the_gate_reopens_once_the_rush_has_passed() {
+        let mut gate = ArrivalGate::default();
+        for _ in 0..BURST_LIMIT * 3 {
+            gate.admit();
+        }
+        assert!(gate.admit().is_none(), "still mid-flood");
+        gate.recent.clear(); // stand in for BURST_WINDOW elapsing
+        assert!(gate.admit().is_some(), "a later line is news again");
+    }
+}
+
+#[cfg(test)]
+mod push_arrival_tests {
+    use super::*;
+
+    #[test]
+    fn a_command_that_prints_a_wall_of_text_does_not_light_it_all() {
+        // /help is fifteen lines in one instant. Lighting every one of them is
+        // the same flash the relay backlog would have caused.
+        let (mut log, mut gate) = (Vec::new(), ArrivalGate::default());
+        for index in 0..15 {
+            let admitted = gate.admit();
+            push_arrival(
+                &mut log,
+                Message::now("system".to_string(), format!("line {index}"), false),
+                admitted,
+            );
+        }
+        assert!(log.iter().all(|m| m.arrived.is_none()));
+    }
+
+    #[test]
+    fn a_single_notice_still_announces_itself() {
+        let (mut log, mut gate) = (Vec::new(), ArrivalGate::default());
+        let admitted = gate.admit();
+        push_arrival(
+            &mut log,
+            Message::now("system".to_string(), "peer left".to_string(), false),
+            admitted,
+        );
+        assert!(log[0].arrived.is_some());
     }
 }
