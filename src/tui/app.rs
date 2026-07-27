@@ -175,6 +175,23 @@ pub struct App {
 const BURST_WINDOW: Duration = Duration::from_millis(400);
 const BURST_LIMIT: usize = 4;
 
+/// How far behind our own clock a line can be stamped and still count as news.
+///
+/// Generous on purpose. A geohash event carries the *sender's* clock from
+/// before it was mined and relayed, so reaching us a few seconds "in the past"
+/// is the normal case rather than the exception, and two phones in the same
+/// channel rarely agree to the second. Judging newness by position in the log
+/// instead — which is what this replaced — silently muted almost every real
+/// message, because the live divider is stamped with our own clock and
+/// everything that arrived afterwards sorted in behind it.
+const LIVE_HORIZON: i64 = 120;
+
+/// Whether a line's own timestamp says it belongs to the present. An hour-old
+/// backlog is nowhere near, which is the distinction that matters.
+fn is_current(epoch: i64) -> bool {
+    chrono::Local::now().timestamp() - epoch <= LIVE_HORIZON
+}
+
 /// Places a message by time rather than by arrival, so a slow relay replaying
 /// an old backlog cannot drop an hour-old line under the live conversation.
 /// Walks from the end because the common case is "newest, goes last".
@@ -189,13 +206,14 @@ fn insert_in_time_order(
         .map(|index| index + 1)
         .unwrap_or(0);
 
-    // Only a line that lands at the end of the log is new. One that sorts into
-    // the middle is an old message a slow relay only just got round to, and
-    // lighting it would advertise it as fresh.
-    if position != messages.len() {
-        message.arrived = None;
-    } else {
+    // Newness is about the clock, not about where the line lands. A message
+    // that sorts into the middle because its sender's clock runs a little slow
+    // is still something that just happened; one stamped an hour ago is the
+    // backlog, wherever it ends up sitting.
+    if is_current(message.epoch) {
         apply_admission(messages, &mut message, admitted);
+    } else {
+        message.arrived = None;
     }
     messages.insert(position, message);
 }
@@ -831,30 +849,42 @@ mod arrival_tests {
         }
     }
 
-    /// Runs a batch of lines through the gate the way the client does.
-    fn land(epochs: impl IntoIterator<Item = i64>) -> Vec<Message> {
+    /// Runs a batch of lines through the gate the way the client does. Offsets
+    /// are seconds behind the present, which is how a real event's `created_at`
+    /// reaches us.
+    fn land(offsets: impl IntoIterator<Item = i64>) -> Vec<Message> {
+        let now = chrono::Local::now().timestamp();
         let (mut log, mut gate) = (Vec::new(), ArrivalGate::default());
-        for epoch in epochs {
+        for offset in offsets {
             let admitted = gate.admit();
-            insert_in_time_order(&mut log, message(epoch), admitted);
+            insert_in_time_order(&mut log, message(now - offset), admitted);
         }
         log
     }
 
     #[test]
-    fn a_line_landing_at_the_end_is_new() {
-        let log = land([100, 200]);
+    fn lines_landing_now_are_new() {
+        let log = land([1, 0]);
         assert!(log.iter().all(|m| m.arrived.is_some()));
     }
 
     #[test]
-    fn a_line_that_sorts_into_the_past_is_not_new() {
-        // The hour-old message a slow relay finally delivered. It belongs in the
-        // log at its own time, but it is not something that just happened.
-        let log = land([500, 100]);
-        assert_eq!(log[0].epoch, 100);
+    fn an_hour_old_line_is_not_new_wherever_it_lands() {
+        // The backlog a slow relay finally delivered. It belongs in the log at
+        // its own time, but it is not something that just happened.
+        let log = land([0, 3600]);
         assert!(log[0].arrived.is_none(), "replayed history must not light up");
         assert!(log[1].arrived.is_some(), "the live line keeps its arrival");
+    }
+
+    #[test]
+    fn arriving_out_of_order_does_not_mute_a_live_line() {
+        // Two phones, clocks a few seconds apart. Both are talking now.
+        let log = land([0, 5]);
+        assert!(
+            log.iter().all(|m| m.arrived.is_some()),
+            "a slightly-behind clock is still the present"
+        );
     }
 
     #[test]
@@ -931,5 +961,63 @@ mod push_arrival_tests {
             admitted,
         );
         assert!(log[0].arrived.is_some());
+    }
+}
+
+#[cfg(test)]
+mod inbound_arrival_tests {
+    use super::*;
+
+    fn channel_line(sender: &str, epoch: i64, content: &str) -> String {
+        format!("__CHANNEL__:#9q:{sender}:{epoch}:{content}")
+    }
+
+    fn lines(app: &App) -> &Vec<Message> {
+        app.channel_messages.get("#9q").expect("channel exists")
+    }
+
+    #[test]
+    fn a_live_message_into_a_quiet_channel_animates() {
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+        app.add_log_message(channel_line("alice", now, "hello"));
+        assert!(lines(&app)[0].arrived.is_some());
+    }
+
+    #[test]
+    fn hour_old_backlog_does_not_animate() {
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+        app.add_log_message(channel_line("alice", now, "recent"));
+        app.add_log_message(channel_line("bob", now - 3600, "ancient"));
+        let ancient = lines(&app).iter().find(|m| m.content == "ancient").unwrap();
+        assert!(ancient.arrived.is_none(), "replayed history must stay dark");
+    }
+
+    #[test]
+    fn a_message_that_took_a_few_seconds_to_reach_us_still_animates() {
+        // What actually happens on a geohash channel: the live divider is
+        // stamped with our own clock at EOSE, and the next real message carries
+        // the sender's created_at from before it was mined and relayed. It
+        // sorts *behind* the divider and so never counted as new.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+        app.add_log_message(channel_line("system", now, "─── live ───"));
+        app.add_log_message(channel_line("alice", now - 5, "hello"));
+        let hello = lines(&app).iter().find(|m| m.content == "hello").unwrap();
+        assert!(
+            hello.arrived.is_some(),
+            "a message a few seconds behind our clock is still news"
+        );
+    }
+
+    #[test]
+    fn clock_skew_between_two_speakers_does_not_mute_the_second() {
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+        app.add_log_message(channel_line("alice", now, "first"));
+        app.add_log_message(channel_line("bob", now - 3, "second"));
+        let second = lines(&app).iter().find(|m| m.content == "second").unwrap();
+        assert!(second.arrived.is_some(), "a slightly-behind clock is still live");
     }
 }

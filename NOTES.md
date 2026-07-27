@@ -167,9 +167,14 @@ The rules it encodes, in priority order:
 
    Two rules keep that from becoming a strobe, and both are load-bearing:
 
-   - **Only a line that lands at the *end* of the log is new.** One that sorts
-     into the middle is an hour-old message a slow relay finally got round to,
-     and lighting it would advertise it as fresh.
+   - **Newness is a property of the clock, not of position in the log**
+     (`LIVE_HORIZON`, 120s). Judging it by "did this land at the end" is the
+     obvious rule and it is wrong: a geohash event carries the *sender's*
+     `created_at` from before it was mined and relayed, and the `─── live ───`
+     divider is stamped with *our* clock at EOSE, so essentially every real
+     message sorts in behind something and was silently muted. Two phones in
+     one channel rarely agree to the second either. An hour-old backlog is
+     nowhere near the horizon, which is the distinction that actually matters.
    - **A flood is not news.** More than `BURST_LIMIT` lines inside
      `BURST_WINDOW` — a relay flushing its backlog, or `/help` printing fifteen
      rows — arrive dark, *including the ones already lit when the flood became
