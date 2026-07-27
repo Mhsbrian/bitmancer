@@ -188,6 +188,27 @@ The rules it encodes, in priority order:
    log ends up permanently striped; `theme::arriving(colour, 0.0)` returning
    the resting colour exactly is enforced by a test.
 
+5. **A line materialises before it cools.** For the first 260ms
+   (`theme::REVEAL`) the body sweeps in left to right behind a bright cyan
+   edge (`FRONTIER`), with `RESOLVING_CELLS` cells just behind it flickering
+   through block and shade forms before settling into their real characters.
+   Three things keep it from being a gimmick:
+
+   - **Only the body sweeps.** The timestamp and the sender column are
+     structure and hold their positions, or every arriving line jitters
+     sideways as it lands.
+   - **Wrapping is computed on the whole message first**, and the sweep is a
+     character budget applied across the already-wrapped rows
+     (`reveal_spans`), so revealing text never reflows it. Rows the sweep has
+     not reached render blank rather than being omitted, so the log does not
+     grow row by row.
+   - **Double-width glyphs never flicker.** Standing a one-cell block in for a
+     two-cell emoji would drag the rest of the row sideways and back again.
+
+   The loop drops to `ANIMATION_TICK` (30fps) while `App::is_animating`, and
+   back to the 10fps idle rate afterwards. At the idle rate a 260ms sweep is
+   three frames and reads as stepping rather than motion.
+
 Speakers get a stable hue from a deliberately narrow cool palette of six, so a
 busy channel stays legible without becoming confetti.
 

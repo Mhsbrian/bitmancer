@@ -272,6 +272,22 @@ fn apply_admission(messages: &mut [Message], message: &mut Message, admitted: Op
 }
 
 impl App {
+    /// Whether anything on screen is still arriving, so the main loop knows to
+    /// draw at the animation rate rather than the idle one. Only the tail of
+    /// the conversation can be mid-arrival, so the scan stops early.
+    pub fn is_animating(&self) -> bool {
+        let (messages, _, _) = self.get_current_messages();
+        messages
+            .iter()
+            .rev()
+            .take(64)
+            .any(|message| {
+                message
+                    .arrived
+                    .is_some_and(|at| at.elapsed() < crate::tui::theme::SETTLE)
+            })
+    }
+
     /// Lines the connection popup can show before older ones scroll off.
     const MAX_POPUP_MESSAGES: usize = 4;
 

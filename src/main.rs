@@ -42,6 +42,10 @@ use tui::tui as tui_mod;
 use tui::ui;
 
 const TICK_RATE: Duration = Duration::from_millis(100);
+/// Frame interval while a line is still arriving. The reveal sweep runs for a
+/// quarter of a second, which at the idle rate would be three frames and would
+/// read as stepping rather than motion. Only paid for while something moves.
+const ANIMATION_TICK: Duration = Duration::from_millis(33);
 /// Minimum keyboard poll window. Long enough for crossterm to decide a bare
 /// 0x1b is Esc rather than the start of an escape sequence.
 const ESC_RESOLVE_WINDOW: Duration = Duration::from_millis(20);
@@ -186,7 +190,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // crossterm only resolves it as Esc once a read times out — with a
         // zero-duration poll it stays buffered until some other key is pressed,
         // so Esc appears to do nothing at all.
-        let poll_timeout = TICK_RATE
+        let frame_interval = if app.is_animating() {
+            ANIMATION_TICK
+        } else {
+            TICK_RATE
+        };
+        let poll_timeout = frame_interval
             .saturating_sub(last_tick.elapsed())
             .max(ESC_RESOLVE_WINDOW);
         if crossterm_event::poll(poll_timeout).unwrap_or(false) {

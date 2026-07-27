@@ -7,6 +7,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::tui::app::{App, FocusArea};
 use crate::tui::theme;
 
@@ -137,10 +139,20 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
     let msg_items: Vec<ListItem> = visible_messages.iter().flat_map(|msg| {
         // A line lands lit and cools to the resting palette. Anything that was
         // never new to us reports zero and is drawn exactly as it always was.
-        let intensity = msg
-            .arrived
-            .map(|at| theme::settle_intensity(at.elapsed()))
-            .unwrap_or(0.0);
+        let age = msg.arrived.map(|at| at.elapsed());
+        let intensity = age.map(theme::settle_intensity).unwrap_or(0.0);
+        // How far the line has come into existence. A line that was never new
+        // to us is simply already there.
+        let total_chars = msg.content.chars().count();
+        let revealed = match age {
+            Some(age) => ((theme::reveal_fraction(age) * total_chars as f32).ceil() as usize)
+                .max(1)
+                .min(total_chars),
+            None => total_chars,
+        };
+        // Steps the resolving cells at about 16fps, independent of the frame
+        // rate, so the flicker is the same speed on any terminal.
+        let seed = age.map(|age| age.as_millis() as u64 / 60).unwrap_or(0);
         // System lines are chrome, yours are mint, everyone else keeps a stable
         // hue so a busy channel stays legible without turning into confetti.
         let is_system = msg.sender == "system";
@@ -223,33 +235,48 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                 };
                 
+                // Where this row starts within the whole message, so the sweep
+                // can run across a wrapped paragraph as one continuous line.
+                let row_start = current_pos;
                 // Extract the line content
                 let line_chars = &chars[current_pos..current_pos + break_point];
                 let line_content: String = line_chars.iter().collect();
                 
-                // Create the line
+                // Create the line. The timestamp and the name are structure and
+                // hold their columns while the words arrive; only the body
+                // sweeps in, or the whole row jitters as it lands.
                 if first_line {
-                    let line = Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(
-                    msg.timestamp.clone(),
-                    Style::default().fg(theme::arriving(theme::FAINT, intensity)),
-                ),
+                            msg.timestamp.clone(),
+                            Style::default().fg(theme::arriving(theme::FAINT, intensity)),
+                        ),
                         Span::raw(" "),
                         Span::styled(sender.clone(), Style::default().fg(color)),
                         Span::styled(
                             if carries_image { " ▣ " } else { "   " },
-                            Style::default().fg(theme::LIVE),
+                            Style::default().fg(theme::arriving(theme::LIVE, intensity)),
                         ),
-                        Span::styled(line_content.clone(), body_style),
-                    ]);
-                    lines.push(ListItem::new(line));
+                    ];
+                    spans.extend(reveal_spans(
+                        &line_content,
+                        row_start,
+                        revealed,
+                        body_style,
+                        seed,
+                    ));
+                    lines.push(ListItem::new(Line::from(spans)));
                     first_line = false;
                 } else {
-                    let line = Line::from(vec![
-                        Span::raw(" ".repeat(prefix_width)),
-                        Span::styled(line_content.clone(), body_style),
-                    ]);
-                    lines.push(ListItem::new(line));
+                    let mut spans = vec![Span::raw(" ".repeat(prefix_width))];
+                    spans.extend(reveal_spans(
+                        &line_content,
+                        row_start,
+                        revealed,
+                        body_style,
+                        seed,
+                    ));
+                    lines.push(ListItem::new(Line::from(spans)));
                 }
                 
                 // Move to next position, skipping leading spaces on continuation lines
@@ -322,4 +349,107 @@ fn render_arrival_gutter(f: &mut Frame, area: Rect, intensities: &[f32]) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines), area);
+}
+
+
+/// Splits one row of a line into the part that has materialised, the cells
+/// still resolving at the leading edge, and nothing at all past it.
+///
+/// Wrapping is computed on the whole message before any of this, so the sweep
+/// never reflows the text it is revealing.
+fn reveal_spans(
+    text: &str,
+    row_start: usize,
+    revealed: usize,
+    style: Style,
+    seed: u64,
+) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    if revealed >= row_start + chars.len() {
+        return vec![Span::styled(text.to_string(), style)];
+    }
+    if revealed <= row_start {
+        // The sweep has not reached this row. It still occupies its height, so
+        // the log does not jump as the words catch up.
+        return Vec::new();
+    }
+
+    let shown = revealed - row_start;
+    let resolving_from = shown.saturating_sub(theme::RESOLVING_CELLS);
+    let mut spans = Vec::new();
+    let settled: String = chars[..resolving_from].iter().collect();
+    if !settled.is_empty() {
+        spans.push(Span::styled(settled, style));
+    }
+    for (offset, character) in chars[resolving_from..shown].iter().enumerate() {
+        // A double-width glyph standing in for a one-cell block would shift the
+        // rest of the row sideways while it resolves, so only single-width
+        // cells flicker.
+        if character.width().unwrap_or(1) == 1 {
+            spans.push(Span::styled(
+                theme::resolving_glyph(seed.wrapping_add((resolving_from + offset) as u64)),
+                Style::default().fg(theme::LIVE),
+            ));
+        } else {
+            spans.push(Span::styled(character.to_string(), style));
+        }
+    }
+    spans.push(Span::styled(
+        theme::FRONTIER,
+        Style::default().fg(theme::LIVE),
+    ));
+    spans
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+
+    fn text_of(spans: &[Span]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_finished_line_is_just_its_text() {
+        // Anything else would leave residue on every settled line in the log.
+        let spans = reveal_spans("hello there", 0, 11, Style::default(), 0);
+        assert_eq!(text_of(&spans), "hello there");
+        assert_eq!(spans.len(), 1, "no leftover frontier once it has arrived");
+    }
+
+    #[test]
+    fn a_row_the_sweep_has_not_reached_is_empty() {
+        let spans = reveal_spans("second row", 20, 5, Style::default(), 0);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn the_leading_edge_carries_the_frontier() {
+        let spans = reveal_spans("hello there", 0, 5, Style::default(), 0);
+        assert!(text_of(&spans).ends_with(theme::FRONTIER));
+        assert_eq!(
+            text_of(&spans).chars().count(),
+            6,
+            "five revealed cells and the edge"
+        );
+    }
+
+    #[test]
+    fn the_sweep_carries_across_a_wrapped_paragraph() {
+        // Row two starts at character 20; a sweep at 25 has taken five of it.
+        let spans = reveal_spans("second row here", 20, 25, Style::default(), 0);
+        assert_eq!(text_of(&spans).chars().count(), 6);
+    }
+
+    #[test]
+    fn a_wide_glyph_never_resolves_and_so_never_shifts_the_row() {
+        // An emoji is two cells; swapping it for a one-cell block mid-sweep
+        // would drag the rest of the row sideways and back again.
+        let spans = reveal_spans("ab😀cd", 0, 3, Style::default(), 7);
+        assert!(
+            text_of(&spans).contains('😀'),
+            "wide glyphs arrive whole: {}",
+            text_of(&spans)
+        );
+    }
 }

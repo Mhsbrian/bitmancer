@@ -242,6 +242,38 @@ const PHOSPHOR: Color = Color::Rgb(226, 248, 252);
 /// carry across a full screen, short of washing the hue out.
 const LIFT: f32 = 0.55;
 
+/// How long a line takes to materialise. Short on purpose: this is the line
+/// assembling itself, not a typewriter. Much beyond a quarter second and it
+/// stops reading as arrival and starts reading as a delay before you can read
+/// your own messages.
+pub const REVEAL: Duration = Duration::from_millis(260);
+
+/// The cells at the leading edge resolve through these before settling into
+/// their real characters. Block and shade forms rather than random letters:
+/// it should read as a signal coming into focus, not as scrambled text.
+const RESOLVING: [&str; 6] = ["▚", "▞", "▒", "░", "▖", "▘"];
+
+/// How many cells behind the leading edge are still resolving.
+pub const RESOLVING_CELLS: usize = 2;
+
+/// The cell at the leading edge of a line coming into existence.
+pub const FRONTIER: &str = "▊";
+
+/// How much of a line has materialised, from 0 to 1.
+pub fn reveal_fraction(age: Duration) -> f32 {
+    let elapsed = age.as_secs_f32() / REVEAL.as_secs_f32();
+    if elapsed >= 1.0 {
+        return 1.0;
+    }
+    // Eased so the sweep arrives rather than stopping dead against the end of
+    // the line.
+    1.0 - (1.0 - elapsed) * (1.0 - elapsed)
+}
+
+pub fn resolving_glyph(seed: u64) -> &'static str {
+    RESOLVING[(seed % RESOLVING.len() as u64) as usize]
+}
+
 /// Where a line sits between arrival (1.0) and rest (0.0).
 pub fn settle_intensity(age: Duration) -> f32 {
     let elapsed = age.as_secs_f32() / SETTLE.as_secs_f32();
@@ -361,6 +393,27 @@ mod arrival_tests {
         assert_eq!(blend(a, b, 1.0), b);
         assert_eq!(blend(a, b, 0.5), Color::Rgb(100, 50, 25));
         assert_eq!(blend(a, b, 9.0), b, "out of range cannot overshoot");
+    }
+
+    #[test]
+    fn a_line_materialises_quickly_and_completely() {
+        assert_eq!(reveal_fraction(Duration::ZERO), 0.0);
+        assert_eq!(reveal_fraction(REVEAL), 1.0);
+        assert_eq!(reveal_fraction(REVEAL * 4), 1.0);
+        assert!(
+            REVEAL < SETTLE,
+            "a line has to finish arriving before it finishes cooling"
+        );
+    }
+
+    #[test]
+    fn the_sweep_only_ever_moves_forward() {
+        let mut previous = -1.0;
+        for step in 0..=40 {
+            let fraction = reveal_fraction(REVEAL.mul_f32(step as f32 / 40.0));
+            assert!(fraction >= previous, "the sweep went backwards at {step}");
+            previous = fraction;
+        }
     }
 
     #[test]
