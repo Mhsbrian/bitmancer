@@ -7,6 +7,8 @@ mod announce;
 mod commands;
 mod compression;
 mod data_structures;
+mod file_packet;
+mod fragment;
 mod geo;
 mod geohash;
 mod media;
@@ -17,6 +19,7 @@ mod noise_session;
 mod peer_id;
 mod persistence;
 mod protocol;
+mod relay;
 mod transport;
 mod tui;
 
@@ -533,6 +536,45 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             // the fact, and the UI orders by this value.
             let epoch = (timestamp_ms / 1000) as i64;
             app.add_log_message(format!("__CHANNEL__:#public:{sender}:{epoch}:{content}"));
+        }
+        MeshEvent::FileReceived {
+            sender,
+            name,
+            mime,
+            bytes,
+            is_image,
+            ..
+        } => {
+            let size = format!("{:.0} KiB", bytes.len() as f64 / 1024.0);
+            if !is_image {
+                app.add_log_message(format!(
+                    "system: {sender} sent {name} ({size}) over the mesh - only images can be shown."
+                ));
+                return;
+            }
+            // Already in hand: decode straight into the cache and offer it in
+            // the viewer, with no network request of any kind.
+            match image::load_from_memory(&bytes) {
+                Ok(decoded) => {
+                    let key = media::mesh_key(&sender, &name);
+                    app.image_dimensions
+                        .insert(key.clone(), (decoded.width(), decoded.height()));
+                    app.images.insert(key.clone(), decoded);
+                    let conversation = "#public".to_string();
+                    app.viewer.remember(media::ImageLink {
+                        url: key,
+                        sender: sender.clone(),
+                        conversation,
+                    });
+                    app.add_log_message(format!(
+                        "__CHANNEL__:#public:{sender}:{}:▣ sent {name} ({size}) - /img to view",
+                        chrono::Local::now().timestamp()
+                    ));
+                }
+                Err(error) => app.add_log_message(format!(
+                    "system: {sender} sent {name} but it would not decode: {error}"
+                )),
+            }
         }
         MeshEvent::Notice(text) => {
             // Protocol diagnostics repeat a lot; only surface transitions.

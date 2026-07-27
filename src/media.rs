@@ -70,8 +70,25 @@ pub fn is_image_url(candidate: &str) -> bool {
     path.contains("/api/media/") || path.contains("/media/") || path.contains("/blossom/")
 }
 
+/// Prefix marking an image that arrived over the mesh rather than by link.
+/// Such images are already in hand, so they are never fetched.
+pub const MESH_SCHEME: &str = "mesh:";
+
+/// Stable key for an image delivered over the radio.
+pub fn mesh_key(sender: &str, name: &str) -> String {
+    format!("{MESH_SCHEME}{sender}/{name}")
+}
+
+pub fn is_mesh_key(url: &str) -> bool {
+    url.starts_with(MESH_SCHEME)
+}
+
 /// Host shown in the viewer, so it is obvious who is about to be contacted.
 pub fn host_of(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix(MESH_SCHEME) {
+        // Nothing was contacted; say so rather than inventing a hostname.
+        return format!("bluetooth mesh · {rest}");
+    }
     url.split("://")
         .nth(1)
         .and_then(|rest| rest.split('/').next())
@@ -254,6 +271,15 @@ mod tests {
     fn shows_the_host_that_would_be_contacted() {
         assert_eq!(host_of("https://glub.chat/api/media/x.gif"), "glub.chat");
         assert_eq!(host_of("http://1.2.3.4:8080/a.png"), "1.2.3.4:8080");
+    }
+
+    #[test]
+    fn mesh_images_are_marked_as_needing_no_network() {
+        let key = mesh_key("bob", "cat.png");
+        assert!(is_mesh_key(&key));
+        assert!(!is_mesh_key("https://example.com/cat.png"));
+        // The viewer must not claim a host was contacted for a radio delivery.
+        assert_eq!(host_of(&key), "bluetooth mesh · bob/cat.png");
     }
 
     #[test]

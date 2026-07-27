@@ -221,11 +221,38 @@ The TUI (`src/tui/`) still shares no types with the backend. Backend → UI mess
 
 The connection overlay covers the whole UI while disconnected; `Esc` dismisses it so the client stays usable offline (reconnection continues regardless). Keep `App::MAX_POPUP_MESSAGES` small — the popup's message pane is only about four rows.
 
+## Mesh fragments, files and relaying
+
+**Fragments (`0x20`, `fragment.rs`).** A BLE write is small, so larger frames
+arrive split: payload is `[id u64][index u16][total u16][original type u8][slice]`
+and the reassembled bytes are a *complete encoded packet*, which is what lets a
+compressed or signed inner packet survive. Reassembly feeds back through the
+same dispatch, with a guard so a fragment carrying a fragment cannot recurse.
+Bounds are upstream's: 10,000 fragments max, 128 assemblies in flight, 30s
+lifetime, and a cap on assembled size.
+
+**Files (`0x22`, `file_packet.rs`).** TLV: fileName `0x01`, fileSize `0x02`,
+mimeType `0x03`, content `0x04`. Only `content` carries a 4-byte length, and
+older senders wrote 2, so the decoder tries the canonical width and falls back.
+Images are handed to the same viewer as linked ones under a `mesh:` key, so they
+are never fetched — the bytes are already in hand.
+
+**Relaying (`relay.rs`) is a policy, not a rebroadcast, and it deliberately never
+fires today.** A flood terminates because a packet is never sent back out the
+link it arrived on — and this client holds exactly one BLE link, so every
+"relay" would be an echo to the peer that just spoke. `plan()` returns
+`Suppress("no link other than the one it came from")` in that case. Written this
+way, forwarding becomes correct by construction if multi-link support lands,
+instead of being a bug someone has to remember. It also refuses inflated TTLs,
+packets addressed to us, presence, and unknown types.
+
 ## What is not done
 
 - **Noise DMs.** `noise_protocol.rs` and `noise_session.rs` implement `Noise_XX_25519_ChaChaPoly_SHA256`, which is still the right suite, but they are wired for the old three-opcode framing (separate init/response/encrypted types). Current upstream uses unified `noiseHandshake 0x10` (direction inferred from the payload) and `noiseEncrypted 0x11` carrying an inner `NoisePayload` type byte (privateMessage 0x01, readReceipt 0x02, delivered 0x03). Both modules currently compile but are unreferenced. `/dm` and `/reply` report this instead of pretending.
-- **Fragments (0x20).** Large frames are dropped rather than reassembled; upstream fragments above ~500 bytes.
-- **Relaying.** We are a leaf node: received packets are not re-broadcast with a decremented TTL.
+- **Sending** fragments and files. Reassembly and decoding are in; the outbound
+  side (splitting our own large frames, uploading a picture) is not.
+- **Multi-link.** The transport connects to one peripheral, which is why relaying
+  never fires. Upstream holds up to six central links.
 - **Everything internet-side** — Nostr transport, geohash channels, groups, media/file transfer, voice, gossip sync — is out of scope for a mesh-only terminal client.
 
 ## Verification

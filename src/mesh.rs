@@ -12,6 +12,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::announce::{self, Announcement};
 use crate::compression;
+use crate::file_packet::FilePacket;
+use crate::fragment::{self, Append, Assembler};
 use crate::peer_id::{derive_peer_id, fingerprint, short_display};
 use crate::protocol::{peer_id_to_bytes, MessageType, Packet};
 
@@ -39,6 +41,15 @@ pub enum MeshEvent {
         sender: String,
         content: String,
         timestamp_ms: u64,
+    },
+    /// A file arrived over the mesh itself rather than as a link.
+    FileReceived {
+        peer_id: String,
+        sender: String,
+        name: String,
+        mime: Option<String>,
+        bytes: Vec<u8>,
+        is_image: bool,
     },
     /// Human-readable diagnostic destined for the message pane.
     Notice(String),
@@ -70,6 +81,8 @@ pub struct MeshService {
     seen_message_ids: HashSet<String>,
     seen_order: VecDeque<String>,
     last_announce: Option<Instant>,
+    /// Buffers fragmented packets until they are whole.
+    assembler: Assembler,
     /// When on, every inbound frame is reported to the UI. Interop bugs are
     /// otherwise invisible: unknown packet types are silently ignored.
     pub debug: bool,
@@ -92,6 +105,7 @@ impl MeshService {
             seen_message_ids: HashSet::new(),
             seen_order: VecDeque::new(),
             last_announce: None,
+            assembler: Assembler::new(),
             debug: false,
         }
     }
@@ -188,6 +202,12 @@ impl MeshService {
                 raw.len()
             ))];
         };
+        self.handle_packet(packet, false)
+    }
+
+    /// `reassembled` marks a packet that came out of the fragment buffer, so a
+    /// fragment carrying another fragment cannot recurse.
+    fn handle_packet(&mut self, packet: Packet, reassembled: bool) -> Vec<MeshEvent> {
 
         let sender = packet.sender_hex();
 
@@ -215,10 +235,52 @@ impl MeshService {
             return events;
         }
 
+        // Fragments carry a whole encoded packet; feed the reassembled bytes
+        // back through this same dispatch once every piece has arrived.
+        if packet.parsed_type() == Some(MessageType::Fragment) {
+            if reassembled {
+                events.push(MeshEvent::Notice(
+                    "ignored a fragment nested inside a fragment".to_string(),
+                ));
+                return events;
+            }
+            let Some(header) = fragment::parse(&packet) else {
+                events.push(MeshEvent::Notice(format!(
+                    "malformed fragment from {}",
+                    short_display(&sender)
+                )));
+                return events;
+            };
+            let total = header.total;
+            match self.assembler.append(header) {
+                Append::Pending { have, total } => {
+                    if self.debug {
+                        events.push(MeshEvent::Trace(format!(
+                            "fragment {have}/{total} from {}",
+                            short_display(&sender)
+                        )));
+                    }
+                }
+                Append::Rejected(reason) => events.push(MeshEvent::Notice(format!(
+                    "dropped a fragment from {}: {reason}",
+                    short_display(&sender)
+                ))),
+                Append::Complete(bytes) => match Packet::decode(&bytes) {
+                    Some(inner) => events.extend(self.handle_packet(inner, true)),
+                    None => events.push(MeshEvent::Notice(format!(
+                        "reassembled {total} fragments from {} into an undecodable packet",
+                        short_display(&sender)
+                    ))),
+                },
+            }
+            return events;
+        }
+
         events.extend(match packet.parsed_type() {
             Some(MessageType::Announce) => self.handle_announce(&packet),
             Some(MessageType::Message) => self.handle_public_message(&packet),
             Some(MessageType::Leave) => self.handle_leave(&sender),
+            Some(MessageType::FileTransfer) => self.handle_file(&packet),
             Some(MessageType::NoiseHandshake) | Some(MessageType::NoiseEncrypted) => {
                 // Stage 2: private messaging over Noise.
                 vec![MeshEvent::Notice(format!(
@@ -349,6 +411,36 @@ impl MeshService {
             sender: display_name,
             content,
             timestamp_ms: packet.timestamp,
+        }]
+    }
+
+    /// A file sent over the radio. Arrives fragmented in practice, so this only
+    /// ever sees a whole payload thanks to the assembler.
+    fn handle_file(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let sender_id = packet.sender_hex();
+        let Some(file) = FilePacket::decode(&packet.payload) else {
+            return vec![MeshEvent::Notice(format!(
+                "unreadable file from {}",
+                short_display(&sender_id)
+            ))];
+        };
+
+        if let Some(peer) = self.peers.get_mut(&sender_id) {
+            peer.last_seen = Instant::now();
+        }
+        let sender = self
+            .peers
+            .get(&sender_id)
+            .map(|peer| peer.nickname.clone())
+            .unwrap_or_else(|| format!("{}?", short_display(&sender_id)));
+
+        vec![MeshEvent::FileReceived {
+            peer_id: sender_id,
+            sender,
+            name: file.display_name(),
+            mime: file.mime_type.clone(),
+            is_image: file.is_image(),
+            bytes: file.content,
         }]
     }
 
@@ -700,6 +792,165 @@ mod tests {
             events.as_slice(),
             [MeshEvent::PeerRenamed { nickname, .. }] if nickname == "robert"
         ));
+    }
+
+    #[test]
+    fn a_fragmented_message_arrives_whole() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        // Bob sends a message, then it is split the way the radio layer splits
+        // anything too big for one write.
+        let frames = bob.public_message_frames("fragmented hello");
+        let inner = Packet::decode(&frames[0]).unwrap().encode().unwrap();
+
+        let mut events = Vec::new();
+        let chunks: Vec<&[u8]> = inner.chunks(40).collect();
+        let total = chunks.len();
+        assert!(total > 1, "test needs a real split");
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&7u64.to_be_bytes());
+            payload.extend_from_slice(&(index as u16).to_be_bytes());
+            payload.extend_from_slice(&(total as u16).to_be_bytes());
+            payload.push(MessageType::Message as u8);
+            payload.extend_from_slice(chunk);
+            let fragment = Packet::new(
+                MessageType::Fragment,
+                peer_id_to_bytes(&bob.my_peer_id),
+                payload,
+                7,
+            );
+            events.extend(alice.handle_frame(&fragment.encode().unwrap()));
+        }
+
+        match events.as_slice() {
+            [MeshEvent::PublicMessage { sender, content, .. }] => {
+                assert_eq!(sender, "bob");
+                assert_eq!(content, "fragmented hello");
+            }
+            other => panic!("expected the reassembled message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_image_sent_over_the_radio_arrives_whole() {
+        // The full path a phone-sent picture takes: a file packet, split into
+        // fragments because a BLE write is small, reassembled here.
+        use crate::file_packet::FilePacket;
+
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        // A real PNG, so the decode at the far end is genuine.
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(24, 18)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let file = FilePacket {
+            file_name: Some("photo.png".into()),
+            file_size: Some(png.len() as u64),
+            mime_type: Some("image/png".into()),
+            content: png.clone(),
+        };
+        let inner = Packet::new(
+            MessageType::FileTransfer,
+            peer_id_to_bytes(&bob.my_peer_id),
+            file.encode().expect("encodes"),
+            7,
+        )
+        .encode()
+        .expect("frames");
+        assert!(inner.len() > 200, "worth fragmenting");
+
+        let chunks: Vec<&[u8]> = inner.chunks(120).collect();
+        let total = chunks.len();
+        let mut events = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&555u64.to_be_bytes());
+            payload.extend_from_slice(&(index as u16).to_be_bytes());
+            payload.extend_from_slice(&(total as u16).to_be_bytes());
+            payload.push(MessageType::FileTransfer as u8);
+            payload.extend_from_slice(chunk);
+            let fragment = Packet::new(
+                MessageType::Fragment,
+                peer_id_to_bytes(&bob.my_peer_id),
+                payload,
+                7,
+            );
+            events.extend(alice.handle_frame(&fragment.encode().unwrap()));
+        }
+
+        match events.as_slice() {
+            [MeshEvent::FileReceived {
+                sender,
+                name,
+                mime,
+                bytes,
+                is_image,
+                ..
+            }] => {
+                assert_eq!(sender, "bob");
+                assert_eq!(name, "photo.png");
+                assert_eq!(mime.as_deref(), Some("image/png"));
+                assert!(is_image);
+                assert_eq!(bytes, &png, "the picture survives fragmentation intact");
+                // And it is a decodable image, not just matching bytes.
+                let decoded = image::load_from_memory(bytes).expect("valid png");
+                assert_eq!((decoded.width(), decoded.height()), (24, 18));
+            }
+            other => panic!("expected a received file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_image_file_is_reported_but_not_decoded() {
+        use crate::file_packet::FilePacket;
+        let mut alice = service(1);
+        let file = FilePacket {
+            file_name: Some("note.m4a".into()),
+            file_size: None,
+            mime_type: Some("audio/mp4".into()),
+            content: vec![7u8; 64],
+        };
+        let packet = Packet::new(MessageType::FileTransfer, [3; 8], file.encode().unwrap(), 7);
+
+        match alice.handle_frame(&packet.encode().unwrap()).as_slice() {
+            [MeshEvent::FileReceived { is_image, name, .. }] => {
+                assert!(!is_image);
+                assert_eq!(name, "note.m4a");
+            }
+            other => panic!("expected a file event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fragment_nested_in_a_fragment_is_refused() {
+        // Otherwise a crafted packet could recurse until the stack gave out.
+        let mut alice = service(1);
+        let inner = Packet::new(MessageType::Fragment, [2; 8], vec![0u8; 13], 7)
+            .encode()
+            .unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        payload.push(MessageType::Fragment as u8);
+        payload.extend_from_slice(&inner);
+        let outer = Packet::new(MessageType::Fragment, [2; 8], payload, 7);
+
+        let events = alice.handle_frame(&outer.encode().unwrap());
+        match events.as_slice() {
+            [MeshEvent::Notice(text)] => assert!(text.contains("nested"), "{text}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
