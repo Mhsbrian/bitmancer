@@ -27,7 +27,6 @@ mod tui;
 
 use std::time::{Duration, Instant};
 
-use chrono::Local;
 use crossterm::event as crossterm_event;
 use crossterm::event::Event as CrosstermEvent;
 use tokio::sync::mpsc;
@@ -751,7 +750,7 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
         MeshEvent::FileReceived {
             sender,
             name,
-            mime,
+            mime: _,
             bytes,
             is_image,
             ..

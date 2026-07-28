@@ -359,6 +359,17 @@ packets addressed to us, presence, and unknown types.
 
 ## Verification
 
+CI runs build, test and `clippy -D warnings` on every push and pull request
+(`.github/workflows/ci.yml`), all with `--all-targets` so the test code is
+compiled too. That last flag is not incidental: while getting the tree clean,
+the library built without a single warning while the tests did not compile at
+all, and `clippy` reported zero warnings because it never got far enough to
+find any. A gate that only checks the library is measuring the wrong half.
+
+`cargo fmt` is deliberately not enforced. The tree is not rustfmt-clean and
+running it would reflow comment blocks that are laid out by hand.
+
+
 There is no second BitChat device in this environment and no loopback mode, so protocol work is verified by unit tests rather than live traffic. Two things help:
 
 - `mesh.rs` tests wire two `MeshService` instances together, which exercises encode → decode → verify end to end.

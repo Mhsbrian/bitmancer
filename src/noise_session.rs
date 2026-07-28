@@ -1,3 +1,9 @@
+
+// The session manager exposes more than the mesh layer currently calls -
+// per-session state queries, verification bookkeeping, rekeying. It is the API
+// the remaining private-messaging work builds on; trimming it to today's call
+// sites would mean restoring it piecemeal.
+#![allow(dead_code)]
 use crate::data_structures::EncryptionStatus;
 use crate::debug_full_println;
 use crate::noise_protocol::{
@@ -961,14 +967,14 @@ impl NoiseSessionManager {
                             // Don't reset session on encryption failure, just return error
                         }
                     }
-                    return result;
+                    result
                 } else {
                     log_noise_event(
                         "ENCRYPT_MESSAGE_NO_CIPHER",
                         peer_id,
                         "Session established but no send cipher available",
                     );
-                    return Err(NoiseError::NotEstablished);
+                    Err(NoiseError::NotEstablished)
                 }
             } else {
                 log_noise_event(
@@ -979,7 +985,7 @@ impl NoiseSessionManager {
                         session.get_state()
                     ),
                 );
-                return Err(NoiseError::NotEstablished);
+                Err(NoiseError::NotEstablished)
             }
         } else {
             log_noise_event(
@@ -987,7 +993,7 @@ impl NoiseSessionManager {
                 peer_id,
                 "No session found for peer",
             );
-            return Err(NoiseError::SessionNotFound);
+            Err(NoiseError::SessionNotFound)
         }
     }
 
@@ -1057,14 +1063,14 @@ impl NoiseSessionManager {
                             // Don't reset session on decryption failure, just return error
                         }
                     }
-                    return result;
+                    result
                 } else {
                     log_noise_event(
                         "DECRYPT_MESSAGE_NO_CIPHER",
                         peer_id,
                         "Session established but no receive cipher available",
                     );
-                    return Err(NoiseError::NotEstablished);
+                    Err(NoiseError::NotEstablished)
                 }
             } else {
                 log_noise_event(
@@ -1075,7 +1081,7 @@ impl NoiseSessionManager {
                         session.get_state()
                     ),
                 );
-                return Err(NoiseError::NotEstablished);
+                Err(NoiseError::NotEstablished)
             }
         } else {
             log_noise_event(
@@ -1083,7 +1089,7 @@ impl NoiseSessionManager {
                 peer_id,
                 "No session found for peer",
             );
-            return Err(NoiseError::SessionNotFound);
+            Err(NoiseError::SessionNotFound)
         }
     }
 
@@ -1306,7 +1312,7 @@ impl NoiseSessionManager {
         // Validate and store the key for future handshakes
         let static_key_array: [u8; 32] = static_key_bytes.try_into()
             .map_err(|_| NoiseError::InvalidPublicKey)?;
-        let public_key = PublicKey::from(static_key_array);
+        let _public_key = PublicKey::from(static_key_array);
         
         // Store in a map for later use during handshakes
         // You might need to add a field to store these keys
@@ -1319,7 +1325,7 @@ impl Clone for NoiseSession {
     fn clone(&self) -> Self {
         Self {
             peer_id: self.peer_id.clone(),
-            role: self.role.clone(),
+            role: self.role,
             state: self.state.clone(),
             handshake_state: self.handshake_state.clone(),
             send_cipher: self.send_cipher.clone(),
@@ -1336,7 +1342,7 @@ impl Clone for NoiseSession {
 impl Clone for NoiseCipherState {
     fn clone(&self) -> Self {
         Self {
-            key: self.key.clone(),
+            key: self.key,
             nonce: self.nonce,
             use_extracted_nonce: self.use_extracted_nonce,
             highest_received_nonce: self.highest_received_nonce,
@@ -1348,8 +1354,8 @@ impl Clone for NoiseCipherState {
 impl Clone for NoiseHandshakeState {
     fn clone(&self) -> Self {
         Self {
-            role: self.role.clone(),
-            pattern: self.pattern.clone(),
+            role: self.role,
+            pattern: self.pattern,
             symmetric_state: self.symmetric_state.clone(),
             local_static_private: self.local_static_private.clone(),
             local_static_public: self.local_static_public,

@@ -42,6 +42,9 @@ pub struct FragmentHeader {
     pub key: FragmentKey,
     pub index: usize,
     pub total: usize,
+    /// Carried through reassembly for callers that need to know what was
+    /// fragmented; the mesh layer re-decodes the joined bytes instead.
+    #[allow(dead_code)]
     pub original_type: u8,
     pub data: Vec<u8>,
 }
@@ -210,6 +213,8 @@ impl Assembler {
             .retain(|_, assembly| assembly.started.elapsed() < ASSEMBLY_LIFETIME);
     }
 
+    /// Assemblies currently buffered. A diagnostic for /debug and the tests.
+    #[allow(dead_code)]
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
     }

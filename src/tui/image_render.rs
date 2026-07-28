@@ -27,6 +27,8 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Human name for the detected backend, for /status.
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Backend::Kitty => "kitty graphics",
@@ -126,7 +128,7 @@ pub fn half_blocks(image: &DynamicImage, cols: u16, rows: u16) -> Vec<Line<'stat
 // MARK: - Kitty graphics protocol
 
 /// Identifier we reuse for every image, so a new one replaces the old.
-pub const KITTY_IMAGE_ID: u32 = 8_1_15;
+pub const KITTY_IMAGE_ID: u32 = 8115;
 /// Kitty requires escape payloads to be chunked.
 const CHUNK: usize = 4096;
 

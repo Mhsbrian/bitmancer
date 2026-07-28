@@ -215,6 +215,8 @@ impl MapState {
         self.activity.get(geohash)
     }
 
+    /// Forgets sampled activity so a re-open starts cold.
+    #[allow(dead_code)]
     pub fn clear_activity(&mut self) {
         self.activity.clear();
     }

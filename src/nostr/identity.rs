@@ -49,7 +49,7 @@ impl IdentityStore {
             mac.update(&iteration.to_be_bytes());
             let candidate = mac.finalize().into_bytes();
 
-            if let Ok(secret) = SecretKey::from_slice(&candidate) {
+            if let Ok(secret) = SecretKey::from_byte_array(candidate.into()) {
                 return Keypair::from_secret_key(SECP256K1, &secret);
             }
         }
@@ -58,7 +58,7 @@ impl IdentityStore {
         hasher.update(seed);
         hasher.update(geohash.as_bytes());
         let fallback = hasher.finalize();
-        let secret = SecretKey::from_slice(&fallback)
+        let secret = SecretKey::from_byte_array(fallback.into())
             .expect("sha256 of seed+geohash is a valid scalar with overwhelming probability");
         Keypair::from_secret_key(SECP256K1, &secret)
     }
@@ -70,6 +70,9 @@ impl IdentityStore {
     }
 
     /// Forgets cached keys; used when the device seed is rotated.
+    /// Drops every derived per-geohash identity. Kept for the wipe path to
+    /// call once geo identities are held across a session.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.cache.clear();
     }
@@ -113,7 +116,7 @@ mod tests {
         mac.update(&0u32.to_be_bytes());
         let expected_secret = mac.finalize().into_bytes();
 
-        let secret = SecretKey::from_slice(&expected_secret).expect("valid scalar for this seed");
+        let secret = SecretKey::from_byte_array(expected_secret.into()).expect("valid scalar for this seed");
         let expected = Keypair::from_secret_key(SECP256K1, &secret);
 
         let mut store = IdentityStore::new(SEED);

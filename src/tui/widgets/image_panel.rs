@@ -76,7 +76,7 @@ fn render_picture(f: &mut Frame, app: &mut App, area: Rect) -> Option<ImageSlot>
             None
         }
         LoadState::Ready => {
-            let Some(url) = url else { return None };
+            let url = url?;
             let Some(image) = app.images.get(&url) else {
                 centered_note(f, inner, "△  dropped from cache", theme::FAULT);
                 return None;

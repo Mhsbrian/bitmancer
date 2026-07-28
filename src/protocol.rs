@@ -398,7 +398,7 @@ pub fn pad(data: Vec<u8>, target_size: usize) -> Vec<u8> {
         return data;
     }
     let mut padded = data;
-    padded.extend(std::iter::repeat(padding_needed as u8).take(padding_needed));
+    padded.extend(std::iter::repeat_n(padding_needed as u8, padding_needed));
     padded
 }
 

@@ -584,7 +584,7 @@ impl App {
         let conversation = self.active_conversation();
         let nickname = self.nickname.clone();
         self.note_image_link(&nickname, &conversation, &text);
-        let timestamp = chrono::Local::now().format("%H:%M").to_string();
+        let _timestamp = chrono::Local::now().format("%H:%M").to_string();
         let msg = Message::now(self.nickname.clone(), text, true);
 
         let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
@@ -598,13 +598,6 @@ impl App {
         self.scroll_to_bottom_current_conversation();
     }
 
-    pub fn add_dm_message(&mut self, target_nickname: String, content: String) {
-        let timestamp = chrono::Local::now().format("%H:%M").to_string();
-        let msg = Message::now(self.nickname.clone(), content, true);
-        let admitted = self.arrival_gate.admit();
-        push_arrival(self.dm_messages.entry(target_nickname).or_default(), msg, admitted);
-        self.scroll_to_bottom_current_conversation();
-    }
 
     pub fn scroll_to_bottom_current_conversation(&mut self) {
         self.msg_scroll = 0;
@@ -895,7 +888,7 @@ impl App {
         }
         
         // Ensure minimum height and reasonable maximum
-        std::cmp::max(3, std::cmp::min(lines_needed + 2, 10)) // +2 for borders, max 10 lines
+        (lines_needed + 2).clamp(3, 10) // +2 for borders, max 10 lines
     }
 }
 

@@ -163,7 +163,7 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
                         1 => { if let Some(channel_name) = app.channels.get(child_idx) { app.switch_to_channel(channel_name.clone()); } }
                         2 => { if let Some(person_name) = app.people.get(child_idx) { app.switch_to_dm(person_name.clone()); } }
                         3 => app.sidebar_state.blocked_selected = Some(child_idx),
-                        4 => { if child_idx == 0 { app.open_nickname_popup(); } }
+                        4 if child_idx == 0 => { app.open_nickname_popup(); }
                         _ => {}
                     }
                     if section_idx != 1 { app.update_current_conversation(); }
@@ -220,6 +220,25 @@ fn handle_popup_events(app: &mut App, key_event: KeyEvent, _input_tx: &mpsc::Sen
         _ => {
             // FIX: Ignore the return value of handle_event
             let _ = app.popup_input.handle_event(&CrosstermEvent::Key(key_event));
+        }
+    }
+}
+
+fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
+    match key_event.code {
+        KeyCode::Enter => {
+            let input_str = app.input.value().to_string();
+            if !input_str.is_empty()
+                && input_tx.try_send(input_str.clone()).is_ok() {
+                    if !input_str.starts_with('/') {
+                        app.add_sent_message(input_str);
+                    }
+                    app.input.reset();
+                }
+        }
+        _ => {
+            // FIX: Ignore the return value of handle_event
+            let _ = app.input.handle_event(&CrosstermEvent::Key(key_event));
         }
     }
 }
@@ -392,25 +411,5 @@ mod tests {
         app.switch_to_channel("#9q8yy".to_string());
         app.open_map();
         assert_eq!(app.map.selected_geohash(), "9q8yy");
-    }
-}
-
-fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
-    match key_event.code {
-        KeyCode::Enter => {
-            let input_str = app.input.value().to_string();
-            if !input_str.is_empty() {
-                if input_tx.try_send(input_str.clone()).is_ok() {
-                    if !input_str.starts_with('/') {
-                        app.add_sent_message(input_str);
-                    }
-                    app.input.reset();
-                }
-            }
-        }
-        _ => {
-            // FIX: Ignore the return value of handle_event
-            let _ = app.input.handle_event(&CrosstermEvent::Key(key_event));
-        }
     }
 }

@@ -20,7 +20,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let available_width = area.width.saturating_sub(2) as usize; // Account for borders
 
     // Split text into lines based on available width
-    let lines = wrap_text(&input_text, available_width);
+    let lines = wrap_text(input_text, available_width);
 
     // Name the destination rather than saying "type a message": in a client
     // with two networks and several channels, where the text is about to go is
@@ -68,7 +68,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Calculate cursor position for multi-line input
     let cursor_pos = app.input.visual_cursor();
-    let (cursor_line, cursor_col) = calculate_cursor_position(&input_text, cursor_pos, available_width);
+    let (cursor_line, cursor_col) = calculate_cursor_position(input_text, cursor_pos, available_width);
     
     // Two columns for the prompt glyph, no border row to skip.
     f.set_cursor(area.x + cursor_col as u16 + 2, area.y + cursor_line as u16);
@@ -127,7 +127,6 @@ fn calculate_cursor_position(text: &str, cursor_pos: usize, max_width: usize) ->
     
     let mut line = 0;
     let mut col = 0;
-    let mut _char_count = 0;
     
     for &ch in &chars[..cursor_chars] {
         if ch == '\n' {
@@ -140,7 +139,6 @@ fn calculate_cursor_position(text: &str, cursor_pos: usize, max_width: usize) ->
                 col = 0;
             }
         }
-        _char_count += 1;
     }
     
     (line, col)

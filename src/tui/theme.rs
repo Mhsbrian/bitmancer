@@ -158,11 +158,6 @@ pub fn spinner(tick: usize) -> &'static str {
     SPINNER[(tick / 2) % SPINNER.len()]
 }
 
-/// Emphasis for a line that mentions you.
-pub fn mention() -> Style {
-    Style::default().fg(ALERT).add_modifier(Modifier::BOLD)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

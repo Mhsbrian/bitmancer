@@ -34,6 +34,10 @@ const PEER_RETENTION: Duration = Duration::from_secs(60);
 const SEEN_LIMIT: usize = 512;
 
 #[derive(Debug, Clone)]
+// Several variants carry a peer_id the UI does not read yet. It stays because
+// an event without its subject cannot be acted on - blocking a peer from a
+// message they sent, or replying privately to one, both need it.
+#[allow(dead_code)]
 pub enum MeshEvent {
     PeerAppeared { peer_id: String, nickname: String },
     /// A frame the mesh layer produced while handling an inbound one, for the
@@ -81,6 +85,10 @@ pub enum MeshEvent {
 pub struct MeshPeer {
     pub peer_id: String,
     pub nickname: String,
+    /// The announced key this peer's ID and fingerprint were derived from.
+    /// Retained rather than recomputed: verifying a re-announce means checking
+    /// the new key against the one we already accepted.
+    #[allow(dead_code)]
     pub noise_public_key: Vec<u8>,
     pub signing_public_key: Vec<u8>,
     pub fingerprint: String,
@@ -940,10 +948,6 @@ impl MeshService {
             .collect();
         names.sort();
         names
-    }
-
-    pub fn peer_by_nickname(&self, nickname: &str) -> Option<&MeshPeer> {
-        self.peers.values().find(|peer| peer.nickname == nickname)
     }
 
     /// Dedup key for a broadcast. The wire carries no message ID any more, so

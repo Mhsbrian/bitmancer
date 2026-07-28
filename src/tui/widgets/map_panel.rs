@@ -50,7 +50,7 @@ fn heat_color(voices: usize, peak: usize) -> Color {
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let map = &app.map;
+    let _map = &app.map;
 
     // Leave a margin so the map reads as an overlay, not a replacement.
     let overlay = centered(area, 92, 88);

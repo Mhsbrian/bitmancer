@@ -77,7 +77,7 @@ impl Event {
             kind,
             tags,
             content,
-            sig: hex::encode(signature.serialize()),
+            sig: hex::encode(signature.to_byte_array()),
         }
     }
 
@@ -98,12 +98,20 @@ impl Event {
         else {
             return false;
         };
-        let (Ok(pubkey), Ok(signature)) = (
-            XOnlyPublicKey::from_slice(&pubkey_bytes),
-            Signature::from_slice(&sig_bytes),
+        // The byte-array constructors are fixed width, so a wrong-length hex
+        // string is rejected here rather than inside secp256k1.
+        let (Ok(pubkey_bytes), Ok(sig_bytes)) = (
+            <[u8; 32]>::try_from(pubkey_bytes.as_slice()),
+            <[u8; 64]>::try_from(sig_bytes.as_slice()),
         ) else {
             return false;
         };
+        // Only the key can fail to parse: a signature is any 64 bytes, and
+        // whether those bytes verify is the next question, not this one.
+        let Ok(pubkey) = XOnlyPublicKey::from_byte_array(pubkey_bytes) else {
+            return false;
+        };
+        let signature = Signature::from_byte_array(sig_bytes);
         SECP256K1
             .verify_schnorr(&signature, &expected_id, &pubkey)
             .is_ok()
@@ -151,7 +159,7 @@ mod tests {
     use secp256k1::SecretKey;
 
     fn keypair(seed: u8) -> Keypair {
-        let secret = SecretKey::from_slice(&[seed.max(1); 32]).unwrap();
+        let secret = SecretKey::from_byte_array([seed.max(1); 32]).unwrap();
         Keypair::from_secret_key(SECP256K1, &secret)
     }
 

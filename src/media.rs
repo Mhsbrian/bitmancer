@@ -79,6 +79,9 @@ pub fn mesh_key(sender: &str, name: &str) -> String {
     format!("{MESH_SCHEME}{sender}/{name}")
 }
 
+/// Distinguishes a mesh-delivered image from a fetched one. Kept for the
+/// viewer work that will need to say where a picture came from.
+#[allow(dead_code)]
 pub fn is_mesh_key(url: &str) -> bool {
     url.starts_with(MESH_SCHEME)
 }
@@ -212,6 +215,8 @@ impl ImageCache {
         self.order.push(url.to_string());
     }
 
+    /// Cached image count, for tests and diagnostics.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

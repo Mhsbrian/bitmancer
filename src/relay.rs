@@ -13,6 +13,10 @@
 // multi-link support arrives, forwarding becomes correct by construction instead
 // of needing to be remembered.
 
+// Every item here is unused today by design, not by neglect: the policy is
+// written and tested so that forwarding becomes correct the moment a second
+// link exists, rather than being remembered later. See NOTES.md.
+#![allow(dead_code)]
 use crate::protocol::{MessageType, Packet};
 
 /// Upstream's `messageTTLDefault`, and the ceiling we accept from a peer.

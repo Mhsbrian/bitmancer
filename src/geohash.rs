@@ -75,6 +75,9 @@ pub fn normalize(input: &str) -> String {
     input.trim().trim_start_matches('#').to_lowercase()
 }
 
+/// The inverse of `decode`, exercised by the round-trip tests. Nothing in the
+/// client encodes a geohash today; the map works from cells it was given.
+#[allow(dead_code)]
 pub fn encode(latitude: f64, longitude: f64, precision: usize) -> String {
     if precision == 0 {
         return String::new();
@@ -266,6 +269,9 @@ pub fn grid_layout(prefix: &str) -> Vec<GridCell> {
 }
 
 /// Rows and columns in the child grid of `prefix`.
+/// Cell counts for a precision. Exercised by the layout tests; the map derives
+/// its grid from the visible bounding box instead.
+#[allow(dead_code)]
 pub fn grid_dimensions(prefix: &str) -> (usize, usize) {
     let layout = grid_layout(prefix);
     let rows = layout.iter().map(|cell| cell.row).max().unwrap_or(0) + 1;

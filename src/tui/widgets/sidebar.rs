@@ -5,7 +5,7 @@ use ratatui::{
     prelude::{Frame, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{List, ListItem},
 };
 
 use crate::tui::app::{App, FocusArea};

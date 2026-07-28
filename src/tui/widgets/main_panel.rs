@@ -1,15 +1,15 @@
 // src/tui/widgets/main_panel.rs
 
 use ratatui::{
-    prelude::{Constraint, Direction, Frame, Layout, Rect},
-    style::{Color, Modifier, Style},
+    prelude::{Frame, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::tui::app::{App, FocusArea};
+use crate::tui::app::App;
 use crate::tui::theme;
 
 /// "HH:MM"
@@ -290,7 +290,7 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
         };
         // The whole block a message occupies carries the mark, not only its
         // first row, so a wrapped paragraph settles as one thing.
-        gutter.extend(std::iter::repeat(intensity).take(rows.len()));
+        gutter.extend(std::iter::repeat_n(intensity, rows.len()));
         rows
     }).collect();
 

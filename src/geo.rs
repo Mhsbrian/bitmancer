@@ -74,6 +74,8 @@ impl GeoService {
         self.nickname = nickname.to_string();
     }
 
+    /// Membership check kept beside `joined()`; the UI asks for the list.
+    #[allow(dead_code)]
     pub fn is_joined(&self, geohash: &str) -> bool {
         self.channels.contains_key(geohash)
     }

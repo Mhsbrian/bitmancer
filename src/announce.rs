@@ -63,7 +63,7 @@ impl Announcement {
 
         if let Some(neighbors) = &self.direct_neighbors {
             let flat: Vec<u8> = neighbors.iter().take(10).flatten().copied().collect();
-            if !flat.is_empty() && flat.len() % 8 == 0 && flat.len() <= 255 {
+            if !flat.is_empty() && flat.len().is_multiple_of(8) && flat.len() <= 255 {
                 push_tlv(&mut data, TLV_DIRECT_NEIGHBORS, &flat);
             }
         }
@@ -108,7 +108,7 @@ impl Announcement {
                 TLV_NOISE_PUBLIC_KEY => noise_public_key = Some(value.to_vec()),
                 TLV_SIGNING_PUBLIC_KEY => signing_public_key = Some(value.to_vec()),
                 TLV_DIRECT_NEIGHBORS => {
-                    if length > 0 && length % 8 == 0 {
+                    if length > 0 && length.is_multiple_of(8) {
                         direct_neighbors = Some(
                             value
                                 .chunks_exact(8)
@@ -118,11 +118,10 @@ impl Announcement {
                     }
                 }
                 TLV_CAPABILITIES => capabilities = Some(value.to_vec()),
-                TLV_BRIDGE_GEOHASH => {
-                    if length <= 12 {
+                TLV_BRIDGE_GEOHASH
+                    if length <= 12 => {
                         bridge_geohash = String::from_utf8(value.to_vec()).ok();
                     }
-                }
                 _ => {}
             }
         }

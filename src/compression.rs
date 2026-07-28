@@ -25,6 +25,10 @@ pub fn should_compress(data: &[u8]) -> bool {
     (unique.len() as f64 / sample_size as f64) < 0.9
 }
 
+/// Unused outbound: we never compress, because a canonical re-encode on the
+/// far side would not reproduce our DEFLATE. Kept as the inverse of `decompress`,
+/// which the round-trip tests exercise.
+#[allow(dead_code)]
 pub fn compress(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < COMPRESSION_THRESHOLD {
         return None;

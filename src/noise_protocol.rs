@@ -1,13 +1,19 @@
+
+// The unused items are the rest of the Noise specification - handshake patterns
+// we do not initiate, replay-window constants, and mixing steps only some
+// patterns use. Keeping the suite whole is cheaper than reconstructing it when
+// a pattern is needed, and a partial implementation of a cryptographic spec is
+// the kind of thing that looks fine until it does not.
+#![allow(dead_code)]
 use crate::debug_full_println;
 use chacha20poly1305::aead::{Aead as ChaChaAead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce};
+use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey};
 use generic_array::GenericArray;
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac as HmacMac};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
-use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 // MARK: - Debug Logging
 
@@ -274,7 +280,7 @@ impl NoiseCipherState {
             let nonce_array = GenericArray::clone_from_slice(&nonce_bytes);
 
             // Create cipher
-            let cipher = ChaCha20Poly1305::new(key.into());
+            let cipher = ChaCha20Poly1305::new(key);
 
             // Create payload with associated data
             let payload = Payload {
@@ -365,7 +371,7 @@ impl NoiseCipherState {
             let nonce_array = GenericArray::clone_from_slice(&nonce_bytes);
 
             // Create cipher and decrypt
-            let cipher = ChaCha20Poly1305::new(key.into());
+            let cipher = ChaCha20Poly1305::new(key);
             let payload = Payload {
                 msg: &encrypted_payload,
                 aad: associated_data,
@@ -619,7 +625,7 @@ impl NoiseHandshakeState {
         remote_static_key: Option<PublicKey>,
     ) -> Self {
         // Initialize protocol name
-        let protocol_name = NoiseProtocolName::new(&pattern.pattern_name());
+        let protocol_name = NoiseProtocolName::new(pattern.pattern_name());
         let full_name = protocol_name.full_name();
         log_noise_protocol_event("HANDSHAKE_INIT", &format!("Protocol name: {}", full_name));
         let symmetric_state = NoiseSymmetricState::new(&full_name);
@@ -643,7 +649,7 @@ impl NoiseHandshakeState {
             pattern,
             symmetric_state,
             local_static_private: local_static_key.clone(),
-            local_static_public: local_static_key.as_ref().map(|k| PublicKey::from(k)),
+            local_static_public: local_static_key.as_ref().map(PublicKey::from),
             local_ephemeral_private: None,
             local_ephemeral_public: None,
             remote_static_public: remote_static_key,
@@ -713,7 +719,7 @@ impl NoiseHandshakeState {
                     log_noise_protocol_event("WRITE_MESSAGE_E", "Generating ephemeral key");
                     // Generate ephemeral key
                     self.local_ephemeral_private =
-                        Some(StaticSecret::random_from_rng(&mut rand::thread_rng()));
+                        Some(StaticSecret::random_from_rng(rand::thread_rng()));
                     self.local_ephemeral_public = Some(PublicKey::from(
                         self.local_ephemeral_private.as_ref().unwrap(),
                     ));
@@ -1362,8 +1368,6 @@ impl NoiseHandshakeState {
         let key_array: [u8; 32] = key_data
             .try_into()
             .map_err(|_| NoiseError::InvalidPublicKey)?;
-        match PublicKey::from(key_array) {
-            public_key => Ok(public_key),
-        }
+        Ok(PublicKey::from(key_array))
     }
 }

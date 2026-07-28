@@ -28,6 +28,9 @@ pub struct Filter {
 impl Filter {
     /// Upstream's `NostrFilter.geohashEphemeral`: chat plus presence for one
     /// geohash.
+    /// Filter for a single cell's ephemeral events. The client subscribes by
+    /// batch; this is the single-cell form the sampler tests use.
+    #[allow(dead_code)]
     pub fn geohash_ephemeral(geohash: &str, since: Option<i64>, limit: usize) -> Self {
         Self::geohashes(&[geohash.to_string()], since, limit)
     }
@@ -125,7 +128,7 @@ mod tests {
     use secp256k1::{Keypair, SecretKey, SECP256K1};
 
     fn sample_event() -> Event {
-        let secret = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let secret = SecretKey::from_byte_array([9u8; 32]).unwrap();
         let keypair = Keypair::from_secret_key(SECP256K1, &secret);
         Event::signed(
             &keypair,

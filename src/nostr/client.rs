@@ -34,6 +34,9 @@ const SEEN_LIMIT: usize = 4096;
 #[derive(Debug, Clone)]
 pub enum GeoEvent {
     RelayConnected {
+        /// Which cell the event arrived from. The subscription already knows,
+        /// but an event without its channel cannot be routed by a later caller.
+        #[allow(dead_code)]
         geohash: String,
         relay: String,
     },
@@ -53,6 +56,8 @@ pub enum GeoEvent {
     Presence {
         geohash: String,
         pubkey: String,
+        /// Send time, kept beside the content so ordering does not depend on arrival.
+        #[allow(dead_code)]
         created_at: i64,
     },
     /// The relays have finished replaying stored history for this channel;
@@ -402,6 +407,11 @@ fn remember(seen: &mut HashSet<String>, order: &mut VecDeque<String>, id: &str) 
 }
 
 /// Holds one relay socket open for one geohash subscription.
+///
+/// The parameters are the subscription's whole identity - url, key, geohash,
+/// filters, channels. Bundling them into a struct would move the same fields
+/// behind one name without making the call site say less.
+#[allow(clippy::too_many_arguments)]
 async fn relay_task(
     url: String,
     key: String,
@@ -663,7 +673,7 @@ pub async fn sample_doctor(prefix: &str, seconds: u64) -> i32 {
     }
 
     let mut ranked: Vec<(&String, &(usize, usize))> = heat.iter().collect();
-    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    ranked.sort_by_key(|(_, (voices, _))| std::cmp::Reverse(*voices));
     for (cell, (voices, messages)) in ranked.iter().take(20) {
         println!("  #{cell:<10} {voices:>5} events  {messages:>4} msg");
     }

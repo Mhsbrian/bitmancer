@@ -85,7 +85,7 @@ fn mine_attempt(
 
         nonce += 1;
         // Checking the clock every hash is wasteful; 8 bits averages 256 tries.
-        if nonce % 256 == 0 && Instant::now() >= deadline {
+        if nonce.is_multiple_of(256) && Instant::now() >= deadline {
             return None;
         }
     }

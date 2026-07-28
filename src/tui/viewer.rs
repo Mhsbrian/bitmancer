@@ -61,6 +61,8 @@ impl Viewer {
             .collect()
     }
 
+    /// Images available in a conversation, for the viewer's position hint.
+    #[allow(dead_code)]
     pub fn count_in(&self, conversation: &str) -> usize {
         self.links_in(conversation).len()
     }

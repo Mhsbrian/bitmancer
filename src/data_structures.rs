@@ -19,8 +19,11 @@ pub static mut DEBUG_LEVEL: DebugLevel = DebugLevel::Clean;
 #[macro_export]
 macro_rules! debug_println {
     ($($arg:tt)*) => {
-        unsafe {
-            if crate::data_structures::DEBUG_LEVEL as u8 >= crate::data_structures::DebugLevel::Basic as u8 {
+        // Only the static read needs unsafe. Expanding the caller's tokens
+        // inside the block would hand them unsafe they never asked for.
+        {
+            let level = unsafe { $crate::data_structures::DEBUG_LEVEL as u8 };
+            if level >= $crate::data_structures::DebugLevel::Basic as u8 {
                 println!($($arg)*);
             }
         }
@@ -31,8 +34,11 @@ macro_rules! debug_println {
 #[macro_export]
 macro_rules! debug_full_println {
     ($($arg:tt)*) => {
-        unsafe {
-            if crate::data_structures::DEBUG_LEVEL as u8 >= crate::data_structures::DebugLevel::Full as u8 {
+        // Only the static read needs unsafe. Expanding the caller's tokens
+        // inside the block would hand them unsafe they never asked for.
+        {
+            let level = unsafe { $crate::data_structures::DEBUG_LEVEL as u8 };
+            if level >= $crate::data_structures::DebugLevel::Full as u8 {
                 println!($($arg)*);
             }
         }
