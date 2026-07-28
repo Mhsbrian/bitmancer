@@ -336,6 +336,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.add_log_message(format!("system: {text}"));
                     }
                 }
+                CommandOutcome::SendFile(path) => {
+                    match load_outgoing_file(&path) {
+                        Ok((name, mime, bytes)) => {
+                            let size = bytes.len();
+                            match mesh.file_frames(&name, mime, bytes) {
+                                Ok(frames) => {
+                                    // Say the cost before spending it: a
+                                    // megabyte is thousands of BLE writes and
+                                    // the pane would otherwise sit silent.
+                                    app.add_log_message(format!(
+                                        "system: sending {name} ({:.0} KiB) as {} fragments...",
+                                        size as f64 / 1024.0,
+                                        frames.len()
+                                    ));
+                                    for frame in frames {
+                                        let _ = transport.outbound.send(frame).await;
+                                    }
+                                    app.add_log_message(format!("system: {name} sent."));
+                                }
+                                Err(reason) => {
+                                    app.add_log_message(format!("system: {reason}"))
+                                }
+                            }
+                        }
+                        Err(reason) => app.add_log_message(format!("system: {reason}")),
+                    }
+                }
                 CommandOutcome::WipeIdentity => {
                     // Tell the mesh we are going before the keys are gone, so
                     // peers drop us now rather than timing us out.
@@ -622,6 +649,55 @@ fn paint_kitty_image(app: &mut App, shown: Option<String>) -> Option<String> {
     );
     let _ = stdout.flush();
     Some(url)
+}
+
+/// Reads a file for transmission, refusing early what the mesh cannot carry.
+///
+/// The type is guessed from the extension rather than sniffed: the receiver
+/// only uses it to decide whether to try rendering the bytes as an image, and
+/// a wrong guess there costs a failed decode, not a corrupted file.
+fn load_outgoing_file(path: &str) -> Result<(String, Option<String>, Vec<u8>), String> {
+    let path = std::path::Path::new(path.trim());
+    let expanded;
+    let path = if let Ok(rest) = path.strip_prefix("~") {
+        expanded = dirs::home_dir()
+            .ok_or_else(|| "no home directory to expand ~ against".to_string())?
+            .join(rest);
+        expanded.as_path()
+    } else {
+        path
+    };
+
+    if !path.exists() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    if path.is_dir() {
+        return Err(format!("{} is a directory", path.display()));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "that filename is not valid text".to_string())?
+        .to_string();
+
+    let bytes = std::fs::read(path).map_err(|error| format!("could not read {name}: {error}"))?;
+    let mime = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("txt") | Some("md") => Some("text/plain"),
+        _ => None,
+    }
+    .map(str::to_string);
+
+    Ok((name, mime, bytes))
 }
 
 fn fixed_key(bytes: Option<&[u8]>) -> Option<[u8; 32]> {

@@ -565,6 +565,79 @@ impl MeshService {
         packet.recipient_hex().as_deref() == Some(self.my_peer_id.as_str())
     }
 
+    /// Frames that put a file on the mesh.
+    ///
+    /// The file becomes a fileTransfer packet, that whole packet is encoded,
+    /// and the encoded bytes are fragmented — reassembly on the far side hands
+    /// the joined bytes back to the packet decoder, so the thing being split
+    /// has to decode on its own.
+    ///
+    /// Unsigned, and not by preference. Verification re-encodes canonically and
+    /// that re-encode compresses anything from 100 bytes up, using a DEFLATE we
+    /// cannot reproduce, so a signature over a file-sized payload could never
+    /// match. Whether a phone insists on one here is untested; if it drops
+    /// these, that is the first thing to look at.
+    pub fn file_frames(
+        &mut self,
+        name: &str,
+        mime: Option<String>,
+        content: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if content.is_empty() {
+            return Err("that file is empty".to_string());
+        }
+        let size = content.len();
+        let packet = FilePacket {
+            file_name: Some(name.to_string()),
+            file_size: Some(size as u64),
+            mime_type: mime,
+            content,
+        };
+        let payload = packet.encode().ok_or_else(|| {
+            format!(
+                "{} is too large for one transfer ({:.1} MiB, limit {:.0} MiB)",
+                name,
+                size as f64 / (1024.0 * 1024.0),
+                crate::file_packet::MAX_PAYLOAD_BYTES as f64 / (1024.0 * 1024.0)
+            )
+        })?;
+
+        let inner = Packet::new(
+            MessageType::FileTransfer,
+            self.sender_bytes(),
+            payload,
+            MESSAGE_TTL,
+        )
+        .encode()
+        .ok_or_else(|| "could not encode the transfer".to_string())?;
+
+        // A fresh id per transfer: the assembler keys on (sender, id), so
+        // reusing one would splice two files together.
+        let id: u64 = rand::random();
+        let pieces = fragment::split(
+            id,
+            MessageType::FileTransfer as u8,
+            &inner,
+            fragment::SLICE_BYTES,
+        );
+        if pieces.is_empty() {
+            return Err(format!("{name} needs more fragments than the protocol allows"));
+        }
+
+        Ok(pieces
+            .into_iter()
+            .filter_map(|payload| {
+                Packet::new(
+                    MessageType::Fragment,
+                    self.sender_bytes(),
+                    payload,
+                    MESSAGE_TTL,
+                )
+                .encode()
+            })
+            .collect())
+    }
+
     // MARK: - Inbound
 
     pub fn handle_frame(&mut self, raw: &[u8]) -> Vec<MeshEvent> {
@@ -1716,5 +1789,127 @@ mod blocking_tests {
         mesh.block(&blocked).unwrap();
         assert!(!mesh.is_blocked(&allowed));
         assert!(mesh.peers.contains_key(&allowed));
+    }
+}
+
+#[cfg(test)]
+mod file_send_tests {
+    use super::*;
+
+    /// A tiny but real PNG, so the receiver's is_image check has something
+    /// honest to look at rather than a magic byte we made up.
+    fn png() -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0u8; 900]);
+        bytes
+    }
+
+    #[test]
+    fn a_file_crosses_the_mesh_and_arrives_whole() {
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let mut receiver = MeshService::new([21; 32], [22; 32], "bob");
+        let original = png();
+
+        let frames = sender
+            .file_frames("cat.png", Some("image/png".into()), original.clone())
+            .unwrap();
+        assert!(frames.len() > 1, "a 900-byte file must fragment");
+
+        let mut received = None;
+        for frame in frames {
+            for event in receiver.handle_frame(&frame) {
+                if let MeshEvent::FileReceived {
+                    name, bytes, mime, is_image, ..
+                } = event
+                {
+                    received = Some((name, bytes, mime, is_image));
+                }
+            }
+        }
+
+        let (name, bytes, mime, is_image) = received.expect("the file must arrive");
+        assert_eq!(name, "cat.png");
+        assert_eq!(bytes, original, "every byte must survive the round trip");
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert!(is_image);
+    }
+
+    #[test]
+    fn nothing_arrives_until_the_last_fragment_does() {
+        // A half-delivered file must not surface as a truncated one.
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let mut receiver = MeshService::new([21; 32], [22; 32], "bob");
+        let frames = sender
+            .file_frames("cat.png", Some("image/png".into()), png())
+            .unwrap();
+
+        let (all_but_last, _) = frames.split_at(frames.len() - 1);
+        for frame in all_but_last {
+            for event in receiver.handle_frame(frame) {
+                assert!(
+                    !matches!(event, MeshEvent::FileReceived { .. }),
+                    "a partial transfer must not be delivered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_transfers_in_flight_do_not_splice_together() {
+        // The assembler keys on (sender, id); a reused id would interleave two
+        // files into one corrupt result.
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let first = sender
+            .file_frames("a.png", Some("image/png".into()), png())
+            .unwrap();
+        let second = sender
+            .file_frames("b.png", Some("image/png".into()), png())
+            .unwrap();
+
+        let id_of = |frame: &Vec<u8>| {
+            let packet = Packet::decode(frame).unwrap();
+            u64::from_be_bytes(packet.payload[0..8].try_into().unwrap())
+        };
+        assert_ne!(
+            id_of(&first[0]),
+            id_of(&second[0]),
+            "each transfer needs its own id"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_refused_before_any_airtime_is_spent() {
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        assert!(sender.file_frames("empty.png", None, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_file_past_the_payload_limit_is_refused_with_its_size() {
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let huge = vec![0u8; crate::file_packet::MAX_PAYLOAD_BYTES + 1];
+        let error = sender.file_frames("huge.bin", None, huge).unwrap_err();
+        assert!(error.contains("too large"), "got: {error}");
+    }
+
+    #[test]
+    fn a_file_with_no_known_extension_still_sends() {
+        // The mime type is a rendering hint, not a requirement.
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let mut receiver = MeshService::new([21; 32], [22; 32], "bob");
+        let frames = sender
+            .file_frames("notes.dat", None, b"plain bytes".to_vec())
+            .unwrap();
+
+        let mut arrived = false;
+        for frame in frames {
+            for event in receiver.handle_frame(&frame) {
+                if let MeshEvent::FileReceived { is_image, name, .. } = event {
+                    assert_eq!(name, "notes.dat");
+                    assert!(!is_image);
+                    arrived = true;
+                }
+            }
+        }
+        assert!(arrived);
     }
 }

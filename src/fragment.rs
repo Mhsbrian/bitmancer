@@ -47,6 +47,48 @@ pub struct FragmentHeader {
 }
 
 /// Parses a fragment packet, rejecting anything malformed or absurd.
+/// Bytes of file data per fragment.
+///
+/// This is a transmission choice, not a protocol constant: the receiver
+/// reassembles whatever arrives, keyed by index and total, so any slice size
+/// works. It is sized so the finished frame lands in the 256-byte padding
+/// bucket, which is the only bucket we have live evidence a phone accepts —
+/// announces use it. Larger slices would mean fewer writes and a faster
+/// transfer, and are very likely fine, but "very likely" is not evidence.
+/// Raise it once the negotiated MTU is actually observable.
+///
+///   256 bucket - 16 (the AEAD allowance in `optimal_block_size`)
+///       - 14 (v1 packet header) - 13 (fragment header) = 213
+pub const SLICE_BYTES: usize = 213;
+
+/// Splits an encoded packet into fragment payloads.
+///
+/// `body` is a whole encoded packet, not a bare payload: reassembly hands the
+/// joined bytes straight back to the packet decoder, so what goes in has to be
+/// something that decodes on its own.
+pub fn split(id: u64, original_type: u8, body: &[u8], slice_bytes: usize) -> Vec<Vec<u8>> {
+    if body.is_empty() || slice_bytes == 0 {
+        return Vec::new();
+    }
+    let total = body.len().div_ceil(slice_bytes);
+    if total > MAX_FRAGMENTS {
+        return Vec::new();
+    }
+
+    body.chunks(slice_bytes)
+        .enumerate()
+        .map(|(index, slice)| {
+            let mut payload = Vec::with_capacity(13 + slice.len());
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.extend_from_slice(&(index as u16).to_be_bytes());
+            payload.extend_from_slice(&(total as u16).to_be_bytes());
+            payload.push(original_type);
+            payload.extend_from_slice(slice);
+            payload
+        })
+        .collect()
+}
+
 pub fn parse(packet: &Packet) -> Option<FragmentHeader> {
     // 8 id + 2 index + 2 total + 1 type
     if packet.payload.len() < 13 {
@@ -340,5 +382,90 @@ mod tests {
         assert_eq!(decoded.msg_type, MessageType::Message as u8);
         assert_eq!(decoded.payload, b"payload");
         assert_eq!(decoded.sender_id, [9; 8]);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use crate::protocol::MessageType;
+
+    #[test]
+    fn splitting_then_reassembling_returns_the_original() {
+        // The pair has to be exact: a fragmenter that disagrees with our own
+        // assembler would also disagree with everyone else's.
+        let body: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let pieces = split(0xABCD, MessageType::FileTransfer as u8, &body, SLICE_BYTES);
+        assert_eq!(pieces.len(), body.len().div_ceil(SLICE_BYTES));
+
+        let mut assembler = Assembler::new();
+        let mut finished = None;
+        for payload in pieces {
+            let packet = Packet::new(MessageType::Fragment, [9; 8], payload, 7);
+            let header = parse(&packet).expect("our own fragment must parse");
+            if let Append::Complete(data) = assembler.append(header) {
+                finished = Some(data);
+            }
+        }
+        assert_eq!(finished.expect("must complete"), body);
+    }
+
+    #[test]
+    fn the_original_type_survives_the_trip() {
+        let pieces = split(1, MessageType::FileTransfer as u8, b"hello", SLICE_BYTES);
+        let packet = Packet::new(MessageType::Fragment, [1; 8], pieces[0].clone(), 7);
+        assert_eq!(
+            parse(&packet).unwrap().original_type,
+            MessageType::FileTransfer as u8
+        );
+    }
+
+    #[test]
+    fn every_fragment_fits_the_bucket_we_have_evidence_for() {
+        // If a fragment grows past the 256-byte bucket it silently starts
+        // relying on an MTU nobody measured.
+        let body = vec![7u8; 5000];
+        for payload in split(2, 0x22, &body, SLICE_BYTES) {
+            let encoded = Packet::new(MessageType::Fragment, [1; 8], payload, 7)
+                .encode()
+                .unwrap();
+            assert!(
+                encoded.len() <= 256,
+                "fragment frame grew to {} bytes",
+                encoded.len()
+            );
+        }
+    }
+
+    #[test]
+    fn indices_are_dense_and_totals_agree() {
+        let body = vec![3u8; SLICE_BYTES * 4 + 1];
+        let pieces = split(3, 0x22, &body, SLICE_BYTES);
+        assert_eq!(pieces.len(), 5);
+        for (expected, payload) in pieces.iter().enumerate() {
+            let packet = Packet::new(MessageType::Fragment, [1; 8], payload.clone(), 7);
+            let header = parse(&packet).unwrap();
+            assert_eq!(header.index, expected);
+            assert_eq!(header.total, 5);
+        }
+    }
+
+    #[test]
+    fn a_body_that_would_need_too_many_fragments_is_refused() {
+        // Better to refuse than to emit a run the receiver will reject partway
+        // through, having already spent the airtime.
+        let body = vec![0u8; MAX_FRAGMENTS + 1];
+        assert!(split(4, 0x22, &body, 1).is_empty());
+    }
+
+    #[test]
+    fn nothing_to_send_produces_nothing() {
+        assert!(split(5, 0x22, b"", SLICE_BYTES).is_empty());
+    }
+
+    #[test]
+    fn a_body_smaller_than_one_slice_is_a_single_fragment() {
+        let pieces = split(6, 0x22, b"tiny", SLICE_BYTES);
+        assert_eq!(pieces.len(), 1);
     }
 }

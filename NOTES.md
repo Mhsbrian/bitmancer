@@ -323,8 +323,6 @@ packets addressed to us, presence, and unknown types.
 
 ## What is not done
 
-- **Sending** fragments and files. Reassembly and decoding are in; the outbound
-  side (splitting our own large frames, uploading a picture) is not.
 - **Multi-link.** The transport connects to one peripheral, which is why relaying
   never fires. Upstream holds up to six central links.
 - **Nostr as a DM transport.** Geohash channels already run over Nostr, so the
@@ -334,6 +332,15 @@ packets addressed to us, presence, and unknown types.
   unhandled `nostrCarrier 0x28`, the dead fingerprint-keyed `favorites` field in
   `state.json`, and the never-populated `TLV_BRIDGE_GEOHASH 0x06` all belong to
   this gap.
+- **Fragment size is a local choice, not a protocol constant.** `SLICE_BYTES`
+  is 213 so a finished fragment frame lands in the 256-byte padding bucket —
+  the only bucket we have live evidence a phone accepts, since announces use
+  it. Larger slices mean fewer BLE writes and are very likely fine; raise it
+  once the negotiated MTU is observable, not before.
+- **Outbound files are unsigned, necessarily.** A file payload is far past the
+  100-byte compression threshold, so a signature could never survive the
+  receiver's canonical re-encode. Whether a phone insists on one for
+  fileTransfer is untested — if it drops our transfers, look there first.
 - **Announce TLVs 0x04/0x05/0x06** (`direct_neighbors`, `capabilities`,
   `bridge_geohash`) encode and decode, but nothing ever populates them.
   `direct_neighbors` is the substrate multi-hop routing needs.

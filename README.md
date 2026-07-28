@@ -113,6 +113,7 @@ and flags the ones running BitChat:
 | `/map` | world map |
 | `/img [n]` | view the newest image link, or the nth one back |
 | `/dm <nick> <message>` | private message, encrypted end to end |
+| `/send <path>` | put a file on the mesh, fragmented |
 | `/block <nick>`, `/unblock <nick>` | refuse a peer's traffic; `/block` alone lists |
 | `/wipe confirm` | destroy the stored identity and quit |
 | `/name <nick>` | change your nickname and re-announce |
@@ -166,9 +167,6 @@ cutoff you get handed a wall of dead conversation that looks live. History is
 bounded to an hour and separated from the present with a `─── live ───` line.
 
 ## What does not work yet
-
-Sending files. Pictures sent over Bluetooth are received and shown; sending one
-is not implemented.
 
 Relaying. The client holds a single Bluetooth link, and forwarding a packet back
 down the only link it arrived on is an echo, not a relay. The policy is written

@@ -25,6 +25,8 @@ pub enum CommandOutcome {
     JoinGeohash(String),
     /// Leave a geohash channel, or the active one when None.
     LeaveGeohash(Option<String>),
+    /// Put a local file on the mesh.
+    SendFile(String),
     /// Destroy the stored identity and quit. Irreversible.
     WipeIdentity,
     /// Refuse all traffic from a peer, by fingerprint.
@@ -138,6 +140,12 @@ pub fn handle(
                 Err(reason) => CommandOutcome::Reply(vec![reason]),
             }
         }
+        "/send" | "/sendfile" if rest.is_empty() => CommandOutcome::Reply(vec![
+            "Usage: /send <path to a file>".to_string(),
+            "The file goes to everyone on the mesh, in fragments.".to_string(),
+        ]),
+        "/send" | "/sendfile" => CommandOutcome::SendFile(rest.to_string()),
+
         // Deliberately two steps. There is no undo, and the cost of an
         // accidental wipe is the user's whole identity.
         "/wipe" | "/panic" if rest != "confirm" => CommandOutcome::Reply(vec![
