@@ -25,6 +25,10 @@ pub enum CommandOutcome {
     JoinGeohash(String),
     /// Leave a geohash channel, or the active one when None.
     LeaveGeohash(Option<String>),
+    /// Refuse all traffic from a peer, by fingerprint.
+    BlockPeer(String),
+    /// Stop refusing traffic from a peer.
+    UnblockPeer(String),
     /// Send an encrypted private message. The target is a resolved peer ID, not
     /// a nickname: resolution can fail or be ambiguous, and that is worth
     /// reporting to the user before anything is encrypted.
@@ -132,9 +136,36 @@ pub fn handle(
                 Err(reason) => CommandOutcome::Reply(vec![reason]),
             }
         }
-        "/block" | "/unblock" => CommandOutcome::Reply(vec![
-            "Blocking is not implemented against the new peer identity model yet.".to_string(),
-        ]),
+        "/block" if rest.is_empty() => {
+            let blocked = mesh.blocked_labels();
+            if blocked.is_empty() {
+                CommandOutcome::Reply(vec!["Nobody is blocked.".to_string()])
+            } else {
+                let mut lines = vec![format!("Blocked ({}):", blocked.len())];
+                lines.extend(blocked.into_iter().map(|label| format!("  {label}")));
+                lines.push("Use /unblock <name> to undo.".to_string());
+                CommandOutcome::Reply(lines)
+            }
+        }
+        "/block" => {
+            // Blocking needs the peer's announced key, so resolve to a peer we
+            // actually know rather than to a bare label.
+            let target = if mesh.peers.contains_key(rest) {
+                Ok(rest.to_string())
+            } else {
+                mesh.peer_id_for_nickname(rest)
+            };
+            match target {
+                Ok(peer_id) => CommandOutcome::BlockPeer(peer_id),
+                Err(reason) => CommandOutcome::Reply(vec![reason]),
+            }
+        }
+        "/unblock" if rest.is_empty() => {
+            CommandOutcome::Reply(vec!["Usage: /unblock <nickname, peer ID or fingerprint>".to_string()])
+        }
+        // Unblocking takes the raw text: the peer may be long gone from the
+        // list, in which case only the stored fingerprint is left to match.
+        "/unblock" => CommandOutcome::UnblockPeer(rest.to_string()),
 
         unknown => CommandOutcome::Reply(vec![
             format!("Unknown command: {unknown}"),

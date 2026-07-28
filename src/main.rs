@@ -124,6 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("nostr device seed missing or malformed in ~/.bitmancer/state.json")?;
 
     let mut mesh = MeshService::new(identity_key, noise_static_key, &nickname);
+    // Restore the block list before the radio starts, so a blocked peer cannot
+    // slip a frame in during the window between connecting and loading.
+    mesh.load_blocked(state.blocked_peers.clone());
     let mut geo = GeoService::new(nostr_device_seed, &mesh.nickname);
 
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
@@ -333,6 +336,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.add_log_message(format!("system: {text}"));
                     }
                 }
+                CommandOutcome::BlockPeer(peer_id) => match mesh.block(&peer_id) {
+                    Ok(nickname) => {
+                        state.blocked_peers = mesh.blocked_fingerprints();
+                        if let Err(error) = persistence::save_state(&state) {
+                            app.add_log_message(format!(
+                                "system: blocked {nickname}, but could not save: {error}"
+                            ));
+                        } else {
+                            app.add_log_message(format!(
+                                "system: blocked {nickname}. Their traffic is dropped."
+                            ));
+                        }
+                        app.update_blocked_list(mesh.blocked_labels());
+                        sync_people(&mut app, &mesh, &geo);
+                    }
+                    Err(reason) => app.add_log_message(format!("system: {reason}")),
+                },
+                CommandOutcome::UnblockPeer(needle) => match mesh.unblock(&needle) {
+                    Ok(label) => {
+                        state.blocked_peers = mesh.blocked_fingerprints();
+                        if let Err(error) = persistence::save_state(&state) {
+                            app.add_log_message(format!(
+                                "system: unblocked {label}, but could not save: {error}"
+                            ));
+                        } else {
+                            app.add_log_message(format!("system: unblocked {label}."));
+                        }
+                        app.update_blocked_list(mesh.blocked_labels());
+                    }
+                    Err(reason) => app.add_log_message(format!("system: {reason}")),
+                },
                 CommandOutcome::SendDirectMessage { target, content } => {
                     match mesh.dm_frames(&target, &content) {
                         Ok(frames) => {

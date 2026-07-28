@@ -96,6 +96,10 @@ pub struct MeshService {
     /// Encrypted sessions, one per peer we have spoken to privately. Owns the
     /// static secret, since the handshake is the only thing that needs it.
     sessions: NoiseSessionManager,
+    /// Full SHA-256 fingerprints we refuse traffic from. Fingerprints rather
+    /// than peer IDs or nicknames: a nickname is claimed rather than owned, and
+    /// a peer ID follows the key, so blocking either would be blocking a label.
+    blocked: HashSet<String>,
     signing_key: SigningKey,
     seen_message_ids: HashSet<String>,
     seen_order: VecDeque<String>,
@@ -120,6 +124,7 @@ impl MeshService {
             peers: HashMap::new(),
             noise_public_key,
             sessions: NoiseSessionManager::new(noise_static_key),
+            blocked: HashSet::new(),
             signing_key,
             seen_message_ids: HashSet::new(),
             seen_order: VecDeque::new(),
@@ -263,6 +268,98 @@ impl MeshService {
         }
     }
 
+    /// Whether traffic from this sender is refused.
+    ///
+    /// Takes a peer ID or a full fingerprint. A peer ID is the first 16 hex
+    /// characters of the fingerprint (`derive_peer_id` is `fingerprint`
+    /// truncated), so a prefix match answers both without needing to have seen
+    /// the peer's announce. That reuses the protocol's own assumption that 64
+    /// bits of hash identify a peer — the same assumption peer IDs already
+    /// rest on — rather than introducing a weaker one.
+    pub fn is_blocked(&self, peer_id_or_fingerprint: &str) -> bool {
+        let needle = peer_id_or_fingerprint.to_lowercase();
+        self.blocked
+            .iter()
+            .any(|fingerprint| fingerprint.starts_with(&needle) || needle.starts_with(fingerprint))
+    }
+
+    /// Restores the list persisted in `state.json`.
+    pub fn load_blocked(&mut self, blocked: HashSet<String>) {
+        self.blocked = blocked.into_iter().map(|f| f.to_lowercase()).collect();
+    }
+
+    pub fn blocked_fingerprints(&self) -> HashSet<String> {
+        self.blocked.clone()
+    }
+
+    /// Blocked peers, named where we still remember a nickname for them.
+    pub fn blocked_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .blocked
+            .iter()
+            .map(|fingerprint| {
+                self.peers
+                    .values()
+                    .find(|peer| peer.fingerprint == *fingerprint)
+                    .map(|peer| peer.nickname.clone())
+                    .unwrap_or_else(|| fingerprint.chars().take(16).collect())
+            })
+            .collect();
+        labels.sort();
+        labels
+    }
+
+    /// Blocks a peer we have seen announce.
+    ///
+    /// The fingerprint comes from their announced key, so blocking someone we
+    /// have only ever heard a message from is refused rather than approximated:
+    /// storing a truncated identifier would break the shared `state.json`
+    /// contract, which holds full SHA-256 fingerprints.
+    pub fn block(&mut self, peer_id: &str) -> Result<String, String> {
+        if peer_id == self.my_peer_id {
+            return Err("you cannot block yourself".to_string());
+        }
+        let Some(peer) = self.peers.get(peer_id) else {
+            return Err(format!(
+                "{} has not announced itself yet, so its key is unknown",
+                short_display(peer_id)
+            ));
+        };
+        let (fingerprint, nickname) = (peer.fingerprint.clone(), peer.nickname.clone());
+        if !self.blocked.insert(fingerprint) {
+            return Err(format!("{nickname} is already blocked"));
+        }
+        // Drop the peer and any encrypted channel with them. Leaving either in
+        // place would keep a blocked peer listed and reachable.
+        self.peers.remove(peer_id);
+        self.sessions.remove_session(peer_id);
+        Ok(nickname)
+    }
+
+    /// Unblocks by nickname, peer ID or fingerprint.
+    pub fn unblock(&mut self, needle: &str) -> Result<String, String> {
+        let needle = needle.to_lowercase();
+        // A nickname only resolves while we still remember the peer, so fall
+        // back to matching the stored fingerprint directly.
+        let by_name = self
+            .peers
+            .values()
+            .find(|peer| peer.nickname.eq_ignore_ascii_case(&needle))
+            .map(|peer| peer.fingerprint.clone());
+        let target = by_name.or_else(|| {
+            self.blocked
+                .iter()
+                .find(|fingerprint| fingerprint.starts_with(&needle))
+                .cloned()
+        });
+        match target {
+            Some(fingerprint) if self.blocked.remove(&fingerprint) => {
+                Ok(fingerprint.chars().take(16).collect())
+            }
+            _ => Err(format!("{needle} is not blocked")),
+        }
+    }
+
     /// Frames carrying a private message.
     ///
     /// When no channel is up yet this starts the handshake and queues the text
@@ -271,6 +368,9 @@ impl MeshService {
     pub fn dm_frames(&mut self, peer_id: &str, content: &str) -> Result<Vec<Vec<u8>>, String> {
         if peer_id == self.my_peer_id {
             return Err("that is your own peer ID".to_string());
+        }
+        if self.is_blocked(peer_id) {
+            return Err("you have blocked that peer".to_string());
         }
         if self.sessions.has_established_session(peer_id) {
             let payload = NoisePayload::private_message(content).encode();
@@ -476,6 +576,13 @@ impl MeshService {
         }
 
         if sender == self.my_peer_id {
+            return events;
+        }
+
+        // Anything from a blocked peer stops here. The debug trace above is
+        // deliberately left in place: traffic vanishing with no explanation is
+        // the harder thing to diagnose.
+        if self.is_blocked(&sender) {
             return events;
         }
 
@@ -1398,5 +1505,142 @@ mod noise_dm_tests {
             alice.peer_id_for_nickname("bob").unwrap(),
             "00000000000000aa"
         );
+    }
+}
+
+#[cfg(test)]
+mod blocking_tests {
+    use super::*;
+
+    fn known_peer(mesh: &mut MeshService, nickname: &str, key: u8) -> String {
+        let noise_public_key = vec![key; 32];
+        let peer_id = derive_peer_id(&noise_public_key);
+        let peer = MeshPeer {
+            peer_id: peer_id.clone(),
+            nickname: nickname.to_string(),
+            fingerprint: fingerprint(&noise_public_key),
+            noise_public_key,
+            signing_public_key: vec![key; 32],
+            verified: false,
+            last_seen: Instant::now(),
+        };
+        mesh.peers.insert(peer_id.clone(), peer);
+        peer_id
+    }
+
+    #[test]
+    fn a_peer_id_matches_its_own_fingerprint() {
+        // The whole prefix scheme rests on this: derive_peer_id is fingerprint
+        // truncated to 16 hex. If that ever stops holding, blocking silently
+        // stops matching anyone.
+        let key = vec![7u8; 32];
+        assert!(fingerprint(&key).starts_with(&derive_peer_id(&key)));
+    }
+
+    #[test]
+    fn blocking_drops_later_traffic_from_that_peer() {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+
+        // Alice learns Bob through his announce, then blocks him.
+        let announce = bob.announce_frame().unwrap();
+        assert!(!alice.handle_frame(&announce).is_empty());
+        let bob_id = bob.my_peer_id.clone();
+        assert_eq!(alice.block(&bob_id).unwrap(), "bob");
+
+        // A public message from Bob now produces nothing at all.
+        for frame in bob.public_message_frames("still here") {
+            assert!(
+                alice.handle_frame(&frame).is_empty(),
+                "a blocked peer's message must not reach the log"
+            );
+        }
+        // Nor does a fresh announce bring him back into the peer list.
+        let again = bob.announce_frame().unwrap();
+        assert!(alice.handle_frame(&again).is_empty());
+        assert!(!alice.peers.contains_key(&bob_id));
+    }
+
+    #[test]
+    fn blocking_a_peer_removes_them_from_the_roster() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "nuisance", 40);
+        assert!(mesh.peers.contains_key(&peer_id));
+        mesh.block(&peer_id).unwrap();
+        assert!(
+            !mesh.peers.contains_key(&peer_id),
+            "a blocked peer must not stay listed"
+        );
+    }
+
+    #[test]
+    fn a_peer_we_have_never_heard_announce_cannot_be_blocked() {
+        // Their key is unknown, so there is no fingerprint to store, and
+        // storing something shorter would break the state.json contract.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let error = mesh.block("00000000000000ff").unwrap_err();
+        assert!(error.contains("has not announced"), "got: {error}");
+    }
+
+    #[test]
+    fn blocking_yourself_is_refused() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let me = mesh.my_peer_id.clone();
+        assert!(mesh.block(&me).is_err());
+    }
+
+    #[test]
+    fn blocking_twice_is_reported_rather_than_silently_ignored() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "twice", 41);
+        assert!(mesh.block(&peer_id).is_ok());
+        // The peer is gone from the roster now, so the second attempt reports
+        // the peer as unknown rather than as already blocked - either way it
+        // must not appear to succeed.
+        assert!(mesh.block(&peer_id).is_err());
+    }
+
+    #[test]
+    fn unblocking_works_after_the_peer_is_forgotten() {
+        // Blocking removes the peer, so by the time a user unblocks, the
+        // nickname is usually gone and only the fingerprint remains.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "gone", 42);
+        let fingerprint_of = mesh.peers[&peer_id].fingerprint.clone();
+        mesh.block(&peer_id).unwrap();
+
+        assert!(mesh.unblock("gone").is_err(), "the nickname is no longer known");
+        assert!(mesh.unblock(&peer_id).is_ok(), "the peer ID prefix must match");
+        assert!(!mesh.is_blocked(&fingerprint_of));
+    }
+
+    #[test]
+    fn the_block_list_survives_a_restart() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "persistent", 43);
+        mesh.block(&peer_id).unwrap();
+        let saved = mesh.blocked_fingerprints();
+
+        let mut restarted = MeshService::new([1; 32], [2; 32], "me");
+        restarted.load_blocked(saved);
+        assert!(restarted.is_blocked(&peer_id));
+    }
+
+    #[test]
+    fn a_blocked_peer_cannot_be_sent_a_private_message() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "hostile", 44);
+        mesh.block(&peer_id).unwrap();
+        assert!(mesh.dm_frames(&peer_id, "hello").is_err());
+    }
+
+    #[test]
+    fn an_unblocked_peer_is_unaffected() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let blocked = known_peer(&mut mesh, "bad", 45);
+        let allowed = known_peer(&mut mesh, "good", 46);
+        mesh.block(&blocked).unwrap();
+        assert!(!mesh.is_blocked(&allowed));
+        assert!(mesh.peers.contains_key(&allowed));
     }
 }
