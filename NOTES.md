@@ -325,7 +325,25 @@ packets addressed to us, presence, and unknown types.
   side (splitting our own large frames, uploading a picture) is not.
 - **Multi-link.** The transport connects to one peripheral, which is why relaying
   never fires. Upstream holds up to six central links.
-- **Everything internet-side** — Nostr transport, geohash channels, groups, media/file transfer, voice, gossip sync — is out of scope for a mesh-only terminal client.
+- **Nostr as a DM transport.** Geohash channels already run over Nostr, so the
+  client is no longer mesh-only — but private messages are. Upstream selects a
+  transport per DM (Bluetooth preferred, Nostr fallback) and queues when neither
+  is up, so a peer out of BLE range is still reachable. Ours are not. The
+  unhandled `nostrCarrier 0x28`, the dead fingerprint-keyed `favorites` field in
+  `state.json`, and the never-populated `TLV_BRIDGE_GEOHASH 0x06` all belong to
+  this gap.
+- **Announce TLVs 0x04/0x05/0x06** (`direct_neighbors`, `capabilities`,
+  `bridge_geohash`) encode and decode, but nothing ever populates them.
+  `direct_neighbors` is the substrate multi-hop routing needs.
+- **Read receipts and delivery acks.** `noise_payload.rs` decodes both; they are
+  traced and otherwise ignored, and we never send them. Wiring, not protocol.
+- **Emergency wipe.** Upstream clears all data on a triple tap. There is no
+  equivalent here — no way to destroy the identity key, session state and
+  history in one action.
+- **Opcodes named but unspecified here:** `courierEnvelope 0x04`,
+  `requestSync 0x21`, `boardPost 0x23`, `prekeyBundle 0x24`,
+  `groupMessage 0x25`. The names came from reading upstream, but nothing in this
+  repo pins down their payloads. Do not implement from the names alone.
 
 ## Verification
 
