@@ -14,7 +14,7 @@ use crate::announce::{self, Announcement};
 use crate::compression;
 use crate::file_packet::FilePacket;
 use crate::fragment::{self, Append, Assembler};
-use crate::noise_payload::{NoisePayload, NoisePayloadType};
+use crate::noise_payload::{NoisePayload, NoisePayloadType, PrivateMessagePacket, MAX_TLV_VALUE};
 use crate::noise_session::NoiseSessionManager;
 use crate::peer_id::{derive_peer_id, fingerprint, short_display};
 use crate::protocol::{peer_id_to_bytes, MessageType, Packet};
@@ -373,15 +373,11 @@ impl MeshService {
             return Err("you have blocked that peer".to_string());
         }
         if self.sessions.has_established_session(peer_id) {
-            let payload = NoisePayload::private_message(content).encode();
-            let sealed = self
-                .sessions
-                .encrypt(&payload, peer_id)
-                .map_err(|error| format!("could not encrypt: {error}"))?;
-            return Ok(self
-                .noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
-                .into_iter()
-                .collect());
+            let mut frames = Vec::new();
+            for chunk in split_into_chunks(content, MAX_TLV_VALUE) {
+                frames.extend(self.sealed_message_frame(peer_id, &chunk)?);
+            }
+            return Ok(frames);
         }
 
         // Order matters: queueing needs a session object to hang the message
@@ -396,6 +392,27 @@ impl MeshService {
         }
         Ok(self
             .noise_frame(MessageType::NoiseHandshake, peer_id, opening)
+            .into_iter()
+            .collect())
+    }
+
+    /// Wraps one chunk of text as a private-message record, seals it, and
+    /// addresses the frame.
+    fn sealed_message_frame(
+        &mut self,
+        peer_id: &str,
+        chunk: &str,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let record = PrivateMessagePacket::new(chunk)
+            .encode()
+            .ok_or_else(|| "message does not fit the wire format".to_string())?;
+        let payload = NoisePayload::new(NoisePayloadType::PrivateMessage, record).encode();
+        let sealed = self
+            .sessions
+            .encrypt(&payload, peer_id)
+            .map_err(|error| format!("could not encrypt: {error}"))?;
+        Ok(self
+            .noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
             .into_iter()
             .collect())
     }
@@ -419,19 +436,14 @@ impl MeshService {
         });
 
         for text in self.sessions.get_pending_messages(peer_id) {
-            let payload = NoisePayload::private_message(&text).encode();
-            match self.sessions.encrypt(&payload, peer_id) {
-                Ok(sealed) => {
-                    if let Some(frame) =
-                        self.noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
-                    {
-                        events.push(MeshEvent::Send(frame));
-                    }
+            for chunk in split_into_chunks(&text, MAX_TLV_VALUE) {
+                match self.sealed_message_frame(peer_id, &chunk) {
+                    Ok(frames) => events.extend(frames.into_iter().map(MeshEvent::Send)),
+                    Err(reason) => events.push(MeshEvent::Notice(format!(
+                        "queued message to {} was lost: {reason}",
+                        short_display(peer_id)
+                    ))),
                 }
-                Err(error) => events.push(MeshEvent::Notice(format!(
-                    "queued message to {} was lost: {error}",
-                    short_display(peer_id)
-                ))),
             }
         }
         events
@@ -501,12 +513,13 @@ impl MeshService {
 
         match payload.kind {
             NoisePayloadType::PrivateMessage => {
-                let Some(content) = payload.text() else {
+                let Some(record) = PrivateMessagePacket::decode(&payload.body) else {
                     return vec![MeshEvent::Trace(format!(
-                        "non-text private message from {}",
+                        "malformed private message from {}",
                         short_display(&sender)
                     ))];
                 };
+                let content = record.content;
                 let nickname = self
                     .peers
                     .get(&sender)
@@ -518,15 +531,15 @@ impl MeshService {
                     content,
                 }]
             }
-            // Receipts are bookkeeping, not conversation. They are traced so
-            // /debug can see them and otherwise stay out of the log.
-            NoisePayloadType::ReadReceipt | NoisePayloadType::Delivered => {
-                vec![MeshEvent::Trace(format!(
-                    "{:?} from {}",
-                    payload.kind,
-                    short_display(&sender)
-                ))]
-            }
+            // Everything else is decoded and named but not yet acted on.
+            // Naming it matters: /debug reporting a bare number is how an
+            // unimplemented payload kind gets mistaken for a corrupt frame.
+            other => vec![MeshEvent::Trace(format!(
+                "{} from {} ({} bytes)",
+                other.label(),
+                short_display(&sender),
+                payload.body.len()
+            ))],
         }
     }
 
@@ -869,12 +882,20 @@ impl MeshService {
 /// be compressed inside the peer's signature check with an encoder we cannot
 /// match, and the message would be dropped as unsigned.
 fn split_for_signing(content: &str) -> Vec<String> {
-    const MAX_CHUNK_BYTES: usize = 99;
+    split_into_chunks(content, 99)
+}
 
+/// Splits on word boundaries where it can and on char boundaries where it must.
+///
+/// Two different budgets need this. A public message is capped at 99 bytes so
+/// it stays under the compression threshold and keeps its signature valid; a
+/// private message is capped at 255 because its content sits in a TLV with a
+/// one-byte length.
+fn split_into_chunks(content: &str, max_chunk_bytes: usize) -> Vec<String> {
     if content.is_empty() {
         return Vec::new();
     }
-    if content.len() <= MAX_CHUNK_BYTES {
+    if content.len() <= max_chunk_bytes {
         return vec![content.to_string()];
     }
 
@@ -882,13 +903,13 @@ fn split_for_signing(content: &str) -> Vec<String> {
     let mut current = String::new();
     for word in content.split_whitespace() {
         // A single word longer than the budget has to be hard-split.
-        if word.len() > MAX_CHUNK_BYTES {
+        if word.len() > max_chunk_bytes {
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
             }
             let mut rest = word;
             while !rest.is_empty() {
-                let mut end = MAX_CHUNK_BYTES.min(rest.len());
+                let mut end = max_chunk_bytes.min(rest.len());
                 while end > 0 && !rest.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -899,7 +920,7 @@ fn split_for_signing(content: &str) -> Vec<String> {
         }
 
         let separator = if current.is_empty() { 0 } else { 1 };
-        if current.len() + separator + word.len() > MAX_CHUNK_BYTES {
+        if current.len() + separator + word.len() > max_chunk_bytes {
             chunks.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
@@ -1455,6 +1476,44 @@ mod noise_dm_tests {
         }
         // Bob still completes normally.
         assert!(!settle(&mut alice, &mut bob, opening).is_empty());
+    }
+
+    #[test]
+    fn a_long_message_is_split_to_fit_the_tlv_length_byte() {
+        // Content lives in a TLV whose length is one byte, so anything past 255
+        // has to become several records rather than being truncated.
+        let (mut alice, mut bob) = pair();
+        let bob_id = bob.my_peer_id.clone();
+        let opening = alice.dm_frames(&bob_id, "x").unwrap();
+        settle(&mut alice, &mut bob, opening);
+
+        let long = "word ".repeat(200); // ~1000 bytes
+        let frames = alice.dm_frames(&bob_id, &long).unwrap();
+        assert!(
+            frames.len() > 1,
+            "a 1000-byte message must not go out as one record"
+        );
+
+        let events = settle(&mut alice, &mut bob, frames);
+        let received: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                MeshEvent::PrivateMessage { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received.len(), frames_expected(&long));
+        for part in &received {
+            assert!(
+                part.len() <= 255,
+                "every chunk must fit the length byte, got {}",
+                part.len()
+            );
+        }
+    }
+
+    fn frames_expected(content: &str) -> usize {
+        split_into_chunks(content, MAX_TLV_VALUE).len()
     }
 
     #[test]
