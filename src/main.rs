@@ -336,6 +336,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.add_log_message(format!("system: {text}"));
                     }
                 }
+                CommandOutcome::WipeIdentity => {
+                    // Tell the mesh we are going before the keys are gone, so
+                    // peers drop us now rather than timing us out.
+                    if let Some(frame) = mesh.leave_frame() {
+                        let _ = transport.outbound.send(frame).await;
+                    }
+                    match persistence::wipe_state() {
+                        Ok(existed) => {
+                            mesh.wipe();
+                            app.wipe();
+                            let what = if existed {
+                                "Identity destroyed."
+                            } else {
+                                "Nothing was stored; memory cleared."
+                            };
+                            app.add_log_message(format!("system: {what} Quitting."));
+                        }
+                        Err(error) => {
+                            // Do not quit on a failed wipe: exiting here would
+                            // look identical to success while leaving the keys
+                            // on disk.
+                            app.add_log_message(format!(
+                                "system: could not destroy the stored identity: {error}"
+                            ));
+                            app.add_log_message(
+                                "system: your keys are still on disk. Nothing was cleared."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                    }
+                    app.should_quit = true;
+                }
                 CommandOutcome::BlockPeer(peer_id) => match mesh.block(&peer_id) {
                     Ok(nickname) => {
                         state.blocked_peers = mesh.blocked_fingerprints();

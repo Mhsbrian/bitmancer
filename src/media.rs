@@ -174,6 +174,14 @@ impl Default for ImageCache {
 }
 
 impl ImageCache {
+    /// Drops every decoded image. Cached pictures were fetched from links
+    /// strangers posted, so a wipe that left them in memory would leave the
+    /// most identifying thing behind.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),

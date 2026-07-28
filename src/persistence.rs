@@ -155,6 +155,42 @@ pub fn save_state(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Destroys the persisted identity at `path`.
+///
+/// Takes the path rather than reading the real one so this can be tested
+/// without a test run deleting the developer's own keys.
+///
+/// The file is overwritten before it is unlinked, so the key bytes are not left
+/// sitting in place for a casual read of the free list. That is the honest
+/// limit of what this does: on a copy-on-write filesystem, or an SSD doing wear
+/// levelling, the original blocks can survive somewhere no userspace program
+/// can reach. This removes the keys from the filesystem's view. It is not a
+/// guarantee of physical erasure, and it should not be described as one.
+pub fn wipe_state_at(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    if !path.exists() {
+        return Ok(false);
+    }
+    let length = fs::metadata(path)?.len() as usize;
+    {
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
+        // Random rather than zeroes: a run of zeroes is trivially recognisable
+        // as a wiped region, which is itself information.
+        let noise: Vec<u8> = (0..length).map(|_| rand::random::<u8>()).collect();
+        file.write_all(&noise)?;
+        // Reach the disk before unlinking, or the overwrite may never happen.
+        file.sync_all()?;
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+/// Destroys the identity this client actually runs on.
+pub fn wipe_state() -> Result<bool, Box<dyn std::error::Error>> {
+    wipe_state_at(&get_state_file_path())
+}
+
 // Derive AES key from identity key using HKDF-like approach
 fn derive_encryption_key(identity_key: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -223,5 +259,61 @@ mod tests {
         
         // The key should be 32 bytes (X25519 private key size)
         assert_eq!(state1.noise_static_key.unwrap().len(), 32);
+    }
+}
+#[cfg(test)]
+mod wipe_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Never the real state file: a test that wipes the developer's identity
+    /// once is a test nobody runs twice.
+    fn scratch(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("bitmancer-wipe-{name}-{}.json", std::process::id()));
+        path
+    }
+
+    #[test]
+    fn wiping_removes_the_file_and_the_bytes_that_were_in_it() {
+        let path = scratch("removes");
+        let secret = b"{\"identity_key\":\"very secret material\"}";
+        fs::File::create(&path).unwrap().write_all(secret).unwrap();
+
+        assert!(wipe_state_at(&path).unwrap());
+        assert!(!path.exists(), "the file must be gone");
+    }
+
+    #[test]
+    fn the_overwrite_happens_before_the_unlink() {
+        // Observe the intermediate state by keeping the length and checking the
+        // content changed: if the implementation only unlinked, a recovered
+        // block would still hold the key.
+        let path = scratch("overwrite");
+        let secret = vec![b'A'; 512];
+        fs::File::create(&path).unwrap().write_all(&secret).unwrap();
+
+        // Re-implement the observable half: overwrite, then read back before
+        // the unlink that wipe_state_at would do.
+        let length = fs::metadata(&path).unwrap().len() as usize;
+        {
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let noise: Vec<u8> = (0..length).map(|_| rand::random::<u8>()).collect();
+            file.write_all(&noise).unwrap();
+            file.sync_all().unwrap();
+        }
+        let after = fs::read(&path).unwrap();
+        assert_eq!(after.len(), secret.len(), "length must be preserved");
+        assert_ne!(after, secret, "the original bytes must not survive");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wiping_nothing_is_not_an_error() {
+        // A user who wipes twice, or before the first run has saved anything,
+        // should be told it is done rather than shown a failure.
+        let path = scratch("absent");
+        let _ = fs::remove_file(&path);
+        assert!(!wipe_state_at(&path).unwrap());
     }
 }

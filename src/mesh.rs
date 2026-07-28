@@ -268,6 +268,21 @@ impl MeshService {
         }
     }
 
+    /// Forgets every peer, session and block.
+    ///
+    /// The static secret cannot be dropped from a live service, so this is not
+    /// the whole of a wipe — the caller is expected to exit immediately
+    /// afterwards, which is what actually releases the key material.
+    pub fn wipe(&mut self) {
+        for peer_id in self.peers.keys().cloned().collect::<Vec<_>>() {
+            self.sessions.remove_session(&peer_id);
+        }
+        self.peers.clear();
+        self.blocked.clear();
+        self.seen_message_ids.clear();
+        self.seen_order.clear();
+    }
+
     /// Whether traffic from this sender is refused.
     ///
     /// Takes a peer ID or a full fingerprint. A peer ID is the first 16 hex

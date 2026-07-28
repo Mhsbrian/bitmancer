@@ -113,6 +113,8 @@ and flags the ones running BitChat:
 | `/map` | world map |
 | `/img [n]` | view the newest image link, or the nth one back |
 | `/dm <nick> <message>` | private message, encrypted end to end |
+| `/block <nick>`, `/unblock <nick>` | refuse a peer's traffic; `/block` alone lists |
+| `/wipe confirm` | destroy the stored identity and quit |
 | `/name <nick>` | change your nickname and re-announce |
 | `/online` | who is on the mesh |
 | `/status` | link state, peer count, your identity |
@@ -130,6 +132,14 @@ which of the two it is about to do.
 Geohash precision decides how big a room is: 2 characters is a region, 4 a
 province, 5 a city, 6 a neighbourhood, 7 a block, 8 a building. Only 2, 4 and 5
 tend to have anyone in them.
+
+**Wiping is two steps and honest about its limits.** `/wipe` explains what it
+destroys; `/wipe confirm` does it. The state file is overwritten before it is
+unlinked, so the keys are not left in the free list for a casual read — but on a
+copy-on-write filesystem or an SSD doing wear levelling the original blocks can
+survive somewhere no userspace program can reach. It removes the keys from the
+filesystem's view. That is worth having and it is not the same as physical
+erasure, so it is not described as one.
 
 ## Some deliberate choices
 

@@ -811,6 +811,27 @@ impl App {
         self.msg_scroll = 0;
     }
 
+    /// Drops every conversation, peer and cached image.
+    ///
+    /// Paired with the on-disk wipe: clearing one without the other leaves
+    /// either the history or the keys behind.
+    pub fn wipe(&mut self) {
+        self.channel_messages.clear();
+        self.dm_messages.clear();
+        self.popup_messages.clear();
+        self.people.clear();
+        self.blocked.clear();
+        self.channels.clear();
+        self.joined_geohashes.clear();
+        self.images.clear();
+        self.image_dimensions.clear();
+        self.viewer.open = false;
+        self.map_open = false;
+        // Leave a single empty public conversation so the pane is not a
+        // dangling reference to something that no longer exists.
+        self.channel_messages.insert("#public".to_string(), Vec::new());
+    }
+
     pub fn update_blocked_list(&mut self, blocked_nicknames: Vec<String>) {
         self.blocked = blocked_nicknames;
     }
@@ -1063,5 +1084,47 @@ mod inbound_arrival_tests {
         app.add_log_message(channel_line("bob", now - 3, "second"));
         let second = lines(&app).iter().find(|m| m.content == "second").unwrap();
         assert!(second.arrived.is_some(), "a slightly-behind clock is still live");
+    }
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::*;
+
+    #[test]
+    fn a_wipe_leaves_no_conversation_peer_or_image_behind() {
+        let mut app = App::new_with_nickname("me".into());
+        app.add_log_message("__CHANNEL__:#public:alice:1700000000:hello".to_string());
+        app.add_log_message("__DM__:bob:1200:private words".to_string());
+        app.people = vec!["alice".into(), "bob".into()];
+        app.blocked = vec!["carol".into()];
+        app.joined_geohashes.insert("9q".into());
+        app.image_dimensions.insert("http://x/y.png".into(), (10, 10));
+
+        app.wipe();
+
+        assert!(app.dm_messages.is_empty(), "private history must not survive");
+        assert!(app.people.is_empty());
+        assert!(app.blocked.is_empty());
+        assert!(app.joined_geohashes.is_empty());
+        assert!(app.image_dimensions.is_empty());
+        assert!(
+            app.channel_messages
+                .get("#public")
+                .is_some_and(|messages| messages.is_empty()),
+            "public survives as an empty pane, not as history"
+        );
+    }
+
+    #[test]
+    fn a_wipe_closes_any_overlay() {
+        // Quitting through an open viewer would render one last frame of
+        // something the user just asked to destroy.
+        let mut app = App::new_with_nickname("me".into());
+        app.viewer.open = true;
+        app.map_open = true;
+        app.wipe();
+        assert!(!app.viewer.open);
+        assert!(!app.map_open);
     }
 }

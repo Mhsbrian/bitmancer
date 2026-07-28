@@ -345,9 +345,6 @@ packets addressed to us, presence, and unknown types.
   `pong 0x27`, but neither `BitchatProtocol.swift` nor `Packets.swift` defines
   them and the whitepaper does not mention them. Do not implement these for
   parity; liveness there comes from announces.
-- **Emergency wipe.** Upstream clears all data on a triple tap. There is no
-  equivalent here — no way to destroy the identity key, session state and
-  history in one action.
 - **Opcodes named but unspecified here:** `courierEnvelope 0x04`,
   `requestSync 0x21`, `boardPost 0x23`, `prekeyBundle 0x24`,
   `groupMessage 0x25`. The names came from reading upstream, but nothing in this

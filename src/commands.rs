@@ -25,6 +25,8 @@ pub enum CommandOutcome {
     JoinGeohash(String),
     /// Leave a geohash channel, or the active one when None.
     LeaveGeohash(Option<String>),
+    /// Destroy the stored identity and quit. Irreversible.
+    WipeIdentity,
     /// Refuse all traffic from a peer, by fingerprint.
     BlockPeer(String),
     /// Stop refusing traffic from a peer.
@@ -136,6 +138,18 @@ pub fn handle(
                 Err(reason) => CommandOutcome::Reply(vec![reason]),
             }
         }
+        // Deliberately two steps. There is no undo, and the cost of an
+        // accidental wipe is the user's whole identity.
+        "/wipe" | "/panic" if rest != "confirm" => CommandOutcome::Reply(vec![
+            "This destroys your identity key, your Noise key, your location-".to_string(),
+            "channel seed, your block list and every conversation in this".to_string(),
+            "session, then quits. Peers will see you as a stranger afterwards.".to_string(),
+            "It cannot be undone.".to_string(),
+            String::new(),
+            format!("Type  {command} confirm  to go ahead."),
+        ]),
+        "/wipe" | "/panic" => CommandOutcome::WipeIdentity,
+
         "/block" if rest.is_empty() => {
             let blocked = mesh.blocked_labels();
             if blocked.is_empty() {
