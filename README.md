@@ -112,6 +112,7 @@ and flags the ones running BitChat:
 | `/geo list`, `/geo off` | list joined channels, leave the current one |
 | `/map` | world map |
 | `/img [n]` | view the newest image link, or the nth one back |
+| `/dm <nick> <message>` | private message, encrypted end to end |
 | `/name <nick>` | change your nickname and re-announce |
 | `/online` | who is on the mesh |
 | `/status` | link state, peer count, your identity |
@@ -155,9 +156,6 @@ cutoff you get handed a wall of dead conversation that looks live. History is
 bounded to an hour and separated from the present with a `─── live ───` line.
 
 ## What does not work yet
-
-Private messages. The Noise session layer is present but not wired to the
-current framing, so `/dm` tells you so rather than pretending.
 
 Sending files. Pictures sent over Bluetooth are received and shown; sending one
 is not implemented.

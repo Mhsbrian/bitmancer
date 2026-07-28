@@ -409,6 +409,34 @@ impl App {
             return;
         }
 
+        // Our own half of a private conversation. The wire copy is encrypted
+        // to the peer and never echoes back, so this is the only record of it.
+        if trimmed.starts_with("__DM_SENT__:") {
+            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let target = parts[1].to_string();
+                let raw = parts[2].to_string();
+                let content = parts[3].to_string();
+                let timestamp = if raw.len() == 4 {
+                    format!("{}:{}", &raw[0..2], &raw[2..4])
+                } else {
+                    raw
+                };
+                let msg = Message {
+                    sender: self.nickname.clone(),
+                    timestamp,
+                    content,
+                    is_self: true,
+                    epoch: chrono::Local::now().timestamp(),
+                    arrived: Some(Instant::now()),
+                };
+                let admitted = self.arrival_gate.admit();
+                push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
+                self.scroll_to_bottom_current_conversation();
+                return;
+            }
+        }
+
         if trimmed.starts_with("__DM__:") {
             let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
             if parts.len() >= 4 {

@@ -25,6 +25,10 @@ pub enum CommandOutcome {
     JoinGeohash(String),
     /// Leave a geohash channel, or the active one when None.
     LeaveGeohash(Option<String>),
+    /// Send an encrypted private message. The target is a resolved peer ID, not
+    /// a nickname: resolution can fail or be ambiguous, and that is worth
+    /// reporting to the user before anything is encrypted.
+    SendDirectMessage { target: String, content: String },
     Quit,
 }
 
@@ -101,12 +105,33 @@ pub fn handle(
         ]),
         "/channels" => CommandOutcome::Reply(geo_list(geo)),
 
-        // Stage 2.
-        "/dm" | "/msg" | "/reply" => CommandOutcome::Reply(vec![
-            "Private messages need the Noise session layer, which is not wired up yet."
-                .to_string(),
-            "Public mesh chat works; DMs are the next piece.".to_string(),
-        ]),
+        "/dm" | "/msg" => {
+            let Some((who, text)) = rest.split_once(char::is_whitespace) else {
+                return CommandOutcome::Reply(vec![
+                    format!("Usage: {command} <nickname> <message>"),
+                    "The first private message opens an encrypted channel, so it".to_string(),
+                    "may take a moment to arrive.".to_string(),
+                ]);
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                return CommandOutcome::Reply(vec![format!("Usage: {command} <nickname> <message>")]);
+            }
+            // A bare peer ID is accepted so two peers sharing a nickname can
+            // still be reached.
+            let target = if mesh.peers.contains_key(who) {
+                Ok(who.to_string())
+            } else {
+                mesh.peer_id_for_nickname(who)
+            };
+            match target {
+                Ok(target) => CommandOutcome::SendDirectMessage {
+                    target,
+                    content: text.to_string(),
+                },
+                Err(reason) => CommandOutcome::Reply(vec![reason]),
+            }
+        }
         "/block" | "/unblock" => CommandOutcome::Reply(vec![
             "Blocking is not implemented against the new peer identity model yet.".to_string(),
         ]),

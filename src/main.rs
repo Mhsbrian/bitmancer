@@ -14,6 +14,7 @@ mod geo;
 mod geohash;
 mod media;
 mod mesh;
+mod noise_payload;
 mod noise_protocol;
 mod nostr;
 mod noise_session;
@@ -168,6 +169,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 TransportEvent::Frame(frame) => {
                     for mesh_event in mesh.handle_frame(&frame) {
+                        // A handshake reply originates down in the mesh layer
+                        // rather than from a user action, so it has to be put
+                        // on the air here.
+                        if let MeshEvent::Send(outgoing) = mesh_event {
+                            let _ = transport.outbound.send(outgoing).await;
+                            continue;
+                        }
                         apply_mesh_event(&mut app, mesh_event, &mut last_notice);
                     }
                 }
@@ -323,6 +331,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandOutcome::Reply(lines) => {
                     for text in lines {
                         app.add_log_message(format!("system: {text}"));
+                    }
+                }
+                CommandOutcome::SendDirectMessage { target, content } => {
+                    match mesh.dm_frames(&target, &content) {
+                        Ok(frames) => {
+                            for frame in frames {
+                                let _ = transport.outbound.send(frame).await;
+                            }
+                            // Echo locally straight away. The wire copy is
+                            // encrypted to the peer and never comes back to us,
+                            // so nothing else would show what we said.
+                            let clock = chrono::Local::now().format("%H%M");
+                            let who = mesh
+                                .peers
+                                .get(&target)
+                                .map(|peer| peer.nickname.clone())
+                                .unwrap_or_else(|| target.clone());
+                            app.add_log_message(format!("__DM_SENT__:{who}:{clock}:{content}"));
+                            if !mesh.has_session(&target) {
+                                app.add_log_message(format!(
+                                    "system: opening an encrypted channel with {who}; the message sends once it is up."
+                                ));
+                            }
+                        }
+                        Err(reason) => {
+                            app.add_log_message(format!("system: {reason}"));
+                        }
                     }
                 }
                 CommandOutcome::SetNickname(name) => app.pending_nickname_update = Some(name),
@@ -528,6 +563,28 @@ fn fixed_key(bytes: Option<&[u8]>) -> Option<[u8; 32]> {
 
 fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut String) {
     match mesh_event {
+        // Handled by the caller, which owns the transport.
+        MeshEvent::Send(_) => {}
+        MeshEvent::PrivateMessage {
+            sender, content, ..
+        } => {
+            // The DM marker takes HHMM, not an epoch: the parser only splits a
+            // four-character value into a clock time and passes anything else
+            // through verbatim, so an epoch renders as ten digits in the time
+            // column.
+            let clock = chrono::Local::now().format("%H%M");
+            app.add_log_message(format!("__DM__:{sender}:{clock}:{content}"));
+        }
+        MeshEvent::SessionUp {
+            nickname,
+            fingerprint,
+            ..
+        } => {
+            let short: String = fingerprint.chars().take(16).collect();
+            app.add_log_message(format!(
+                "system: encrypted channel with {nickname} is up ({short})"
+            ));
+        }
         MeshEvent::PeerAppeared { nickname, .. } => {
             app.add_log_message(format!("system: {nickname} connected"));
         }

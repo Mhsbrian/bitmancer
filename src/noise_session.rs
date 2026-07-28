@@ -13,12 +13,19 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 // MARK: - Debug Logging
 
+/// Appends a handshake trace, but only when the operator has asked for one by
+/// pointing `BITMANCER_NOISE_LOG` at a path.
+///
+/// This used to append to `noise_debug.log` in the current working directory
+/// unconditionally. Every private message a user sent would drop a file
+/// wherever they happened to launch the client from — inside their own repo,
+/// in most cases — carrying peer IDs and handshake state nobody asked to have
+/// written to disk.
 fn write_noise_debug_log(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("noise_debug.log")
-    {
+    let Ok(path) = std::env::var("BITMANCER_NOISE_LOG") else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()

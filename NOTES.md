@@ -52,6 +52,9 @@ Linux builds pull in `dbus` with the `vendored` feature, so a C toolchain and `p
 All of this is ported from `localPackages/BitFoundation/Sources/BitFoundation/` and `bitchat/Protocols/` upstream. Get any of it wrong and the peer silently ignores you — bitchat's announce handler says "no backward compatibility" and means it.
 
 - **Peer IDs are derived, not random** (`peer_id.rs`). A peer ID is the first 16 hex chars of SHA-256(Noise static public key); the frame carries those 16 hex chars decoded to 8 bytes. The receiver re-derives the ID from the announced key and drops the announce on mismatch, so the ID must stay pinned to the persisted Noise key.
+- **Noise frames are not signed.** `noiseHandshake 0x10` and `noiseEncrypted 0x11` are addressed and unsigned. The handshake authenticates the channel on its own, and a signature would not survive anyway: verification re-encodes canonically, and that re-encode compresses payloads at or above 100 bytes with a DEFLATE we cannot reproduce. Handshake messages routinely exceed 100 bytes, so a signed Noise frame would be dropped every time. Only announces and public messages are signed.
+- **Encrypted frames carry a typed payload.** The plaintext inside 0x11 is `[type byte][body]` — privateMessage 0x01, readReceipt 0x02, delivered 0x03 (`noise_payload.rs`). Unknown types are dropped rather than rendered, since a type we cannot parse is not chat.
+- **A queued DM needs a session object first.** `NoiseSessionManager::queue_message` returns `false` and discards the text when no session exists for the peer, and `initiate_handshake` is what creates one. Queue before initiating and the user's first message vanishes with only a bool to say so — `dm_frames` initiates first for exactly this reason.
 - **Announces are signed TLV** (`announce.rs`). Mandatory TLVs: nickname 0x01, noise public key 0x02, signing public key 0x03. The packet carries an Ed25519 signature over the *canonical* encoding — signature cleared, TTL forced to 0, RSR flag cleared, and padded. Verification re-encodes, so the canonical bytes must be reproducible on both sides.
 - **Announce payloads must stay under 100 bytes.** Upstream compresses any payload at or above that threshold before signing, using Apple's DEFLATE, whose output we cannot reproduce byte-for-byte with flate2. Below the threshold neither side compresses and signatures match. This is why `announce::MAX_NICKNAME_BYTES` is 24 — do not raise it without solving the canonical-compression problem.
 - **Outbound frames are never compressed** (`protocol.rs`), for the same reason. Inbound compressed frames are decoded normally.
@@ -318,7 +321,6 @@ packets addressed to us, presence, and unknown types.
 
 ## What is not done
 
-- **Noise DMs.** `noise_protocol.rs` and `noise_session.rs` implement `Noise_XX_25519_ChaChaPoly_SHA256`, which is still the right suite, but they are wired for the old three-opcode framing (separate init/response/encrypted types). Current upstream uses unified `noiseHandshake 0x10` (direction inferred from the payload) and `noiseEncrypted 0x11` carrying an inner `NoisePayload` type byte (privateMessage 0x01, readReceipt 0x02, delivered 0x03). Both modules currently compile but are unreferenced. `/dm` and `/reply` report this instead of pretending.
 - **Sending** fragments and files. Reassembly and decoding are in; the outbound
   side (splitting our own large frames, uploading a picture) is not.
 - **Multi-link.** The transport connects to one peripheral, which is why relaying
