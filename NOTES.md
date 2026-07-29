@@ -99,6 +99,28 @@ are Nostr, over the internet, and nothing about them touches BLE. Ported from
   from `assets/online_relays_gps.csv`, ties broken by host. Publishers and
   subscribers only meet because they compute the same set from the same file —
   change the selection and the client goes silent without erroring.
+- **The directory is a snapshot with no liveness signal**, so a channel whose
+  nearest relays have since died picks them again on every join. `#wd` reaches
+  two Bangkok hosts (`relay0`/`relay1.gfcom.info`, lines 16 and 353) that refuse
+  and 502 respectively, and a third that flaps. This is survivable — the other
+  relays carry the channel — but it is the steady state, not a transient, and
+  the client has to behave well in it rather than treat it as an error.
+- **Relay failures are reported per host, on transition, with a mute.** Three
+  separate defects lived here. The notice filter was a single `last_notice`
+  string, which two relays failing with *different* reasons defeat completely,
+  because consecutive lines never match. The event carried a channel, so one
+  dead host was reported once by the joined channel and again by the map
+  sampler. And a host that flaps produces an honest, useless line every few
+  seconds — so after `FLAP_LIMIT` separate outages a relay is announced as
+  unreliable once and then muted. A steadily dead relay is never called
+  unstable; it fell over once and stayed there.
+- **The reconnect backoff resets on a connection that lasted, not on one that
+  opened.** A relay that accepts and immediately drops was "succeeding" on every
+  attempt, so it reset the backoff and was redialled every two seconds for the
+  session — roughly 1200 dials an hour at a host that never serves anything.
+  Resetting only after `STABLE_CONNECTION` makes a degraded host back off like a
+  dead one. A socket closing because we left the channel or are quitting is not
+  reported as a failure.
 - NIP-13 PoW is mined to 8 bits before signing, since the nonce tag is part of
   the id. Mining is time-capped and steps the committed target down rather than
   blocking a send.

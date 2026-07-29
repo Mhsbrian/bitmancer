@@ -18,7 +18,25 @@ use crate::nostr::relay::{
 };
 
 const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(2);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Five minutes, reached after about eight consecutive failures.
+///
+/// The directory is a static snapshot and some of the hosts in it are simply
+/// gone, so this is not a transient case to ride out — it is the steady state
+/// for a channel whose nearest relays have died. A minute between attempts
+/// meant well over a thousand connections a day to a host that will never
+/// answer, which is wasted traffic and looks like probing from the other end.
+/// The curve still recovers a genuinely flapping relay quickly: the cap is only
+/// reached after several minutes of continuous failure.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// How long a connection must last before it counts as having worked.
+///
+/// The backoff used to reset the moment a socket opened, which is the wrong
+/// signal: a relay that accepts a connection and drops it immediately would be
+/// redialled every two seconds forever, since each attempt "succeeded". Seen on
+/// a host that accepted, died, and returned 502 three times in a minute.
+/// Resetting only after a connection has held for a while means a degraded host
+/// backs off like a dead one, while a genuine reconnection still clears it.
+const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 /// Joined channel: one hour of recent history, matching upstream's
 /// nostrGeohashInitialLookbackSeconds / nostrGeohashInitialLimit.
 const CHANNEL_LOOKBACK_SECONDS: i64 = 3600;
@@ -46,11 +64,10 @@ pub enum GeoEvent {
         geohash: String,
         relay: String,
     },
-    RelayFailed {
-        geohash: String,
-        relay: String,
-        reason: String,
-    },
+    /// Carries no channel, deliberately. A host that is not answering is not
+    /// answering anyone, and tagging the failure with whichever subscription
+    /// noticed invites reporting one fact once per channel.
+    RelayFailed { relay: String, reason: String },
     Message {
         geohash: String,
         pubkey: String,
@@ -588,7 +605,8 @@ async fn relay_task(
     loop {
         match connect_async(&url).await {
             Ok((mut socket, _response)) => {
-                backoff = RECONNECT_BACKOFF_START;
+                // Not yet a reason to reset the backoff — see below.
+                let opened_at = tokio::time::Instant::now();
                 let _ = events
                     .send(GeoEvent::RelayConnected {
                         geohash: key.clone(),
@@ -649,11 +667,28 @@ async fn relay_task(
                         }
                     }
                 }
+
+                // The socket is gone. Only a connection that lasted counts as
+                // one that worked: a host that accepts and drops immediately
+                // would otherwise reset the backoff on every attempt and be
+                // redialled every two seconds for the rest of the session.
+                if opened_at.elapsed() >= STABLE_CONNECTION {
+                    backoff = RECONNECT_BACKOFF_START;
+                } else if !outbound.is_closed() {
+                    // Not when we are the ones going away: a socket closing
+                    // because the channel was left, or the client is quitting,
+                    // is not the relay failing.
+                    let _ = events
+                        .send(GeoEvent::RelayFailed {
+                            relay: url.clone(),
+                            reason: "dropped the connection".to_string(),
+                        })
+                        .await;
+                }
             }
             Err(error) => {
                 let _ = events
                     .send(GeoEvent::RelayFailed {
-                        geohash: key.clone(),
                         relay: url.clone(),
                         reason: error.to_string(),
                     })

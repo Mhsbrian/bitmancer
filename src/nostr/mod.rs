@@ -8,6 +8,7 @@ pub mod client;
 pub mod embedded;
 pub mod envelope;
 pub mod event;
+pub mod health;
 pub mod identity;
 pub mod npub;
 pub mod pow;

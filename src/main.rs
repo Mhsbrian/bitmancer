@@ -38,6 +38,7 @@ use geo::GeoService;
 use mesh::{DeliveryStatus, MeshEvent, MeshService};
 use noise_payload::{NoisePayloadType, PrivateMessagePacket};
 use nostr::client::GeoEvent;
+use nostr::health::Notice;
 use transport::TransportEvent;
 use tui::app::{App, TuiPhase};
 use tui::event;
@@ -198,6 +199,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
     let mut last_maintenance = Instant::now();
     let mut last_notice = String::new();
+    // Per relay, because two relays failing with different reasons is exactly
+    // what defeats a single-slot filter.
+    let mut relay_health = nostr::health::RelayHealth::new();
     // Whether the map sampler is currently running, so it can be torn down
     // exactly once when the map closes.
     let mut sampling = false;
@@ -683,7 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 continue;
             }
-            apply_geo_event(&mut app, &mut geo, geo_event, &mut last_notice);
+            apply_geo_event(&mut app, &mut geo, geo_event, &mut relay_health);
         }
 
         // 6. Periodic upkeep: re-announce so we do not age out, expire peers,
@@ -1167,21 +1171,31 @@ fn apply_geo_event(
     app: &mut App,
     geo: &mut GeoService,
     geo_event: GeoEvent,
-    last_notice: &mut String,
+    health: &mut nostr::health::RelayHealth,
 ) {
     match geo_event {
-        GeoEvent::RelayConnected { .. } => {}
-        GeoEvent::RelayFailed {
-            geohash,
-            relay,
-            reason,
-        } => {
-            let text = format!("#{geohash}: {relay} unreachable ({reason})");
-            if *last_notice != text {
-                *last_notice = text.clone();
-                app.add_log_message(format!("system: {text}"));
+        // Said only for a relay we had already reported down. Announcing every
+        // successful connection would put a line on screen for each of the five
+        // relays behind an ordinary join.
+        GeoEvent::RelayConnected { relay, .. } => {
+            if health.recovered(&relay) == Notice::BackUp {
+                app.add_log_message(format!("system: {relay} is answering again."));
             }
         }
+        // No channel in the message: the host is down for every subscription at
+        // once, so naming the one that happened to notice would report the same
+        // fact once per channel and once more for the map sampler.
+        GeoEvent::RelayFailed { relay, reason, .. } => match health.fell_over(&relay) {
+            Notice::Down => {
+                app.add_log_message(format!("system: {relay} unreachable ({reason})"));
+            }
+            Notice::Unstable => {
+                app.add_log_message(format!(
+                    "system: {relay} keeps dropping; no longer reporting it."
+                ));
+            }
+            Notice::Silent | Notice::BackUp => {}
+        },
         GeoEvent::Message {
             geohash,
             pubkey,
