@@ -5,10 +5,12 @@
 // pool. Nothing here touches the BLE mesh — geohash channels ride the internet.
 
 pub mod client;
+pub mod embedded;
 pub mod envelope;
 pub mod event;
 pub mod identity;
 pub mod pow;
+pub mod processed;
 pub mod relay;
 
 /// rustls 0.23 refuses to pick a crypto backend for you when more than one

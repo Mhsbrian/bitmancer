@@ -388,12 +388,53 @@ packets addressed to us, presence, and unknown types.
   transport per DM (Bluetooth preferred, Nostr fallback) and queues when neither
   is up, so a peer out of BLE range is still reachable. Ours are not. The
   unhandled `nostrCarrier 0x28` and the never-populated `TLV_BRIDGE_GEOHASH
-  0x06` still belong to this gap. Four of five layers are done: the address
-  exchange (favourites, above), the envelope cryptography, the three-layer
-  assembly, and the routing and retention decisions (`outbox.rs`). What remains
-  is relay plumbing — a gift-wrap filter (`kind 1059` tagged with our pubkey), a
-  DM subscription, and a publish path — since `nostr/client.rs` is currently
-  shaped entirely around geohash channels.
+  0x06` still belong to this gap. Inbound now works end to end: the client
+  subscribes to gift wraps at startup, opens them, files the message and
+  acknowledges it. Outbound is the remaining half — see the npub note below.
+- **A rumor does not carry text; it carries a mesh packet.** Upstream puts
+  `"bitchat1:" + base64url(BitchatPacket)` in the rumor, and
+  `NostrInboundPipeline` ignores content without that prefix outright. A client
+  that seals plain text is sending something the other side logs and drops. The
+  packet is typed `noiseEncrypted 0x11` even though nothing in it is
+  Noise-encrypted — the envelope already did that, and doing it again would need
+  a session with someone who is by definition out of radio range. The type is
+  reused so the payload lands in the same dispatch as a mesh DM, which is why
+  `embedded.rs` is thin: only three payload types travel this way
+  (`privateMessage`, `delivered`, `readReceipt`), and group state, voice and
+  files are explicitly refused at both ends.
+- **The inner packet is padded, and that padding is load-bearing.** The envelope
+  does not pad its plaintext, so it is the only thing standing between a relay
+  and the length of every message it carries for us.
+- **Relays redeliver a day of mail on every reconnect**, which is the point —
+  the subscription asks for 24 hours precisely so anything sent while we were
+  offline arrives. It also means a session-lifetime dedup cache is not enough:
+  every relaunch would replay old conversations and re-fire receipts at peers
+  who acknowledged them yesterday. `nostr/processed.rs` keeps the opened-wrap
+  ids on disk beside the identity, and `/wipe` clears it — a list of envelopes
+  we opened is a record of who wrote to us and roughly when. Upstream reached
+  the same conclusion in `NostrProcessedEventStore`.
+- **DM relays are a fixed set, not the geohash directory.** Those are chosen by
+  distance to a location and a DM has no location; using them would also make
+  the relays we collect mail from change with where we are standing, and strand
+  mail on relays we stopped querying. Four clearnet hostnames is a real
+  chokepoint — upstream says so itself and offers user-added relays as the
+  escape hatch. We do not have that yet.
+- **A DM subscription gets no backlog buffering.** The channel backlog sorts
+  replayed history by send time, and a gift wrap's `created_at` is randomised by
+  ±15 minutes to blur exactly that; sorting on it would order the day's mail by
+  noise. The true time is inside the sealed rumor, so ordering belongs
+  downstream of decryption.
+- **Inbound routing uses the envelope's sender, never the peer ID inside the
+  packet.** The crypto proves who sealed it; the inner ID is the sender's
+  unverified claim about themselves, and routing by it would let anyone holding
+  our address drop a message into someone else's conversation. Upstream resolves
+  the same way, via favourites with a fallback derived from the Nostr key.
+- **Upstream hands out `npub`, not hex.** `sendFavoriteNotification` appends
+  `":" + myNostrIdentity.npub`, so a peer's stored address is bech32. We send
+  hex, which upstream's `findNoiseKey` accepts through its raw-hex branch, but
+  addressing *them* needs a bech32 decoder we do not have. That is what blocks
+  outbound: `embedded::private_message` is written and tested with nothing
+  calling it.
 - **The mesh is preferred over Nostr for every private message**, and not only
   for latency: a message that stays on the local radio tells no third party the
   conversation exists, while the relay path necessarily reveals that *someone*

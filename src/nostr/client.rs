@@ -27,6 +27,12 @@ const CHANNEL_LIMIT: usize = 200;
 /// minutes (nostrGeohashSampleLookbackSeconds) and stays cheap.
 const SAMPLE_LOOKBACK_SECONDS: i64 = 300;
 const SAMPLE_LIMIT: usize = 100;
+/// Private mail: a full day of stored history, matching upstream's
+/// nostrDMSubscribeLookbackSeconds / nostrRelayDefaultFetchLimit. Long on
+/// purpose — a gift wrap is mail held for someone who was not there, so the
+/// window has to cover being away, not just being briefly disconnected.
+const DM_LOOKBACK_SECONDS: i64 = 86400;
+const DM_LIMIT: usize = 100;
 /// Bound on the id set used to collapse copies arriving from several relays.
 /// Only chat consumes it — see `remember_chat`.
 const SEEN_LIMIT: usize = 4096;
@@ -72,6 +78,12 @@ pub enum GeoEvent {
         pubkey: String,
         is_message: bool,
     },
+    /// A gift wrap addressed to us, still sealed.
+    ///
+    /// It arrives unopened because this task holds no keys: it speaks the relay
+    /// protocol and nothing else, and a private message should not be decrypted
+    /// by the component whose whole job is talking to strangers.
+    PrivateEnvelope { wrap: Box<Event> },
 }
 
 enum Command {
@@ -81,11 +93,78 @@ enum Command {
     /// Watch many cells over one subscription, for the map's heat display.
     Sample { cells: Vec<String>, relays: Vec<String> },
     StopSampling,
+    /// Listen for private mail addressed to one identity.
+    SubscribeDirect { pubkey: String, relays: Vec<String> },
 }
 
-/// Reserved subscription key for the map sampler. Not a valid geohash, so it
-/// can never collide with a joined channel.
+/// Reserved subscription keys, for the two subscriptions that are not a joined
+/// channel. Neither is a valid geohash — geohashes are base32 — so neither can
+/// collide with one.
 const SAMPLER_KEY: &str = "\u{1}sampler";
+const DM_KEY: &str = "\u{1}dm";
+
+/// Where private mail is posted and collected.
+///
+/// Deliberately not the geohash directory: those relays are chosen by distance
+/// to a location, and a DM has no location. Reusing them would also mean the
+/// set of relays we ask for mail on changes with where we are standing, which
+/// is a movement signal handed to anyone watching, and would leave mail sitting
+/// on a relay we no longer query.
+///
+/// These are upstream's four built-ins, so mail posted by either client reaches
+/// the other. Four clearnet hostnames is a real chokepoint — upstream says as
+/// much in `NostrRelaySettings` and offers user-added relays as the escape
+/// hatch. We do not have that yet; it is the natural next thing here.
+const DM_RELAYS: [&str; 4] = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://offchain.pub",
+];
+
+/// The relay set private mail uses.
+pub fn dm_relays() -> Vec<String> {
+    DM_RELAYS.iter().map(|relay| relay.to_string()).collect()
+}
+
+/// What one socket is watching. These three used to be separate parameters on
+/// `relay_task`; they are one decision, and a DM subscription differs from a
+/// channel in all of them at once.
+#[derive(Debug, Clone)]
+enum Watch {
+    /// One or more geohash cells: a joined channel, or the map's sample set.
+    Cells {
+        cells: Vec<String>,
+        lookback_seconds: i64,
+        limit: usize,
+    },
+    /// Gift wraps addressed to one public key.
+    DirectMessages { pubkey: String },
+}
+
+impl Watch {
+    /// Rebuilt on every reconnect, so `since` stays relative to now rather than
+    /// asking for an ever-older window as the session runs on.
+    fn filter(&self) -> Filter {
+        match self {
+            Watch::Cells {
+                cells,
+                lookback_seconds,
+                limit,
+            } => Filter::geohashes(cells, Filter::since_lookback(*lookback_seconds), *limit),
+            Watch::DirectMessages { pubkey } => {
+                Filter::gift_wraps(pubkey, Filter::since_lookback(DM_LOOKBACK_SECONDS), DM_LIMIT)
+            }
+        }
+    }
+
+    fn subscription_prefix(&self) -> &'static str {
+        match self {
+            Watch::Cells { .. } => "geo",
+            Watch::DirectMessages { .. } => "dm",
+        }
+    }
+}
 
 pub struct NostrClient {
     pub events: mpsc::Receiver<GeoEvent>,
@@ -141,6 +220,35 @@ impl NostrClient {
             })
             .await;
     }
+
+    /// Starts collecting private mail for one identity, replacing any previous
+    /// subscription. One at a time: this is the long-lived address a favourite
+    /// was given, and there is only ever one of those.
+    pub async fn subscribe_direct(&self, pubkey: &str, relays: Vec<String>) {
+        let _ = self
+            .commands
+            .send(Command::SubscribeDirect {
+                pubkey: pubkey.to_string(),
+                relays,
+            })
+            .await;
+    }
+
+    /// Posts a gift wrap to the DM relays.
+    ///
+    /// Silently does nothing until `subscribe_direct` has run, because it
+    /// borrows that subscription's sockets. That ordering is not a constraint
+    /// worth working around — a client that can send private mail but is not
+    /// listening for the reply is not a client anyone wants.
+    pub async fn publish_direct(&self, event: Event) {
+        let _ = self
+            .commands
+            .send(Command::Publish {
+                geohash: DM_KEY.to_string(),
+                event: Box::new(event),
+            })
+            .await;
+    }
 }
 
 /// Stored events arrive newest-first, so a fresh subscription's backlog is
@@ -189,9 +297,11 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
                             tokio::spawn(relay_task(
                                 relay,
                                 geohash.clone(),
-                                vec![geohash.clone()],
-                                CHANNEL_LOOKBACK_SECONDS,
-                                CHANNEL_LIMIT,
+                                Watch::Cells {
+                                    cells: vec![geohash.clone()],
+                                    lookback_seconds: CHANNEL_LOOKBACK_SECONDS,
+                                    limit: CHANNEL_LIMIT,
+                                },
                                 outbound_rx,
                                 raw_tx.clone(),
                                 events.clone(),
@@ -214,9 +324,11 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
                             tokio::spawn(relay_task(
                                 relay,
                                 SAMPLER_KEY.to_string(),
-                                cells.clone(),
-                                SAMPLE_LOOKBACK_SECONDS,
-                                SAMPLE_LIMIT,
+                                Watch::Cells {
+                                    cells: cells.clone(),
+                                    lookback_seconds: SAMPLE_LOOKBACK_SECONDS,
+                                    limit: SAMPLE_LIMIT,
+                                },
                                 outbound_rx,
                                 raw_tx.clone(),
                                 events.clone(),
@@ -224,6 +336,32 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
                             senders.push(outbound_tx);
                         }
                         subscriptions.insert(SAMPLER_KEY.to_string(), senders);
+                    }
+                    Some(Command::SubscribeDirect { pubkey, relays }) => {
+                        subscriptions.remove(DM_KEY);
+                        // No backlog entry, deliberately. The channel backlog
+                        // exists to sort replayed history by send time, and a
+                        // gift wrap's `created_at` is randomised by a quarter
+                        // of an hour either way to blur exactly that. Sorting
+                        // on it would order the day's mail by noise. The real
+                        // time is inside the sealed rumor, so ordering belongs
+                        // downstream of decryption, not here.
+                        let mut senders = Vec::new();
+                        for relay in relays {
+                            let (outbound_tx, outbound_rx) = mpsc::channel::<String>(32);
+                            tokio::spawn(relay_task(
+                                relay,
+                                DM_KEY.to_string(),
+                                Watch::DirectMessages {
+                                    pubkey: pubkey.clone(),
+                                },
+                                outbound_rx,
+                                raw_tx.clone(),
+                                events.clone(),
+                            ));
+                            senders.push(outbound_tx);
+                        }
+                        subscriptions.insert(DM_KEY.to_string(), senders);
                     }
                     Some(Command::StopSampling) => {
                         subscriptions.remove(SAMPLER_KEY);
@@ -267,6 +405,31 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
                 if !event.verify() {
                     continue;
                 }
+
+                // Private mail leaves here before anything geographic is asked
+                // of it: a gift wrap carries no `#g` tag, and should not — the
+                // cell someone is standing in is not part of an address.
+                if key == DM_KEY {
+                    if event.kind != crate::nostr::envelope::KIND_GIFT_WRAP {
+                        continue;
+                    }
+                    // Four relays each hand over the same wrap. Collapsing them
+                    // here saves three decryptions; the durable record that
+                    // survives a restart is kept by the caller, which is the
+                    // one that knows what it already acted on.
+                    if !remember(&mut seen_ids, &mut seen_order, &event.id) {
+                        continue;
+                    }
+                    if events
+                        .send(GeoEvent::PrivateEnvelope { wrap: event })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+
                 let Some(cell) = event.geohash().map(str::to_string) else { continue };
                 let is_sampler = key == SAMPLER_KEY;
                 if is_sampler {
@@ -406,23 +569,20 @@ fn remember(seen: &mut HashSet<String>, order: &mut VecDeque<String>, id: &str) 
     true
 }
 
-/// Holds one relay socket open for one geohash subscription.
-///
-/// The parameters are the subscription's whole identity - url, key, geohash,
-/// filters, channels. Bundling them into a struct would move the same fields
-/// behind one name without making the call site say less.
-#[allow(clippy::too_many_arguments)]
+/// Holds one relay socket open for one subscription.
 async fn relay_task(
     url: String,
     key: String,
-    cells: Vec<String>,
-    lookback_seconds: i64,
-    limit: usize,
+    watch: Watch,
     mut outbound: mpsc::Receiver<String>,
     inbound: mpsc::Sender<(String, String, RelayMessage)>,
     events: mpsc::Sender<GeoEvent>,
 ) {
-    let subscription_id = format!("geo-{}", sanitize_subscription_id(&key));
+    let subscription_id = format!(
+        "{}-{}",
+        watch.subscription_prefix(),
+        sanitize_subscription_id(&key)
+    );
     let mut backoff = RECONNECT_BACKOFF_START;
 
     loop {
@@ -438,8 +598,7 @@ async fn relay_task(
 
                 // Recomputed on every (re)connect so a long-lived session does
                 // not keep asking for an ever-older window.
-                let filter =
-                    Filter::geohashes(&cells, Filter::since_lookback(lookback_seconds), limit);
+                let filter = watch.filter();
                 if socket
                     .send(WsMessage::Text(req_message(&subscription_id, &filter).into()))
                     .await
@@ -577,8 +736,11 @@ pub async fn doctor(geohash: &str, seconds: u64) -> i32 {
                     presence += 1;
                     speakers.entry(pubkey.clone()).or_insert_with(|| pubkey[..8].to_string());
                 }
-                // The doctor never starts the map sampler.
-                GeoEvent::Activity { .. } | GeoEvent::HistoryEnd { .. } => {}
+                // The doctor starts neither the map sampler nor a DM
+                // subscription, so neither can arrive here.
+                GeoEvent::Activity { .. }
+                | GeoEvent::HistoryEnd { .. }
+                | GeoEvent::PrivateEnvelope { .. } => {}
             },
         }
     }

@@ -35,7 +35,8 @@ use tokio::sync::mpsc;
 
 use commands::CommandOutcome;
 use geo::GeoService;
-use mesh::{MeshEvent, MeshService};
+use mesh::{DeliveryStatus, MeshEvent, MeshService};
+use noise_payload::{NoisePayloadType, PrivateMessagePacket};
 use nostr::client::GeoEvent;
 use transport::TransportEvent;
 use tui::app::{App, TuiPhase};
@@ -167,6 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
     let mut transport = transport::spawn();
     let mut nostr_client = nostr::client::NostrClient::spawn();
+
+    // Private mail, collected from the moment the client starts rather than
+    // when a channel is joined. The address a favourite was given does not
+    // depend on where we are standing, and mail waiting on a relay should not
+    // need a location channel to be opened before it is delivered.
+    let mut seen_envelopes = nostr::processed::ProcessedEvents::open();
+    let our_nostr_key = geo.main_nostr_pubkey();
+    nostr_client
+        .subscribe_direct(&our_nostr_key, nostr::client::dm_relays())
+        .await;
 
     let mut last_tick = Instant::now();
     let mut last_maintenance = Instant::now();
@@ -423,6 +434,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(existed) => {
                             mesh.wipe();
                             app.wipe();
+                            // A list of envelopes we opened is a record of who
+                            // wrote to us and roughly when, in its own file
+                            // beside the identity rather than inside it.
+                            seen_envelopes.wipe();
                             let what = if existed {
                                 "Identity destroyed."
                             } else {
@@ -607,8 +622,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // 5. Location channel traffic.
+        // 5. Location channel traffic, and private mail off the same relays.
         while let Ok(geo_event) = nostr_client.events.try_recv() {
+            if let GeoEvent::PrivateEnvelope { wrap } = geo_event {
+                if let Some(reply) = open_private_envelope(
+                    &mut app,
+                    &mut mesh,
+                    &mut geo,
+                    &mut seen_envelopes,
+                    &wrap,
+                ) {
+                    nostr_client.publish_direct(reply).await;
+                }
+                continue;
+            }
             apply_geo_event(&mut app, &mut geo, geo_event, &mut last_notice);
         }
 
@@ -923,6 +950,145 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
     }
 }
 
+/// Opens a gift wrap and acts on what is inside, returning an acknowledgement
+/// to post back when one is owed.
+///
+/// Everything here is decided on the *envelope's* sender — the key that signed
+/// the seal, which the crypto proved — and never on the peer ID written inside
+/// the packet. That inner ID is the sender's unverified claim about themselves,
+/// and routing a conversation by it would let anyone holding our address drop a
+/// message into someone else's thread.
+fn open_private_envelope(
+    app: &mut App,
+    mesh: &mut MeshService,
+    geo: &mut GeoService,
+    seen: &mut nostr::processed::ProcessedEvents,
+    wrap: &nostr::event::Event,
+) -> Option<nostr::event::Event> {
+    // Recorded before it is opened, not after. A wrap that fails to decrypt
+    // will fail again identically on the next reconnect, and the relays offer
+    // the same day of mail every time — without recording the failures too,
+    // one unreadable envelope becomes an error on a loop forever.
+    if !seen.remember(&wrap.id) {
+        return None;
+    }
+
+    let keypair = geo.main_nostr_keypair();
+    let (our_pubkey, _) = keypair.x_only_public_key();
+    let opened = match nostr::envelope::open_message(wrap, &keypair.secret_key(), &our_pubkey) {
+        Ok(opened) => opened,
+        // Not necessarily an attack, and not worth a line in the user's log:
+        // relays serve whatever is tagged with our key, including mail sealed
+        // by a client we cannot read.
+        Err(_) => return None,
+    };
+
+    // Plain text is not a private message. Upstream frames a whole mesh packet
+    // inside the rumor and ignores content without the marker; a bare string
+    // arriving here is from something that does not speak this protocol.
+    let packet = nostr::embedded::decode(&opened.content)?;
+    let payload = nostr::embedded::payload_of(&packet)?;
+
+    // Who this is, by the only identity the envelope actually proved.
+    let fingerprint = mesh
+        .favorites
+        .fingerprint_for_nostr_key(&opened.sender)
+        .map(str::to_string);
+    if let Some(fingerprint) = &fingerprint {
+        if mesh.is_blocked(fingerprint) {
+            return None;
+        }
+    }
+    let (conversation, display) = match &fingerprint {
+        Some(fingerprint) => {
+            let nickname = mesh
+                .favorites
+                .get(fingerprint)
+                .map(|entry| entry.nickname.clone())
+                .filter(|nickname| !nickname.is_empty())
+                .unwrap_or_else(|| crate::peer_id::short_display(fingerprint));
+            (fingerprint.chars().take(16).collect::<String>(), nickname)
+        }
+        // Someone we favourited who has not favourited us back can reach us
+        // without our ever having been given their address. Their mail is
+        // real; we simply have no name for them, so it is filed under the
+        // address that sent it rather than dropped.
+        None => (
+            opened.sender.clone(),
+            format!("nostr:{}", &opened.sender[..8.min(opened.sender.len())]),
+        ),
+    };
+
+    match payload.kind {
+        NoisePayloadType::PrivateMessage => {
+            let record = PrivateMessagePacket::decode(&payload.body)?;
+            // Send time from inside the envelope. The wrap's own timestamp is
+            // randomised by up to a quarter of an hour to blur it.
+            let clock = chrono::DateTime::from_timestamp(opened.created_at, 0)
+                .map(|sent| sent.with_timezone(&chrono::Local).format("%H%M").to_string())
+                .unwrap_or_else(|| chrono::Local::now().format("%H%M").to_string());
+            app.add_log_message(format!(
+                "__DM__:{display}:{clock}:{}:{}",
+                record.message_id, record.content
+            ));
+
+            // Acknowledge over the transport it arrived on. The sender is out
+            // of radio range by construction — that is why this path exists —
+            // so a mesh receipt would go nowhere.
+            let our_peer_id = mesh.my_peer_id.clone();
+            let content = nostr::embedded::receipt(
+                NoisePayloadType::Delivered,
+                &record.message_id,
+                &our_peer_id,
+                &conversation,
+            )?;
+            seal_for(&content, &opened.sender, &keypair)
+        }
+        NoisePayloadType::Delivered => {
+            app.mark_delivery(&payload.message_id()?, DeliveryStatus::Delivered);
+            None
+        }
+        NoisePayloadType::ReadReceipt => {
+            app.mark_delivery(&payload.message_id()?, DeliveryStatus::Read);
+            None
+        }
+        // `payload_of` already refused everything else.
+        _ => None,
+    }
+}
+
+/// Seals `content` for one recipient, drawing the fresh randomness every
+/// envelope needs: a throwaway signing key for the wrap and two nonces that
+/// must never repeat under their keys.
+fn seal_for(
+    content: &str,
+    recipient_hex: &str,
+    sender: &secp256k1::Keypair,
+) -> Option<nostr::event::Event> {
+    use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
+
+    let recipient_bytes: [u8; 32] = hex::decode(recipient_hex).ok()?.try_into().ok()?;
+    let recipient = XOnlyPublicKey::from_byte_array(recipient_bytes).ok()?;
+    let ephemeral = Keypair::from_secret_key(
+        SECP256K1,
+        &SecretKey::from_byte_array(rand::random::<[u8; 32]>()).ok()?,
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    nostr::envelope::seal_message(
+        content,
+        &recipient,
+        sender,
+        &ephemeral,
+        now,
+        nostr::envelope::published_timestamp(now, rand::random::<i64>()),
+        [rand::random(), rand::random()],
+    )
+    .ok()
+}
+
 /// Location channel traffic. Chat lands in the "#<geohash>" conversation; the
 /// presence beacons only update the participant list.
 fn apply_geo_event(
@@ -983,6 +1149,10 @@ fn apply_geo_event(
             pubkey,
             is_message,
         } => app.map.note_voice(&geohash, &pubkey, is_message),
+        // Opened by the caller, which holds the identity keys and the record of
+        // what has already been acted on. Nothing subscribes to private mail
+        // yet, so nothing reaches here.
+        GeoEvent::PrivateEnvelope { .. } => {}
     }
 }
 

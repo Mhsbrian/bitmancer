@@ -78,6 +78,16 @@ impl GeoService {
         self.identities.main_pubkey_hex()
     }
 
+    /// The secret half of that address, for opening private mail and signing
+    /// the seal inside it.
+    ///
+    /// Handed out rather than used here because this service knows about
+    /// location channels and nothing about private messages, and giving it the
+    /// envelope format as well would make it the place where both live.
+    pub fn main_nostr_keypair(&mut self) -> secp256k1::Keypair {
+        self.identities.main_keypair()
+    }
+
     pub fn set_nickname(&mut self, nickname: &str) {
         self.nickname = nickname.to_string();
     }

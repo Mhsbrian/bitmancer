@@ -11,7 +11,7 @@
 
 pkgname=bitmancer
 pkgver=0.1.0
-pkgrel=13
+pkgrel=14
 pkgdesc="Terminal client for the BitChat mesh and its geohash location channels"
 arch=('x86_64' 'aarch64' 'armv7h')
 url="https://github.com/local/bitmancer"
@@ -39,9 +39,12 @@ prepare() {
 	rm -rf "$srcdir/build"
 	mkdir -p "$srcdir/build"
 	# assets/ holds the geo relay directory, which is include_str!'d at build
-	# time — the crate does not compile without it.
+	# time — the crate does not compile without it. tests/ carries the wire
+	# fixtures captured from other implementations, which the unit tests
+	# include_str! in turn, so check() cannot compile without them either.
 	cp -a "$(_repo)/Cargo.toml" "$(_repo)/Cargo.lock" "$(_repo)/src" \
-	      "$(_repo)/assets" "$(_repo)/LICENSE" "$(_repo)/README.md" "$srcdir/build/"
+	      "$(_repo)/assets" "$(_repo)/tests" "$(_repo)/LICENSE" \
+	      "$(_repo)/README.md" "$srcdir/build/"
 
 	cd "$srcdir/build"
 	# makepkg exports LDFLAGS with --as-needed, which drops the statically

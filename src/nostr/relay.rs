@@ -23,6 +23,10 @@ pub struct Filter {
     pub limit: Option<usize>,
     #[serde(rename = "#g", skip_serializing_if = "Option::is_none")]
     pub geohashes: Option<Vec<String>>,
+    /// Recipients, for gift wraps addressed to us. A wrap is authored by a
+    /// throwaway key, so `authors` says nothing and `#p` is the only handle.
+    #[serde(rename = "#p", skip_serializing_if = "Option::is_none")]
+    pub pubkeys: Option<Vec<String>>,
 }
 
 impl Filter {
@@ -59,6 +63,29 @@ impl Filter {
             since,
             limit: Some(limit),
             geohashes: Some(cells.to_vec()),
+            pubkeys: None,
+        }
+    }
+
+    /// Private mail addressed to us: `NostrFilter.giftWrapsFor`.
+    ///
+    /// Unlike a geohash channel this asks for *stored* events, and must. A gift
+    /// wrap is held by the relay precisely so it can be handed over when the
+    /// recipient comes back, which is the whole point of the internet path — a
+    /// `since` of "now" would collect only mail sent while we happened to be
+    /// listening, i.e. exactly the case the mesh already covers.
+    ///
+    /// The window is a day, matching upstream. It cannot be tight: a wrap's
+    /// `created_at` is deliberately randomised by up to fifteen minutes either
+    /// way to blur send times, so the timestamp a relay filters on is not the
+    /// time the message was written.
+    pub fn gift_wraps(pubkey: &str, since: Option<i64>, limit: usize) -> Self {
+        Self {
+            kinds: Some(vec![crate::nostr::envelope::KIND_GIFT_WRAP]),
+            since,
+            limit: Some(limit),
+            geohashes: None,
+            pubkeys: Some(vec![pubkey.to_string()]),
         }
     }
 }
@@ -153,6 +180,33 @@ mod tests {
         let filter = Filter::geohash_ephemeral("9q8yy", None, 10);
         let json = serde_json::to_string(&filter).unwrap();
         assert!(!json.contains("since"), "{json}");
+    }
+
+    #[test]
+    fn a_gift_wrap_filter_asks_by_recipient_not_author() {
+        // The wrap is signed by a throwaway key that exists for one message, so
+        // `authors` would match nothing. `#p` is the only handle on it.
+        let filter = Filter::gift_wraps("ab".repeat(32).as_str(), Some(1700000000), 100);
+        let json = serde_json::to_string(&filter).unwrap();
+        assert!(json.contains(r#""kinds":[1059]"#), "{json}");
+        assert!(json.contains(&format!(r##""#p":["{}"]"##, "ab".repeat(32))), "{json}");
+        assert!(!json.contains("authors"), "{json}");
+        assert!(!json.contains(r##""#g""##), "a DM filter must not be scoped to a cell: {json}");
+    }
+
+    #[test]
+    fn a_gift_wrap_filter_always_carries_a_window() {
+        // Without `since` the relay replays the entire mailbox on every
+        // reconnect; with `since` of now, mail that arrived while we were
+        // offline is never handed over — which is the only reason this
+        // transport exists.
+        let filter = Filter::gift_wraps("cd".repeat(32).as_str(), Filter::since_lookback(86400), 100);
+        let since = filter.since.expect("a DM subscription is useless without a window");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((now - since - 86400).abs() <= 2, "the window should be a day");
     }
 
     #[test]
