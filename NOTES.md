@@ -372,6 +372,13 @@ packets addressed to us, presence, and unknown types.
   its gift-wrap layer wants one candidate and its seal layer the other. A
   single-candidate reader opens the wrap and then fails on the seal, which is
   exactly the bug this repo shipped for an afternoon.
+- **The rumor's JSON shape is not guessable.** `id` is present and *empty*
+  rather than omitted, and `sig` is absent entirely rather than null. Read off
+  a real envelope, not from a struct definition. A reader that requires a
+  signature there rejects every genuine message.
+- **Outer timestamps are jittered by up to ±900s** (`published_timestamp`).
+  The true send time rides inside the encrypted rumor. Without this, two relays
+  comparing arrival times correlate a conversation they cannot decrypt.
 - **`tests/fixtures/legacy_private_envelope.json`** is a genuine envelope from
   upstream's own suite, produced by BitChat release 733098bb. Opening it is the
   only evidence that separates a correct implementation from two wrong ones

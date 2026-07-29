@@ -57,6 +57,8 @@ pub enum EnvelopeError {
     BadFraming,
     TooLarge,
     Undecryptable,
+    /// Structurally an envelope, but nothing proves who sent it.
+    Unauthenticated,
 }
 
 impl std::fmt::Display for EnvelopeError {
@@ -66,6 +68,7 @@ impl std::fmt::Display for EnvelopeError {
             Self::BadFraming => "not a v2 envelope",
             Self::TooLarge => "envelope larger than we will decode",
             Self::Undecryptable => "could not decrypt",
+            Self::Unauthenticated => "envelope is not authenticated",
         })
     }
 }
@@ -461,5 +464,474 @@ pub mod tests_support {
             &xonly_of(seal["pubkey"].as_str().unwrap()),
         )
         .unwrap()
+    }
+}
+
+// MARK: - Layers
+
+use crate::nostr::event::Event;
+use serde::{Deserialize, Serialize};
+
+pub const KIND_RUMOR: u32 = 14;
+pub const KIND_SEAL: u32 = 13;
+pub const KIND_GIFT_WRAP: u32 = 1059;
+
+/// How far a published timestamp is moved from the truth.
+///
+/// The outer layers are visible to relays, so their timestamps are jittered by
+/// up to a quarter hour either way; the real send time rides inside the
+/// encrypted rumor, where only the recipient can read it. Without this, two
+/// relays comparing arrival times can correlate a conversation they cannot
+/// decrypt.
+pub const TIMESTAMP_JITTER_SECS: i64 = 900;
+
+/// A timestamp fit to publish: the real one, displaced by up to a quarter hour.
+///
+/// Takes the displacement rather than drawing it, so the jitter is testable and
+/// the caller owns the randomness. Any input maps into the window, because a
+/// caller passing an unbounded random number should get a valid timestamp
+/// rather than one a relay will reject as far-future.
+pub fn published_timestamp(now: i64, jitter: i64) -> i64 {
+    let span = 2 * TIMESTAMP_JITTER_SECS + 1;
+    now + jitter.rem_euclid(span) - TIMESTAMP_JITTER_SECS
+}
+
+/// The innermost layer: the message, unsigned.
+///
+/// The shape is taken from a real envelope rather than from the struct that
+/// produces it, because two fields are surprising. `id` is present and *empty*
+/// rather than omitted, and `sig` is absent entirely rather than null — a
+/// reader that insists on a signature here rejects every genuine message, and
+/// one that emits `"sig": null` is sending a document upstream did not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rumor {
+    pub kind: u32,
+    pub created_at: i64,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+    pub pubkey: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+}
+
+/// A private message, opened and authenticated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opened {
+    pub content: String,
+    /// The key that signed the seal — not the one the rumor claims. They are
+    /// checked to match, and this is the one that was actually proved.
+    pub sender: String,
+    /// Send time from inside the envelope, not the jittered outer one.
+    pub created_at: i64,
+}
+
+/// Builds the gift wrap that carries `content` to `recipient`.
+///
+/// `ephemeral` is passed in rather than generated here so a caller can be
+/// deterministic; in use it must be a fresh key per message, since reusing one
+/// links every message sealed under it.
+pub fn seal_message(
+    content: &str,
+    recipient: &XOnlyPublicKey,
+    sender: &secp256k1::Keypair,
+    ephemeral: &secp256k1::Keypair,
+    sent_at: i64,
+    published_at: i64,
+    nonces: [[u8; NONCE_BYTES]; 2],
+) -> Result<Event, EnvelopeError> {
+    let sender_pubkey = hex::encode(sender.x_only_public_key().0.serialize());
+
+    let rumor = Rumor {
+        kind: KIND_RUMOR,
+        created_at: sent_at,
+        tags: Vec::new(),
+        content: content.to_string(),
+        pubkey: sender_pubkey,
+        id: String::new(),
+        sig: None,
+    };
+    let rumor_json = serde_json::to_string(&rumor).map_err(|_| EnvelopeError::BadFraming)?;
+
+    // The seal is signed with the sender's real key: that signature is the only
+    // thing that makes the sender name mean anything, since the wrap outside it
+    // is signed by a throwaway.
+    let seal = Event::signed(
+        sender,
+        published_at,
+        KIND_SEAL,
+        Vec::new(),
+        encrypt(&rumor_json, recipient, &sender.secret_key(), nonces[0])?,
+    );
+    let seal_json = serde_json::to_string(&seal).map_err(|_| EnvelopeError::BadFraming)?;
+
+    Ok(Event::signed(
+        ephemeral,
+        published_at,
+        KIND_GIFT_WRAP,
+        vec![vec!["p".to_string(), hex::encode(recipient.serialize())]],
+        encrypt(&seal_json, recipient, &ephemeral.secret_key(), nonces[1])?,
+    ))
+}
+
+/// Opens a gift wrap addressed to us, or explains why it is not one.
+///
+/// Every check here is load-bearing. Without the seal's signature a private
+/// message is forgeable by anyone who knows the recipient's public key, and
+/// without binding the rumor's claimed author to the seal's signer the sender
+/// name is decoration.
+pub fn open_message(
+    wrap: &Event,
+    our_secret: &SecretKey,
+    our_pubkey: &XOnlyPublicKey,
+) -> Result<Opened, EnvelopeError> {
+    let ours = hex::encode(our_pubkey.serialize());
+    if wrap.kind != KIND_GIFT_WRAP
+        || wrap.tags != vec![vec!["p".to_string(), ours.clone()]]
+        || !wrap.verify()
+    {
+        return Err(EnvelopeError::BadFraming);
+    }
+
+    let seal: Event = serde_json::from_str(&decrypt(
+        &wrap.content,
+        our_secret,
+        &parse_xonly(&wrap.pubkey)?,
+    )?)
+    .map_err(|_| EnvelopeError::BadFraming)?;
+
+    // A BitChat seal is tagless. Binding to that exact shape leaves nothing for
+    // a forger to smuggle in beside the signature.
+    if seal.kind != KIND_SEAL || !seal.tags.is_empty() || !seal.verify() {
+        return Err(EnvelopeError::Unauthenticated);
+    }
+
+    let rumor: Rumor = serde_json::from_str(&decrypt(
+        &seal.content,
+        our_secret,
+        &parse_xonly(&seal.pubkey)?,
+    )?)
+    .map_err(|_| EnvelopeError::BadFraming)?;
+
+    if rumor.kind != KIND_RUMOR || rumor.sig.is_some() || rumor.pubkey != seal.pubkey {
+        return Err(EnvelopeError::Unauthenticated);
+    }
+    // Released iOS envelopes carry no inner tags; current Android ones carry
+    // exactly the recipient's own `p` tag. Anything else — another recipient,
+    // duplicates, extras — is not a shape any client emits.
+    let inner_tags_ok =
+        rumor.tags.is_empty() || rumor.tags == vec![vec!["p".to_string(), ours]];
+    if !inner_tags_ok {
+        return Err(EnvelopeError::Unauthenticated);
+    }
+
+    Ok(Opened {
+        content: rumor.content,
+        sender: seal.pubkey,
+        created_at: rumor.created_at,
+    })
+}
+
+fn parse_xonly(hex_str: &str) -> Result<XOnlyPublicKey, EnvelopeError> {
+    let bytes = hex::decode(hex_str).map_err(|_| EnvelopeError::BadKey)?;
+    let array = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| EnvelopeError::BadKey)?;
+    XOnlyPublicKey::from_byte_array(array).map_err(|_| EnvelopeError::BadKey)
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::tests_support::*;
+    use super::*;
+    use secp256k1::{Keypair, SECP256K1};
+
+    fn key(seed: u8) -> Keypair {
+        let mut bytes = [seed.max(1); 32];
+        bytes[31] = seed.max(1);
+        Keypair::from_secret_key(SECP256K1, &SecretKey::from_byte_array(bytes).unwrap())
+    }
+
+    fn sealed_to(recipient: &Keypair, sender: &Keypair, content: &str) -> Event {
+        seal_message(
+            content,
+            &recipient.x_only_public_key().0,
+            sender,
+            &key(99),
+            1_700_000_000,
+            1_700_000_500,
+            [[5u8; NONCE_BYTES], [6u8; NONCE_BYTES]],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_real_envelope_opens_through_the_full_stack() {
+        // The whole point: this was produced by another implementation, so
+        // every layer, check and key decision has to match theirs.
+        let wrap: Event = serde_json::from_str(FIXTURE).unwrap();
+        let opened = open_message(
+            &wrap,
+            &recipient(),
+            &recipient().x_only_public_key(SECP256K1).0,
+        )
+        .expect("a genuine envelope must open");
+
+        assert_eq!(opened.content, "legacy fixture from 733098bb");
+        assert_eq!(
+            opened.sender,
+            "2e3d79df7047204f02b726c574e256f8de1dd80510f7dcb8b0d12df13acb87e6"
+        );
+    }
+
+    #[test]
+    fn what_we_seal_another_reader_opens() {
+        let sender = key(21);
+        let recipient = key(22);
+        let wrap = sealed_to(&recipient, &sender, "meet at the docks");
+
+        assert_eq!(wrap.kind, KIND_GIFT_WRAP);
+        assert!(wrap.verify(), "the wrap must be signed by its throwaway key");
+        assert_eq!(
+            wrap.tags,
+            vec![vec![
+                "p".to_string(),
+                hex::encode(recipient.x_only_public_key().0.serialize())
+            ]]
+        );
+
+        let opened = open_message(
+            &wrap,
+            &recipient.secret_key(),
+            &recipient.x_only_public_key().0,
+        )
+        .unwrap();
+        assert_eq!(opened.content, "meet at the docks");
+        assert_eq!(
+            opened.sender,
+            hex::encode(sender.x_only_public_key().0.serialize())
+        );
+        assert_eq!(opened.created_at, 1_700_000_000, "the true send time");
+    }
+
+    #[test]
+    fn the_outer_layers_never_carry_the_sender_or_the_real_time() {
+        // What a relay can see must not identify the conversation.
+        let sender = key(23);
+        let recipient = key(24);
+        let wrap = sealed_to(&recipient, &sender, "private");
+
+        let sender_hex = hex::encode(sender.x_only_public_key().0.serialize());
+        assert_ne!(wrap.pubkey, sender_hex, "the wrap is signed by a throwaway");
+        assert!(
+            !serde_json::to_string(&wrap).unwrap().contains(&sender_hex),
+            "the sender must not appear anywhere a relay can read"
+        );
+        assert_ne!(
+            wrap.created_at, 1_700_000_000,
+            "the published time is jittered, not the send time"
+        );
+    }
+
+    #[test]
+    fn an_envelope_addressed_to_someone_else_is_refused() {
+        let wrap = sealed_to(&key(26), &key(25), "not for you");
+        let bystander = key(27);
+        assert_eq!(
+            open_message(
+                &wrap,
+                &bystander.secret_key(),
+                &bystander.x_only_public_key().0
+            ),
+            Err(EnvelopeError::BadFraming)
+        );
+    }
+
+    #[test]
+    fn a_seal_signed_by_the_wrong_key_is_rejected() {
+        // The forgery this check exists for: anyone knowing the recipient's
+        // public key can build a well-formed wrap. Only the seal's signature
+        // says who wrote what is inside.
+        let recipient = key(31);
+        let impostor = key(32);
+        let claimed = key(33);
+
+        // A seal that claims `claimed` but is signed by `impostor`.
+        let rumor = Rumor {
+            kind: KIND_RUMOR,
+            created_at: 1_700_000_000,
+            tags: Vec::new(),
+            content: "transfer the funds".to_string(),
+            pubkey: hex::encode(claimed.x_only_public_key().0.serialize()),
+            id: String::new(),
+            sig: None,
+        };
+        let sealed = Event::signed(
+            &impostor,
+            1_700_000_500,
+            KIND_SEAL,
+            Vec::new(),
+            encrypt(
+                &serde_json::to_string(&rumor).unwrap(),
+                &recipient.x_only_public_key().0,
+                &impostor.secret_key(),
+                [1u8; NONCE_BYTES],
+            )
+            .unwrap(),
+        );
+        let ephemeral = key(34);
+        let wrap = Event::signed(
+            &ephemeral,
+            1_700_000_500,
+            KIND_GIFT_WRAP,
+            vec![vec![
+                "p".to_string(),
+                hex::encode(recipient.x_only_public_key().0.serialize()),
+            ]],
+            encrypt(
+                &serde_json::to_string(&sealed).unwrap(),
+                &recipient.x_only_public_key().0,
+                &ephemeral.secret_key(),
+                [2u8; NONCE_BYTES],
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            open_message(
+                &wrap,
+                &recipient.secret_key(),
+                &recipient.x_only_public_key().0
+            ),
+            Err(EnvelopeError::Unauthenticated),
+            "a rumor claiming an author the seal's signer is not must be refused"
+        );
+    }
+
+    #[test]
+    fn a_signed_rumor_is_refused() {
+        // The rumor is unsigned by design; a signature there would be an
+        // unchecked second opinion about authorship.
+        let recipient = key(41);
+        let sender = key(42);
+        let mut rumor = Rumor {
+            kind: KIND_RUMOR,
+            created_at: 1_700_000_000,
+            tags: Vec::new(),
+            content: "hello".to_string(),
+            pubkey: hex::encode(sender.x_only_public_key().0.serialize()),
+            id: String::new(),
+            sig: None,
+        };
+        rumor.sig = Some("00".repeat(64));
+
+        let sealed = Event::signed(
+            &sender,
+            1_700_000_500,
+            KIND_SEAL,
+            Vec::new(),
+            encrypt(
+                &serde_json::to_string(&rumor).unwrap(),
+                &recipient.x_only_public_key().0,
+                &sender.secret_key(),
+                [3u8; NONCE_BYTES],
+            )
+            .unwrap(),
+        );
+        let ephemeral = key(43);
+        let wrap = Event::signed(
+            &ephemeral,
+            1_700_000_500,
+            KIND_GIFT_WRAP,
+            vec![vec![
+                "p".to_string(),
+                hex::encode(recipient.x_only_public_key().0.serialize()),
+            ]],
+            encrypt(
+                &serde_json::to_string(&sealed).unwrap(),
+                &recipient.x_only_public_key().0,
+                &ephemeral.secret_key(),
+                [4u8; NONCE_BYTES],
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            open_message(
+                &wrap,
+                &recipient.secret_key(),
+                &recipient.x_only_public_key().0
+            ),
+            Err(EnvelopeError::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn a_rumor_serialises_to_the_shape_a_real_one_has() {
+        // Verified against the fixture: `id` is empty rather than absent, and
+        // `sig` is absent rather than null.
+        let json = serde_json::to_string(&Rumor {
+            kind: KIND_RUMOR,
+            created_at: 1,
+            tags: Vec::new(),
+            content: "x".to_string(),
+            pubkey: "ab".to_string(),
+            id: String::new(),
+            sig: None,
+        })
+        .unwrap();
+        assert!(json.contains(r#""id":"""#), "id must be present and empty: {json}");
+        assert!(!json.contains("sig"), "sig must be absent entirely: {json}");
+    }
+
+    #[test]
+    fn the_wrong_kind_at_any_layer_is_refused() {
+        let recipient = key(51);
+        let ephemeral = key(52);
+        let wrap = Event::signed(
+            &ephemeral,
+            1_700_000_500,
+            KIND_RUMOR, // not a gift wrap
+            vec![vec![
+                "p".to_string(),
+                hex::encode(recipient.x_only_public_key().0.serialize()),
+            ]],
+            "v2:AAAA".to_string(),
+        );
+        assert_eq!(
+            open_message(
+                &wrap,
+                &recipient.secret_key(),
+                &recipient.x_only_public_key().0
+            ),
+            Err(EnvelopeError::BadFraming)
+        );
+    }
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::*;
+
+    #[test]
+    fn any_displacement_lands_inside_the_window() {
+        // A caller handing over a raw random number must still get a timestamp
+        // a relay will accept, not one years in the future.
+        for jitter in [0, 1, -1, 900, -900, 901, -901, i64::MAX, i64::MIN + 1] {
+            let published = published_timestamp(1_700_000_000, jitter);
+            let drift = published - 1_700_000_000;
+            assert!(
+                (-TIMESTAMP_JITTER_SECS..=TIMESTAMP_JITTER_SECS).contains(&drift),
+                "jitter {jitter} drifted {drift}s"
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_reaches_both_ways() {
+        // A one-sided jitter would still let a relay bound the true send time.
+        let published: Vec<i64> = (0..2000)
+            .map(|j| published_timestamp(1_700_000_000, j) - 1_700_000_000)
+            .collect();
+        assert!(published.iter().any(|drift| *drift < 0), "must reach earlier");
+        assert!(published.iter().any(|drift| *drift > 0), "must reach later");
     }
 }
