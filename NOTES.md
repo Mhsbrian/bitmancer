@@ -336,13 +336,31 @@ packets addressed to us, presence, and unknown types.
 
 - **Multi-link.** The transport connects to one peripheral, which is why relaying
   never fires. Upstream holds up to six central links.
+- **A favourite is an address exchange, not a bookmark** (`favorites.rs`).
+  Upstream sends it as the *content of an ordinary private message* —
+  `"[FAVORITED]:" + npub` — and intercepts it on arrival, so it needs no packet
+  type of its own and must be caught before it reaches the chat log. The two
+  halves are independent: favouriting someone does not make them reachable,
+  only their address does. An unfavourite does not retract an address already
+  held, since that would strand queued mail. Verified against
+  `BLEService.sendFavoriteNotification` and
+  `ChatPrivateConversationCoordinator.handleFavoriteNotification`.
+- **The main Nostr identity is not a channel identity.** Location-channel keys
+  exist to be unlinkable from one another; the main one exists to be findable,
+  and is what a favourite hands out. Its derivation label is ours and need not
+  match another client's — a peer never re-derives it, it is exchanged.
 - **Nostr as a DM transport.** Geohash channels already run over Nostr, so the
   client is no longer mesh-only — but private messages are. Upstream selects a
   transport per DM (Bluetooth preferred, Nostr fallback) and queues when neither
   is up, so a peer out of BLE range is still reachable. Ours are not. The
-  unhandled `nostrCarrier 0x28`, the dead fingerprint-keyed `favorites` field in
-  `state.json`, and the never-populated `TLV_BRIDGE_GEOHASH 0x06` all belong to
-  this gap.
+  unhandled `nostrCarrier 0x28` and the never-populated `TLV_BRIDGE_GEOHASH
+  0x06` still belong to this gap. The address exchange it depends on is done
+  (see favourites above); what remains is NIP-17 sealing, transport selection,
+  and an outbox that retries until an ack clears it.
+- **`courierEnvelope 0x04` is store-and-forward.** Upstream hands a sealed copy
+  of an undeliverable message to nearby peers who may physically encounter the
+  recipient, addressed by a 16-byte rotating tag — an HMAC of the recipient's
+  static key and the UTC day. Not implemented here.
 - **Fragment size is a local choice, not a protocol constant.** `SLICE_BYTES`
   is 213 so a finished fragment frame lands in the 256-byte padding bucket —
   the only bucket we have live evidence a phone accepts, since announces use

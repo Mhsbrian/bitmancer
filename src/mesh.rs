@@ -12,6 +12,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::announce::{self, Announcement};
 use crate::compression;
+use crate::favorites::{FavoriteNotice, Favorites};
 use crate::file_packet::FilePacket;
 use crate::fragment::{self, Append, Assembler};
 use crate::noise_payload::{NoisePayload, NoisePayloadType, PrivateMessagePacket, MAX_TLV_VALUE};
@@ -44,6 +45,15 @@ pub enum MeshEvent {
     /// main loop to put on the air. A handshake is a conversation, so a reply
     /// has to be able to originate down here rather than from a user action.
     Send(Vec<u8>),
+    /// A peer favourited or unfavourited us, handing over their Nostr address.
+    /// Never rendered as chat: upstream sends this as private-message content
+    /// and intercepts it on arrival, so showing it would print plumbing.
+    FavoriteUpdate {
+        peer_id: String,
+        nickname: String,
+        fingerprint: String,
+        notice: FavoriteNotice,
+    },
     /// A message we sent has been acknowledged.
     DeliveryUpdate {
         message_id: String,
@@ -136,6 +146,8 @@ pub struct MeshService {
     /// and needs something to match a later receipt against. The manager's own
     /// queue also discards silently when no session object exists yet.
     pending_dms: HashMap<String, Vec<PrivateMessagePacket>>,
+    /// Who has handed us a Nostr address, and who we have handed ours to.
+    pub favorites: Favorites,
     /// Full SHA-256 fingerprints we refuse traffic from. Fingerprints rather
     /// than peer IDs or nicknames: a nickname is claimed rather than owned, and
     /// a peer ID follows the key, so blocking either would be blocking a label.
@@ -165,6 +177,7 @@ impl MeshService {
             noise_public_key,
             sessions: NoiseSessionManager::new(noise_static_key),
             pending_dms: HashMap::new(),
+            favorites: Favorites::new(),
             blocked: HashSet::new(),
             signing_key,
             seen_message_ids: HashSet::new(),
@@ -320,6 +333,10 @@ impl MeshService {
         }
         self.peers.clear();
         self.blocked.clear();
+        // Favourites hold peers' Nostr addresses and who was willing to be
+        // reached by us. A wipe that left them would leave a contact list.
+        self.favorites.clear();
+        self.pending_dms.clear();
         self.seen_message_ids.clear();
         self.seen_order.clear();
     }
@@ -487,6 +504,41 @@ impl MeshService {
             .collect())
     }
 
+    /// Frames telling a peer we favourited them, carrying our Nostr address.
+    ///
+    /// Sent as an ordinary private message because that is what upstream reads:
+    /// there is no separate packet type for this, and inventing one would talk
+    /// to nobody.
+    pub fn favorite_frames(
+        &mut self,
+        peer_id: &str,
+        is_favorite: bool,
+        our_nostr_key: &str,
+    ) -> Result<SentDirectMessages, String> {
+        let fingerprint = self
+            .peers
+            .get(peer_id)
+            .map(|peer| peer.fingerprint.clone())
+            .ok_or_else(|| {
+                format!(
+                    "{} has not announced itself yet, so its key is unknown",
+                    short_display(peer_id)
+                )
+            })?;
+        let nickname = self
+            .peers
+            .get(peer_id)
+            .map(|peer| peer.nickname.clone())
+            .unwrap_or_default();
+
+        let text = Favorites::notice_text(is_favorite, our_nostr_key);
+        let sent = self.dm_frames(peer_id, &text)?;
+        // Record our own half only once the frames exist: a failure above
+        // means nothing was said, and the list should not claim otherwise.
+        self.favorites.set_ours(&fingerprint, &nickname, is_favorite);
+        Ok(sent)
+    }
+
     /// A sealed receipt naming one message.
     ///
     /// Returns `None` rather than an error when there is no session: a receipt
@@ -615,6 +667,46 @@ impl MeshService {
                     ))];
                 };
                 let content = record.content;
+                // A favourite notification travels as private-message content
+                // rather than as its own type, so it has to be caught here or
+                // the user reads "[FAVORITED]:npub1..." as a line of chat.
+                if let Some(notice) = Favorites::parse_notice(&content) {
+                    let nickname = self
+                        .peers
+                        .get(&sender)
+                        .map(|peer| peer.nickname.clone())
+                        .unwrap_or_else(|| short_display(&sender));
+                    let fingerprint = self
+                        .peers
+                        .get(&sender)
+                        .map(|peer| peer.fingerprint.clone())
+                        .unwrap_or_default();
+                    if fingerprint.is_empty() {
+                        // Without their announced key there is nothing stable
+                        // to file the address under.
+                        return vec![MeshEvent::Trace(format!(
+                            "favourite notice from unannounced {}",
+                            short_display(&sender)
+                        ))];
+                    }
+                    self.favorites.apply_notice(&fingerprint, &nickname, &notice);
+                    let mut events = vec![MeshEvent::FavoriteUpdate {
+                        peer_id: sender.clone(),
+                        nickname,
+                        fingerprint,
+                        notice,
+                    }];
+                    // Still acknowledge it: the sender is waiting on the same
+                    // ack any private message gets.
+                    if let Some(frame) = self.receipt_frame(
+                        &sender,
+                        NoisePayloadType::Delivered,
+                        &record.message_id,
+                    ) {
+                        events.push(MeshEvent::Send(frame));
+                    }
+                    return events;
+                }
                 let nickname = self
                     .peers
                     .get(&sender)
@@ -1397,7 +1489,7 @@ mod tests {
     fn an_image_sent_over_the_radio_arrives_whole() {
         // The full path a phone-sent picture takes: a file packet, split into
         // fragments because a BLE write is small, reassembled here.
-        use crate::file_packet::FilePacket;
+use crate::file_packet::FilePacket;
 
         let mut alice = service(1);
         let mut bob = service(20);
@@ -1469,7 +1561,7 @@ mod tests {
 
     #[test]
     fn a_non_image_file_is_reported_but_not_decoded() {
-        use crate::file_packet::FilePacket;
+use crate::file_packet::FilePacket;
         let mut alice = service(1);
         let file = FilePacket {
             file_name: Some("note.m4a".into()),
@@ -2130,5 +2222,177 @@ mod receipt_tests {
         assert_eq!(sent.ids.len(), sent.frames.len());
         let unique: std::collections::HashSet<&String> = sent.ids.iter().collect();
         assert_eq!(unique.len(), sent.ids.len(), "ids must not repeat");
+    }
+}
+
+#[cfg(test)]
+mod favorite_tests {
+    use super::*;
+
+    /// Two clients with an encrypted channel already up.
+    fn linked() -> (MeshService, MeshService, String, String) {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        // Each learns the other's key, which is what a fingerprint needs.
+        let announce = bob.announce_frame().unwrap();
+        alice.handle_frame(&announce);
+        let announce = alice.announce_frame().unwrap();
+        bob.handle_frame(&announce);
+
+        let (alice_id, bob_id) = (alice.my_peer_id.clone(), bob.my_peer_id.clone());
+        let mut to_bob = alice.dm_frames(&bob_id, "hello").unwrap().frames;
+        let mut to_alice: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..8 {
+            let (mut next_a, mut next_b) = (Vec::new(), Vec::new());
+            for frame in to_bob.drain(..) {
+                for event in bob.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_a.push(reply);
+                    }
+                }
+            }
+            for frame in to_alice.drain(..) {
+                for event in alice.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_b.push(reply);
+                    }
+                }
+            }
+            if next_a.is_empty() && next_b.is_empty() {
+                break;
+            }
+            to_alice = next_a;
+            to_bob = next_b;
+        }
+        (alice, bob, alice_id, bob_id)
+    }
+
+    #[test]
+    fn favouriting_hands_over_an_address_without_printing_plumbing() {
+        let (mut alice, mut bob, _, bob_id) = linked();
+        let sent = alice
+            .favorite_frames(&bob_id, true, "npub1alice")
+            .unwrap();
+
+        let mut update = None;
+        for frame in sent.frames {
+            for event in bob.handle_frame(&frame) {
+                match event {
+                    MeshEvent::FavoriteUpdate { notice, .. } => update = Some(notice),
+                    // The marker must never reach the chat log.
+                    MeshEvent::PrivateMessage { content, .. } => {
+                        panic!("favourite marker leaked into chat: {content}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let notice = update.expect("bob must see the favourite");
+        assert!(notice.is_favorite);
+        assert_eq!(notice.their_nostr_key.as_deref(), Some("npub1alice"));
+
+        // And Bob can now find Alice by that address.
+        let fingerprint = fingerprint(&alice.noise_public_key);
+        assert_eq!(
+            bob.favorites.nostr_key_for(&fingerprint),
+            Some("npub1alice")
+        );
+        assert_eq!(
+            bob.favorites.fingerprint_for_nostr_key("npub1alice"),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn ordinary_chat_still_reaches_the_log() {
+        // The interception must not swallow anything else.
+        let (mut alice, mut bob, _, bob_id) = linked();
+        let sent = alice.dm_frames(&bob_id, "I favourited your post").unwrap();
+        let mut delivered = false;
+        for frame in sent.frames {
+            for event in bob.handle_frame(&frame) {
+                if let MeshEvent::PrivateMessage { content, .. } = event {
+                    assert_eq!(content, "I favourited your post");
+                    delivered = true;
+                }
+            }
+        }
+        assert!(delivered, "normal chat must not be intercepted");
+    }
+
+    #[test]
+    fn our_own_half_is_recorded_when_we_favourite() {
+        let (mut alice, _bob, _, bob_id) = linked();
+        alice.favorite_frames(&bob_id, true, "npub1alice").unwrap();
+        let bob_fingerprint = fingerprint(&_bob.noise_public_key);
+        let entry = alice.favorites.get(&bob_fingerprint).unwrap();
+        assert!(entry.we_favorited);
+        // Not mutual until Bob answers, and not reachable until he sends his.
+        assert!(!entry.mutual());
+        assert!(!entry.reachable_over_nostr());
+    }
+
+    #[test]
+    fn favouriting_an_unannounced_peer_is_refused() {
+        // No announce means no key, so nothing stable to file an address under.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(mesh
+            .favorite_frames("00000000000000ff", true, "npub1me")
+            .is_err());
+    }
+
+    #[test]
+    fn a_mutual_favourite_is_reachable_from_both_ends() {
+        let (mut alice, mut bob, alice_id, bob_id) = linked();
+
+        let deliver = |from: &mut MeshService, to: &mut MeshService, frames: Vec<Vec<u8>>| {
+            for frame in frames {
+                for event in to.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        from.handle_frame(&reply);
+                    }
+                }
+            }
+        };
+
+        let sent = alice.favorite_frames(&bob_id, true, "npub1alice").unwrap();
+        deliver(&mut alice, &mut bob, sent.frames);
+        let sent = bob.favorite_frames(&alice_id, true, "npub1bob").unwrap();
+        deliver(&mut bob, &mut alice, sent.frames);
+
+        let bob_fp = fingerprint(&bob.noise_public_key);
+        let alice_fp = fingerprint(&alice.noise_public_key);
+        assert!(alice.favorites.get(&bob_fp).unwrap().mutual());
+        assert!(bob.favorites.get(&alice_fp).unwrap().mutual());
+        assert_eq!(
+            alice.favorites.nostr_key_for(&bob_fp),
+            Some("npub1bob")
+        );
+    }
+}
+
+#[cfg(test)]
+mod wipe_favorites_tests {
+    use super::*;
+
+    #[test]
+    fn a_wipe_destroys_the_contact_list_too() {
+        // Favourites are addresses and relationships; leaving them behind
+        // would leave exactly the record a wipe exists to remove.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        mesh.favorites.apply_notice(
+            "aa11",
+            "bob",
+            &FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1bob".into()),
+            },
+        );
+        assert!(mesh.favorites.get("aa11").is_some());
+
+        mesh.wipe();
+        assert!(mesh.favorites.get("aa11").is_none());
+        assert!(mesh.favorites.ours().is_empty());
     }
 }

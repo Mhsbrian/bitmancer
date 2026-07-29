@@ -70,6 +70,14 @@ impl GeoService {
         }
     }
 
+    /// Our long-lived Nostr address, the one a favourite hands out.
+    ///
+    /// Distinct from the per-geohash identities this service otherwise deals
+    /// in: those exist to be unlinkable, this one exists to be findable.
+    pub fn main_nostr_pubkey(&mut self) -> String {
+        self.identities.main_pubkey_hex()
+    }
+
     pub fn set_nickname(&mut self, nickname: &str) {
         self.nickname = nickname.to_string();
     }

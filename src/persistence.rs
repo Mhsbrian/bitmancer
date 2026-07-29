@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,17 @@ pub struct AppState {
     /// kept: upstream gates Nostr key exchange on this, so it is what a DM to a
     /// peer out of Bluetooth range will need.
     pub favorites: HashSet<String>,                           // bitchat.favorites
+    /// Nostr address each peer handed us, by fingerprint. Without this a
+    /// favourite survives a restart as a name with no way to reach it.
+    #[serde(default)]
+    pub favorite_nostr_keys: HashMap<String, String>,
+    /// Nicknames last seen for favourites, so the list stays readable after the
+    /// peer has gone out of range.
+    #[serde(default)]
+    pub favorite_nicknames: HashMap<String, String>,
+    /// Peers who favourited us, by fingerprint.
+    #[serde(default)]
+    pub favorited_us: HashSet<String>,
     pub identity_key: Option<Vec<u8>>,                        // bitchat.identityKey (Ed25519 private key)
     pub noise_static_key: Option<Vec<u8>>,                   // bitchat.noiseStaticKey (X25519 private key)
     /// Seed that per-geohash Nostr identities are derived from. Kept separate
@@ -32,6 +43,9 @@ impl AppState {
             blocked_peers: HashSet::new(),
             joined_channels: Vec::new(),
             favorites: HashSet::new(),
+            favorite_nostr_keys: HashMap::new(),
+            favorite_nicknames: HashMap::new(),
+            favorited_us: HashSet::new(),
             identity_key: None,
             noise_static_key: None,
             nostr_device_seed: None,

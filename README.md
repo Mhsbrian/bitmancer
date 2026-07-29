@@ -115,6 +115,7 @@ and flags the ones running BitChat:
 | `/map` | world map |
 | `/img [n]` | view the newest image link, or the nth one back |
 | `/dm <nick> <message>` | private message, encrypted end to end |
+| `/fav <nick>`, `/unfav <nick>` | exchange Nostr addresses; `/fav` alone lists |
 | `/send <path>` | put a file on the mesh, fragmented |
 | `/block <nick>`, `/unblock <nick>` | refuse a peer's traffic; `/block` alone lists |
 | `/wipe confirm` | destroy the stored identity and quit |

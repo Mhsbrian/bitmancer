@@ -25,6 +25,8 @@ pub enum CommandOutcome {
     JoinGeohash(String),
     /// Leave a geohash channel, or the active one when None.
     LeaveGeohash(Option<String>),
+    /// Hand a peer our Nostr address so they can reach us off-mesh.
+    SetFavorite { target: String, favorite: bool },
     /// Put a local file on the mesh.
     SendFile(String),
     /// Destroy the stored identity and quit. Irreversible.
@@ -140,6 +142,42 @@ pub fn handle(
                 Err(reason) => CommandOutcome::Reply(vec![reason]),
             }
         }
+        "/fav" | "/favorite" | "/unfav" | "/unfavorite" if rest.is_empty() => {
+            let listed = mesh.favorites.ours();
+            if listed.is_empty() {
+                CommandOutcome::Reply(vec![
+                    "No favourites yet.".to_string(),
+                    "/fav <nickname> hands them your Nostr address, so they can".to_string(),
+                    "reach you when Bluetooth cannot.".to_string(),
+                ])
+            } else {
+                let mut lines = vec![format!("Favourites ({}):", listed.len())];
+                for (_, entry) in listed {
+                    // Say plainly whether a route actually exists. A favourite
+                    // that has not answered is not a way to reach anyone.
+                    let state = match (entry.mutual(), entry.reachable_over_nostr()) {
+                        (true, true) => "mutual, reachable off-mesh",
+                        (false, true) => "reachable off-mesh",
+                        _ => "no address yet",
+                    };
+                    lines.push(format!("  {:<16} {state}", entry.nickname));
+                }
+                CommandOutcome::Reply(lines)
+            }
+        }
+        "/fav" | "/favorite" | "/unfav" | "/unfavorite" => {
+            let favorite = command == "/fav" || command == "/favorite";
+            let target = if mesh.peers.contains_key(rest) {
+                Ok(rest.to_string())
+            } else {
+                mesh.peer_id_for_nickname(rest)
+            };
+            match target {
+                Ok(target) => CommandOutcome::SetFavorite { target, favorite },
+                Err(reason) => CommandOutcome::Reply(vec![reason]),
+            }
+        }
+
         "/send" | "/sendfile" if rest.is_empty() => CommandOutcome::Reply(vec![
             "Usage: /send <path to a file>".to_string(),
             "The file goes to everyone on the mesh, in fragments.".to_string(),

@@ -9,6 +9,7 @@ mod compression;
 mod data_structures;
 mod discovery;
 mod file_packet;
+mod favorites;
 mod fragment;
 mod geo;
 mod geohash;
@@ -126,6 +127,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore the block list before the radio starts, so a blocked peer cannot
     // slip a frame in during the window between connecting and loading.
     mesh.load_blocked(state.blocked_peers.clone());
+    // Favourites carry the only addresses we have for peers who are not in
+    // radio range, so they are restored before anything can need one.
+    {
+        let mut restored = std::collections::HashMap::new();
+        let fingerprints = state
+            .favorites
+            .iter()
+            .chain(state.favorited_us.iter())
+            .chain(state.favorite_nostr_keys.keys())
+            .cloned()
+            .collect::<std::collections::HashSet<String>>();
+        for fingerprint in fingerprints {
+            restored.insert(
+                fingerprint.clone(),
+                favorites::Relationship {
+                    we_favorited: state.favorites.contains(&fingerprint),
+                    they_favorited: state.favorited_us.contains(&fingerprint),
+                    their_nostr_key: state.favorite_nostr_keys.get(&fingerprint).cloned(),
+                    nickname: state
+                        .favorite_nicknames
+                        .get(&fingerprint)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            );
+        }
+        mesh.favorites.load(restored);
+    }
     let mut geo = GeoService::new(nostr_device_seed, &mesh.nickname);
 
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
@@ -333,6 +362,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandOutcome::Reply(lines) => {
                     for text in lines {
                         app.add_log_message(format!("system: {text}"));
+                    }
+                }
+                CommandOutcome::SetFavorite { target, favorite } => {
+                    let our_key = geo.main_nostr_pubkey();
+                    match mesh.favorite_frames(&target, favorite, &our_key) {
+                        Ok(sent) => {
+                            for frame in sent.frames {
+                                let _ = transport.outbound.send(frame).await;
+                            }
+                            let who = mesh
+                                .peers
+                                .get(&target)
+                                .map(|peer| peer.nickname.clone())
+                                .unwrap_or_else(|| target.clone());
+                            let verb = if favorite { "favourited" } else { "unfavourited" };
+                            app.add_log_message(format!(
+                                "system: {verb} {who}; they now have your Nostr address."
+                            ));
+                            save_favorites(&mut state, &mesh, &mut app);
+                        }
+                        Err(reason) => app.add_log_message(format!("system: {reason}")),
                     }
                 }
                 CommandOutcome::SendFile(path) => {
@@ -677,6 +727,38 @@ fn paint_kitty_image(app: &mut App, shown: Option<String>) -> Option<String> {
 /// The type is guessed from the extension rather than sniffed: the receiver
 /// only uses it to decide whether to try rendering the bytes as an image, and
 /// a wrong guess there costs a failed decode, not a corrupted file.
+/// Mirrors the favourite table into the persisted state and saves it.
+///
+/// A favourite that does not survive a restart is a name with no way to reach
+/// it, so the address matters more than the flag.
+fn save_favorites(state: &mut persistence::AppState, mesh: &MeshService, app: &mut App) {
+    state.favorites.clear();
+    state.favorited_us.clear();
+    state.favorite_nostr_keys.clear();
+    state.favorite_nicknames.clear();
+    for (fingerprint, entry) in mesh.favorites.all() {
+        if entry.we_favorited {
+            state.favorites.insert(fingerprint.clone());
+        }
+        if entry.they_favorited {
+            state.favorited_us.insert(fingerprint.clone());
+        }
+        if let Some(key) = &entry.their_nostr_key {
+            state
+                .favorite_nostr_keys
+                .insert(fingerprint.clone(), key.clone());
+        }
+        if !entry.nickname.is_empty() {
+            state
+                .favorite_nicknames
+                .insert(fingerprint.clone(), entry.nickname.clone());
+        }
+    }
+    if let Err(error) = persistence::save_state(state) {
+        app.add_log_message(format!("system: could not save favourites: {error}"));
+    }
+}
+
 fn load_outgoing_file(path: &str) -> Result<(String, Option<String>, Vec<u8>), String> {
     let path = std::path::Path::new(path.trim());
     let expanded;
@@ -729,6 +811,21 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
     match mesh_event {
         // Handled by the caller, which owns the transport.
         MeshEvent::Send(_) => {}
+        MeshEvent::FavoriteUpdate {
+            nickname, notice, ..
+        } => {
+            let what = if notice.is_favorite {
+                "favourited you"
+            } else {
+                "unfavourited you"
+            };
+            let reach = if notice.their_nostr_key.is_some() {
+                " You can now reach them off-mesh."
+            } else {
+                ""
+            };
+            app.add_log_message(format!("system: {nickname} {what}.{reach}"));
+        }
         MeshEvent::DeliveryUpdate { message_id, status } => {
             app.mark_delivery(&message_id, status);
         }

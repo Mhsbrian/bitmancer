@@ -20,6 +20,11 @@ pub struct IdentityStore {
     cache: HashMap<String, Keypair>,
 }
 
+/// Label the long-lived identity is derived under. Not a geohash, and chosen
+/// so it cannot collide with one: geohashes are base32 and never contain a
+/// hyphen.
+const MAIN_IDENTITY_LABEL: &str = "bitmancer-main-identity";
+
 impl IdentityStore {
     pub fn new(device_seed: [u8; 32]) -> Self {
         Self {
@@ -40,6 +45,28 @@ impl IdentityStore {
         let keypair = Self::derive(&self.device_seed, geohash);
         self.cache.insert(geohash.to_string(), keypair);
         keypair
+    }
+
+    /// The one long-lived Nostr identity, distinct from the per-geohash ones.
+    ///
+    /// Location-channel identities are deliberately unlinkable from each other.
+    /// This one is the opposite: it is the address a favourite hands out so we
+    /// can be reached when Bluetooth cannot carry the message, so it has to be
+    /// stable across sessions and the same in every channel.
+    ///
+    /// The derivation label is ours and need not match another client's. A peer
+    /// never re-derives this key — it is exchanged explicitly in a favourite
+    /// notification — so the only requirement is that it stays the same for the
+    /// same device seed.
+    /// Only the public half is needed to hand out an address; the secret half
+    /// is what will sign internet-carried DMs.
+    #[allow(dead_code)]
+    pub fn main_keypair(&mut self) -> Keypair {
+        self.keypair_for(MAIN_IDENTITY_LABEL)
+    }
+
+    pub fn main_pubkey_hex(&mut self) -> String {
+        self.pubkey_hex(MAIN_IDENTITY_LABEL)
     }
 
     fn derive(seed: &[u8; 32], geohash: &str) -> Keypair {
@@ -134,5 +161,38 @@ mod tests {
         assert_eq!(first.secret_bytes(), second.secret_bytes());
         store.clear();
         assert_eq!(store.keypair_for("9q8yy").secret_bytes(), first.secret_bytes());
+    }
+}
+
+#[cfg(test)]
+mod main_identity_tests {
+    use super::*;
+
+    #[test]
+    fn the_main_identity_is_stable_for_a_seed() {
+        // A favourite hands this out as our address; if it moved between
+        // sessions every peer's stored copy would go stale.
+        let mut first = IdentityStore::new([7; 32]);
+        let mut second = IdentityStore::new([7; 32]);
+        assert_eq!(first.main_pubkey_hex(), second.main_pubkey_hex());
+    }
+
+    #[test]
+    fn a_different_seed_is_a_different_identity() {
+        let mut a = IdentityStore::new([7; 32]);
+        let mut b = IdentityStore::new([8; 32]);
+        assert_ne!(a.main_pubkey_hex(), b.main_pubkey_hex());
+    }
+
+    #[test]
+    fn the_main_identity_is_not_any_channel_identity() {
+        // Location-channel identities exist to be unlinkable. If the main one
+        // collided with a cell's, joining that cell would publish the address
+        // our favourites know us by.
+        let mut store = IdentityStore::new([7; 32]);
+        let main = store.main_pubkey_hex();
+        for cell in ["9q", "u4pruy", "gbsuv", "bitmancer", "main"] {
+            assert_ne!(store.pubkey_hex(cell), main, "collided with {cell}");
+        }
     }
 }
