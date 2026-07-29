@@ -276,6 +276,15 @@ fn status_lines(mesh: &MeshService, connected: bool) -> Vec<String> {
         format!("  Nickname:    {}", mesh.nickname),
         format!("  Peer ID:     {}", mesh.my_peer_id),
     ];
+    // Who around us is offering to carry mesh traffic to the internet. Worth
+    // stating separately from the peer list: it is the one capability that
+    // changes what this client can do for someone else.
+    let gateways = mesh.peers.values().filter(|peer| peer.is_gateway()).count();
+    if gateways > 0 {
+        lines.push(format!(
+            "  Gateways:    {gateways} peer(s) offering internet to the mesh"
+        ));
+    }
     if !mesh.peers.is_empty() {
         lines.push("  Known peers:".to_string());
         let mut peers: Vec<_> = mesh.peers.values().collect();
@@ -294,6 +303,13 @@ fn status_lines(mesh: &MeshService, connected: bool) -> Vec<String> {
             if mesh.is_verified(&peer.fingerprint) {
                 notes.push("verified in person");
             }
+            // What they say they can do. Only the bits we can act on are
+            // named — see `Capabilities::labels`.
+            let advertised = peer
+                .capabilities
+                .map(|advertised| advertised.labels())
+                .unwrap_or_default();
+            notes.extend(advertised);
             lines.push(format!(
                 "    {} ({}){}",
                 peer.nickname,

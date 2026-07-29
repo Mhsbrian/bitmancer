@@ -128,7 +128,19 @@ pub struct MeshPeer {
     pub signing_public_key: Vec<u8>,
     pub fingerprint: String,
     pub verified: bool,
+    /// What the peer says it can do, or `None` from a client old enough not to
+    /// say. The two are different answers and are kept apart: "advertises
+    /// nothing" is a current peer with everything off.
+    pub capabilities: Option<announce::Capabilities>,
     pub last_seen: Instant,
+}
+
+impl MeshPeer {
+    /// Whether this peer offers to carry geohash traffic to the internet.
+    pub fn is_gateway(&self) -> bool {
+        self.capabilities
+            .is_some_and(|advertised| advertised.has(announce::Capabilities::GATEWAY))
+    }
 }
 
 pub struct MeshService {
@@ -156,6 +168,13 @@ pub struct MeshService {
     seen_message_ids: HashSet<String>,
     seen_order: VecDeque<String>,
     last_announce: Option<Instant>,
+    /// Whether we are currently offering to carry mesh traffic to the internet.
+    ///
+    /// Set by the client from two things it knows and this layer does not: that
+    /// the user opted in, and that relays are actually answering. Advertising
+    /// `gateway` while either is false is a promise a mesh-only peer will act
+    /// on and we cannot keep.
+    pub gateway_ready: bool,
     /// Buffers fragmented packets until they are whole.
     assembler: Assembler,
     /// When on, every inbound frame is reported to the UI. Interop bugs are
@@ -183,6 +202,7 @@ impl MeshService {
             seen_message_ids: HashSet::new(),
             seen_order: VecDeque::new(),
             last_announce: None,
+            gateway_ready: false,
             assembler: Assembler::new(),
             debug: false,
         }
@@ -205,11 +225,20 @@ impl MeshService {
     /// Signed TLV announce. This is what makes us a peer: without it we are an
     /// anonymous subscribed central that nobody lists or addresses.
     pub fn announce_frame(&mut self) -> Option<Vec<u8>> {
+        // Advertised only while we actually have somewhere to carry traffic to.
+        // A standing claim would be a promise we cannot keep the moment the
+        // relays go away, and a mesh-only peer that trusts it stops trying
+        // anything else.
+        let mut claimed = announce::Capabilities::from_bits(announce::ADVERTISED);
+        if self.gateway_ready {
+            claimed = claimed.with(announce::Capabilities::GATEWAY);
+        }
         let payload = Announcement::new(
             &self.nickname,
             self.noise_public_key.to_vec(),
             self.signing_key.verifying_key().to_bytes().to_vec(),
         )
+        .with_capabilities(claimed)
         .encode()?;
 
         let mut packet = Packet::new(
@@ -1122,6 +1151,7 @@ impl MeshService {
 
         let nickname = announcement.nickname.clone();
         let fingerprint = fingerprint(&announcement.noise_public_key);
+        let capabilities = announcement.advertised();
         let now = Instant::now();
 
         match self.peers.get_mut(&sender) {
@@ -1131,6 +1161,12 @@ impl MeshService {
                 let renamed = existing.nickname != nickname;
                 existing.nickname = nickname.clone();
                 existing.verified = verified;
+                // Refreshed from every announce rather than kept from the
+                // first: a peer that turns gateway mode on says so by
+                // re-announcing, and one that turns it off says so the same
+                // way. Holding the old value would leave us depositing traffic
+                // with someone who has stopped carrying it.
+                existing.capabilities = capabilities;
                 existing.last_seen = now;
                 if renamed {
                     vec![MeshEvent::PeerRenamed {
@@ -1151,6 +1187,7 @@ impl MeshService {
                         signing_public_key: announcement.signing_public_key,
                         fingerprint,
                         verified,
+                        capabilities,
                         last_seen: now,
                     },
                 );
@@ -1968,6 +2005,7 @@ mod noise_dm_tests {
                 signing_public_key: vec![seed; 32],
                 fingerprint: format!("{seed:02x}"),
                 verified: false,
+                capabilities: None,
                 last_seen: Instant::now(),
             };
             alice.peers.insert(peer.peer_id.clone(), peer);
@@ -1988,6 +2026,7 @@ mod noise_dm_tests {
             signing_public_key: vec![9; 32],
             fingerprint: "aa".to_string(),
             verified: false,
+            capabilities: None,
             last_seen: Instant::now(),
         };
         alice.peers.insert(peer.peer_id.clone(), peer);
@@ -2013,6 +2052,7 @@ mod blocking_tests {
             noise_public_key,
             signing_public_key: vec![key; 32],
             verified: false,
+            capabilities: None,
             last_seen: Instant::now(),
         };
         mesh.peers.insert(peer_id.clone(), peer);
@@ -2520,6 +2560,76 @@ mod favorite_tests {
             alice.favorites.nostr_key_for(&bob_fp),
             Some("npub1bob")
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn a_gateway_announces_itself_and_the_peer_hears_it() {
+        let mut carrier = MeshService::new([11; 32], [12; 32], "carrier");
+        let mut phone = MeshService::new([21; 32], [22; 32], "phone");
+        carrier.gateway_ready = true;
+
+        phone.handle_frame(&carrier.announce_frame().unwrap());
+        let seen = phone.peers.get(&carrier.my_peer_id).expect("announce accepted");
+        assert!(seen.is_gateway(), "the phone can see the offer");
+        assert!(seen.verified, "and the announce still verified with the extra TLV");
+    }
+
+    #[test]
+    fn withdrawing_the_offer_is_heard_too() {
+        // The failure this prevents: a peer keeps depositing traffic with a
+        // gateway that stopped carrying it, because we held the first value we
+        // saw instead of the latest.
+        let mut carrier = MeshService::new([11; 32], [12; 32], "carrier");
+        let mut phone = MeshService::new([21; 32], [22; 32], "phone");
+
+        carrier.gateway_ready = true;
+        phone.handle_frame(&carrier.announce_frame().unwrap());
+        assert!(phone.peers[&carrier.my_peer_id].is_gateway());
+
+        carrier.gateway_ready = false;
+        phone.handle_frame(&carrier.announce_frame().unwrap());
+        assert!(
+            !phone.peers[&carrier.my_peer_id].is_gateway(),
+            "the withdrawal must land, not be ignored as a duplicate announce"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_offers_nothing_is_not_a_gateway() {
+        let mut plain = MeshService::new([11; 32], [12; 32], "plain");
+        let mut phone = MeshService::new([21; 32], [22; 32], "phone");
+        phone.handle_frame(&plain.announce_frame().unwrap());
+
+        let seen = &phone.peers[&plain.my_peer_id];
+        assert!(!seen.is_gateway());
+        assert_eq!(
+            seen.capabilities,
+            Some(crate::announce::Capabilities::default()),
+            "a current client says 'nothing', which is not the same as saying nothing"
+        );
+    }
+
+    #[test]
+    fn we_do_not_claim_gateway_until_we_can_keep_the_promise() {
+        // Advertising it by default would be a promise acted on by every
+        // mesh-only peer in range and kept by none of them.
+        let mut fresh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(!fresh.gateway_ready, "off until the client says otherwise");
+        let announced = crate::announce::Announcement::decode(
+            &crate::protocol::Packet::decode(&fresh.announce_frame().unwrap())
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert!(!announced
+            .advertised()
+            .unwrap()
+            .has(crate::announce::Capabilities::GATEWAY));
     }
 }
 
