@@ -43,7 +43,9 @@ kitty, colour half-blocks everywhere else. Pictures sent over Bluetooth itself
 are received and displayed too.
 
 An asterisk after a name means that person is chatting into the cell from
-somewhere else. `▣` marks a line carrying an image.
+somewhere else. `▣` marks a line carrying an image. On a private message you
+sent, `✓` means it reached the other device and `✓✓` means they have it on
+screen.
 
 ## Requirements
 

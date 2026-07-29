@@ -428,8 +428,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 CommandOutcome::SendDirectMessage { target, content } => {
                     match mesh.dm_frames(&target, &content) {
-                        Ok(frames) => {
-                            for frame in frames {
+                        Ok(sent) => {
+                            for frame in sent.frames {
                                 let _ = transport.outbound.send(frame).await;
                             }
                             // Echo locally straight away. The wire copy is
@@ -441,7 +441,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .get(&target)
                                 .map(|peer| peer.nickname.clone())
                                 .unwrap_or_else(|| target.clone());
-                            app.add_log_message(format!("__DM_SENT__:{who}:{clock}:{content}"));
+                            // The id travels with the echo so a receipt
+                            // arriving later can tick this exact line.
+                            let id = sent.ids.first().cloned().unwrap_or_default();
+                            app.add_log_message(format!(
+                                "__DM_SENT__:{who}:{clock}:{id}:{content}"
+                            ));
                             if !mesh.has_session(&target) {
                                 app.add_log_message(format!(
                                     "system: opening an encrypted channel with {who}; the message sends once it is up."
@@ -576,6 +581,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sync_people(&mut app, &mesh, &geo);
 
         // 6. Draw.
+        // Read receipts, sent for whatever the user is actually looking at.
+        // Delivered says the radio worked; read says a person saw it, so this
+        // is gated on the conversation being on screen rather than on arrival.
+        if !app.viewer.open && !app.map_open {
+            if let (_, Some(peer), _) = app.get_current_messages() {
+                let peer = peer.clone();
+                let ids = app.take_unreceipted_from(&peer);
+                if !ids.is_empty() {
+                    if let Ok(target) = mesh.peer_id_for_nickname(&peer) {
+                        for frame in mesh.read_receipt_frames(&target, &ids) {
+                            let _ = transport.outbound.send(frame).await;
+                        }
+                    }
+                }
+            }
+        }
+
         app.tick = app.tick.wrapping_add(1);
         app.pending_image_slot = None;
         terminal.draw(|frame| ui::render(&mut app, frame))?;
@@ -707,15 +729,21 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
     match mesh_event {
         // Handled by the caller, which owns the transport.
         MeshEvent::Send(_) => {}
+        MeshEvent::DeliveryUpdate { message_id, status } => {
+            app.mark_delivery(&message_id, status);
+        }
         MeshEvent::PrivateMessage {
-            sender, content, ..
+            sender,
+            content,
+            message_id,
+            ..
         } => {
             // The DM marker takes HHMM, not an epoch: the parser only splits a
             // four-character value into a clock time and passes anything else
             // through verbatim, so an epoch renders as ten digits in the time
             // column.
             let clock = chrono::Local::now().format("%H%M");
-            app.add_log_message(format!("__DM__:{sender}:{clock}:{content}"));
+            app.add_log_message(format!("__DM__:{sender}:{clock}:{message_id}:{content}"));
         }
         MeshEvent::SessionUp {
             nickname,

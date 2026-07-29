@@ -87,6 +87,26 @@ impl NoisePayload {
         Self { kind, body }
     }
 
+    /// A receipt naming the message it is about.
+    ///
+    /// Over the mesh a receipt body is just the message ID as UTF-8 — not the
+    /// richer `ReadReceipt` record with reader ID and timestamp, which is a
+    /// different form used elsewhere. Verified against upstream's
+    /// `BLENoisePayloadFactory.readReceipt`, whose whole body is
+    /// `Data(originalMessageID.utf8)`, and against the decoder, which reads it
+    /// straight back with `String(data:encoding:.utf8)`.
+    pub fn receipt(kind: NoisePayloadType, message_id: &str) -> Self {
+        Self {
+            kind,
+            body: message_id.as_bytes().to_vec(),
+        }
+    }
+
+    /// The body as a message ID, when it is one.
+    pub fn message_id(&self) -> Option<String> {
+        String::from_utf8(self.body.clone()).ok()
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + self.body.len());
         out.push(self.kind as u8);
@@ -304,5 +324,38 @@ mod tests {
     #[test]
     fn an_empty_frame_is_not_a_payload() {
         assert!(NoisePayload::decode(&[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn a_mesh_receipt_body_is_the_bare_message_id() {
+        // Upstream's BLENoisePayloadFactory sends Data(messageID.utf8) and
+        // nothing else. The 49-byte ReadReceipt record is a different form; if
+        // we sent that here the peer would read it as a nonsense id.
+        let id = "3F2504E0-4F89-11D3-9A0C-0305E82C3301";
+        let payload = NoisePayload::receipt(NoisePayloadType::ReadReceipt, id);
+        assert_eq!(payload.body, id.as_bytes());
+        assert_eq!(payload.encode()[0], 0x02);
+        assert_eq!(payload.encode().len(), 1 + id.len());
+    }
+
+    #[test]
+    fn a_receipt_round_trips_through_the_type_byte() {
+        for kind in [NoisePayloadType::ReadReceipt, NoisePayloadType::Delivered] {
+            let payload = NoisePayload::receipt(kind, "abc-123");
+            let decoded = NoisePayload::decode(&payload.encode()).unwrap();
+            assert_eq!(decoded.kind, kind);
+            assert_eq!(decoded.message_id().unwrap(), "abc-123");
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_receipt_body_is_not_an_id() {
+        let payload = NoisePayload::new(NoisePayloadType::Delivered, vec![0xff, 0xfe]);
+        assert!(payload.message_id().is_none());
     }
 }

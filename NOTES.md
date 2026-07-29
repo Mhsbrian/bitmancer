@@ -55,6 +55,17 @@ All of this is ported from `localPackages/BitFoundation/Sources/BitFoundation/` 
 - **Noise frames are not signed.** `noiseHandshake 0x10` and `noiseEncrypted 0x11` are addressed and unsigned. The handshake authenticates the channel on its own, and a signature would not survive anyway: verification re-encodes canonically, and that re-encode compresses payloads at or above 100 bytes with a DEFLATE we cannot reproduce. Handshake messages routinely exceed 100 bytes, so a signed Noise frame would be dropped every time. Only announces and public messages are signed.
 - **Encrypted frames carry a typed payload.** The plaintext inside 0x11 is `[type byte][body]`. There are eleven types, not three: privateMessage 0x01, readReceipt 0x02, delivered 0x03, groupInvite 0x06, groupKeyUpdate 0x07, voiceFrame 0x08, verifyChallenge 0x10, verifyResponse 0x11, vouch 0x12, privateFile 0x20, authenticatedPeerState 0x21 (upstream `BitchatProtocol.swift`). We decode all of them and act on the first; the rest are named in `/debug` rather than reported as corruption.
 - **A private message is a TLV record, not raw text.** The body of a privateMessage payload is `[type u8][len u8][value]` with messageID 0x00 and content 0x01, both mandatory, each capped at 255 bytes by the one-byte length (upstream `Packets.swift`, `PrivateMessagePacket`). Sending raw UTF-8 there is readable only by another client making the same mistake — which is what this repo did until the format was checked against the source. Long messages split at 255 bytes; an unknown TLV type aborts the whole record, matching upstream, because a half-understood record renders wrongly.
+- **A mesh receipt is the bare message ID, nothing more.** The body of a
+  readReceipt or delivered payload is the UUID string as UTF-8 — upstream's
+  `BLENoisePayloadFactory` sends `Data(messageID.utf8)` and its decoder reads it
+  straight back with `String(data:encoding:.utf8)`. The 49-byte `ReadReceipt`
+  record with reader ID, timestamp and nickname is a *different* form used
+  elsewhere; sending that over the mesh would be read as a nonsense id. Reading
+  the construction site settled this where reading the model struct had
+  misled — the model is not always what goes on the wire.
+- **Read outranks delivered.** The two can race, and upstream discards a
+  delivery acknowledgement for a message already marked read. `DeliveryStatus`
+  is ordered so the weaker one cannot walk a line backwards.
 - **The message ID is load-bearing.** Each private message carries a UUID that a read receipt or delivery acknowledgement points back at (`ReadReceipt.originalMessageID`). A receipt is itself a binary record — originalMessageID and receiptID as 16-byte UUIDs, an 8-byte reader ID, an 8-byte timestamp and a length-prefixed nickname, 49 bytes minimum — so it cannot be faked from a bare ID string.
 - **A queued DM needs a session object first.** `NoiseSessionManager::queue_message` returns `false` and discards the text when no session exists for the peer, and `initiate_handshake` is what creates one. Queue before initiating and the user's first message vanishes with only a bool to say so — `dm_frames` initiates first for exactly this reason.
 - **Announces are signed TLV** (`announce.rs`). Mandatory TLVs: nickname 0x01, noise public key 0x02, signing public key 0x03. The packet carries an Ed25519 signature over the *canonical* encoding — signature cleared, TTL forced to 0, RSR flag cleared, and padded. Verification re-encodes, so the canonical bytes must be reproducible on both sides.
@@ -344,10 +355,6 @@ packets addressed to us, presence, and unknown types.
 - **Announce TLVs 0x04/0x05/0x06** (`direct_neighbors`, `capabilities`,
   `bridge_geohash`) encode and decode, but nothing ever populates them.
   `direct_neighbors` is the substrate multi-hop routing needs.
-- **Read receipts and delivery acks.** Decoded and named, never sent or acted
-  on. The format is now known (see above), so this is bounded work rather than
-  research: generate the receipt record, match `originalMessageID` against sent
-  messages, and tick the line.
 - **No ping/pong upstream.** Our opcode table carries `ping 0x26` and
   `pong 0x27`, but neither `BitchatProtocol.swift` nor `Packets.swift` defines
   them and the whitepaper does not mention them. Do not implement these for

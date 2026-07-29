@@ -16,6 +16,11 @@ pub struct Message {
     /// events at their own pace, so a slow one can deliver an hour-old message
     /// after the live ones; appending in arrival order puts it at the bottom.
     pub epoch: i64,
+    /// Wire identifier, on private messages we sent. A receipt names this, and
+    /// without it an acknowledgement could only ever tick the newest line.
+    pub message_id: Option<String>,
+    /// How far this message has got, once a peer has said.
+    pub delivery: Option<crate::mesh::DeliveryStatus>,
     /// When this line landed, which drives the arrival animation. `None` means
     /// it was never new to us — replayed history, or one of a flood — and it is
     /// drawn at rest.
@@ -31,6 +36,8 @@ impl Message {
             content,
             is_self,
             epoch: now.timestamp(),
+            message_id: None,
+            delivery: None,
             arrived: Some(Instant::now()),
         }
     }
@@ -167,6 +174,8 @@ pub struct App {
     pub pending_geohash_join: Option<String>,
     /// Recognises floods of arriving lines so they do not all light up.
     arrival_gate: ArrivalGate,
+    /// Messages we have already told the sender we read.
+    read_receipts_sent: std::collections::HashSet<String>,
 }
 
 /// A flood is not news. A relay flushing its backlog delivers dozens of lines
@@ -304,6 +313,7 @@ impl App {
         let mut app = Self {
             input: Input::default(),
             arrival_gate: ArrivalGate::default(),
+            read_receipts_sent: std::collections::HashSet::new(),
             phase: TuiPhase::Connecting,
             should_quit: false,
             focus_area: FocusArea::InputBox,
@@ -412,11 +422,12 @@ impl App {
         // Our own half of a private conversation. The wire copy is encrypted
         // to the peer and never echoes back, so this is the only record of it.
         if trimmed.starts_with("__DM_SENT__:") {
-            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
-            if parts.len() >= 4 {
+            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
+            if parts.len() >= 5 {
                 let target = parts[1].to_string();
                 let raw = parts[2].to_string();
-                let content = parts[3].to_string();
+                let message_id = parts[3].to_string();
+                let content = parts[4].to_string();
                 let timestamp = if raw.len() == 4 {
                     format!("{}:{}", &raw[0..2], &raw[2..4])
                 } else {
@@ -428,6 +439,8 @@ impl App {
                     content,
                     is_self: true,
                     epoch: chrono::Local::now().timestamp(),
+                    message_id: (!message_id.is_empty()).then_some(message_id),
+                    delivery: None,
                     arrived: Some(Instant::now()),
                 };
                 let admitted = self.arrival_gate.admit();
@@ -438,16 +451,17 @@ impl App {
         }
 
         if trimmed.starts_with("__DM__:") {
-            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
-            if parts.len() >= 4 {
+            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
+            if parts.len() >= 5 {
                 let sender = parts[1].to_string();
                 let timestamp_raw = parts[2].to_string();
-                let content = parts[3].to_string();
+                let message_id = parts[3].to_string();
+                let content = parts[4].to_string();
                 
                 let timestamp = if timestamp_raw.len() == 4 { format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4]) } else { timestamp_raw };
 
                 let sender_clone = sender.clone();
-                let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), arrived: Some(Instant::now()) };
+                let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), message_id: (!message_id.is_empty()).then_some(message_id), delivery: None, arrived: Some(Instant::now()) };
 
                 let admitted = self.arrival_gate.admit();
                 push_arrival(self.dm_messages.entry(sender_clone.clone()).or_default(), msg, admitted);
@@ -476,7 +490,7 @@ impl App {
                     .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
 
                 self.note_image_link(&sender, &channel, &content);
-                let msg = Message { sender, timestamp, content, is_self: false, epoch, arrived: Some(Instant::now()) };
+                let msg = Message { sender, timestamp, content, is_self: false, epoch, message_id: None, delivery: None, arrived: Some(Instant::now()) };
 
                 let admitted = self.arrival_gate.admit();
                 insert_in_time_order(
@@ -519,7 +533,7 @@ impl App {
             
             if sender == self.nickname { return; }
             
-            let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), arrived: Some(Instant::now()) };
+            let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), message_id: None, delivery: None, arrived: Some(Instant::now()) };
             let current_channel = self.get_selected_channel_name();
             let admitted = self.arrival_gate.admit();
             push_arrival(self.channel_messages.entry(current_channel).or_default(), msg, admitted);
@@ -817,12 +831,51 @@ impl App {
         self.channels.clear();
         self.joined_geohashes.clear();
         self.images.clear();
+        self.read_receipts_sent.clear();
         self.image_dimensions.clear();
         self.viewer.open = false;
         self.map_open = false;
         // Leave a single empty public conversation so the pane is not a
         // dangling reference to something that no longer exists.
         self.channel_messages.insert("#public".to_string(), Vec::new());
+    }
+
+    /// Records that a peer acknowledged one of our messages.
+    ///
+    /// Only ever raises the status. Read and delivered can race, and a delivery
+    /// acknowledgement arriving after a read must not walk the line backwards -
+    /// upstream drops that case as stale, and so does this.
+    pub fn mark_delivery(&mut self, message_id: &str, status: crate::mesh::DeliveryStatus) {
+        for messages in self.dm_messages.values_mut() {
+            for message in messages.iter_mut() {
+                if message.message_id.as_deref() == Some(message_id) {
+                    if message.delivery.is_none_or(|current| status > current) {
+                        message.delivery = Some(status);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Messages from this peer we have now shown and not yet acknowledged.
+    ///
+    /// Marks them as receipted on the way out, so the caller cannot send the
+    /// same receipt on every frame — this is called from the draw loop.
+    pub fn take_unreceipted_from(&mut self, peer: &str) -> Vec<String> {
+        let Some(messages) = self.dm_messages.get(peer) else {
+            return Vec::new();
+        };
+        let fresh: Vec<String> = messages
+            .iter()
+            .filter(|m| !m.is_self)
+            .filter_map(|m| m.message_id.clone())
+            .filter(|id| !self.read_receipts_sent.contains(id))
+            .collect();
+        for id in &fresh {
+            self.read_receipts_sent.insert(id.clone());
+        }
+        fresh
     }
 
     pub fn update_blocked_list(&mut self, blocked_nicknames: Vec<String>) {
@@ -903,6 +956,8 @@ mod arrival_tests {
             content: "hello".to_string(),
             is_self: false,
             epoch,
+            message_id: None,
+            delivery: None,
             arrived: Some(Instant::now()),
         }
     }

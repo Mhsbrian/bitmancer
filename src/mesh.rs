@@ -44,11 +44,18 @@ pub enum MeshEvent {
     /// main loop to put on the air. A handshake is a conversation, so a reply
     /// has to be able to originate down here rather than from a user action.
     Send(Vec<u8>),
+    /// A message we sent has been acknowledged.
+    DeliveryUpdate {
+        message_id: String,
+        status: DeliveryStatus,
+    },
     /// Decrypted chat from an established session.
     PrivateMessage {
         peer_id: String,
         sender: String,
         content: String,
+        /// What a read receipt for this message must name.
+        message_id: String,
     },
     /// An encrypted channel came up. The fingerprint is what a user compares
     /// out of band; the peer ID rotates with the key, so it cannot be that.
@@ -81,6 +88,24 @@ pub enum MeshEvent {
     Trace(String),
 }
 
+/// What a `/dm` produced: the frames to put on the air, and the identifier of
+/// each message so a later receipt can be matched to the right line.
+pub struct SentDirectMessages {
+    pub ids: Vec<String>,
+    pub frames: Vec<Vec<u8>>,
+}
+
+/// How far a sent private message has got.
+///
+/// Read outranks delivered: upstream discards a delivery acknowledgement that
+/// arrives for a message already marked read, since the two can race and the
+/// weaker one must not undo the stronger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeliveryStatus {
+    Delivered,
+    Read,
+}
+
 #[derive(Debug, Clone)]
 pub struct MeshPeer {
     pub peer_id: String,
@@ -104,6 +129,13 @@ pub struct MeshService {
     /// Encrypted sessions, one per peer we have spoken to privately. Owns the
     /// static secret, since the handshake is the only thing that needs it.
     sessions: NoiseSessionManager,
+    /// Messages typed before the encrypted channel came up, by peer.
+    ///
+    /// Held here rather than in the session manager so the identifier exists
+    /// the moment the user presses enter: the UI echoes the line immediately
+    /// and needs something to match a later receipt against. The manager's own
+    /// queue also discards silently when no session object exists yet.
+    pending_dms: HashMap<String, Vec<PrivateMessagePacket>>,
     /// Full SHA-256 fingerprints we refuse traffic from. Fingerprints rather
     /// than peer IDs or nicknames: a nickname is claimed rather than owned, and
     /// a peer ID follows the key, so blocking either would be blocking a label.
@@ -132,6 +164,7 @@ impl MeshService {
             peers: HashMap::new(),
             noise_public_key,
             sessions: NoiseSessionManager::new(noise_static_key),
+            pending_dms: HashMap::new(),
             blocked: HashSet::new(),
             signing_key,
             seen_message_ids: HashSet::new(),
@@ -388,48 +421,62 @@ impl MeshService {
     /// When no channel is up yet this starts the handshake and queues the text
     /// instead of dropping it; the queued message goes out by itself once the
     /// session establishes, so the user never has to send it twice.
-    pub fn dm_frames(&mut self, peer_id: &str, content: &str) -> Result<Vec<Vec<u8>>, String> {
+    pub fn dm_frames(
+        &mut self,
+        peer_id: &str,
+        content: &str,
+    ) -> Result<SentDirectMessages, String> {
         if peer_id == self.my_peer_id {
             return Err("that is your own peer ID".to_string());
         }
         if self.is_blocked(peer_id) {
             return Err("you have blocked that peer".to_string());
         }
+        // Identifiers are minted here, before anything is sent, because the UI
+        // echoes the line straight away and a receipt arriving later has to
+        // match something already on screen.
+        let records: Vec<PrivateMessagePacket> = split_into_chunks(content, MAX_TLV_VALUE)
+            .into_iter()
+            .map(|chunk| PrivateMessagePacket::new(&chunk))
+            .collect();
+        let ids: Vec<String> = records.iter().map(|r| r.message_id.clone()).collect();
+
         if self.sessions.has_established_session(peer_id) {
             let mut frames = Vec::new();
-            for chunk in split_into_chunks(content, MAX_TLV_VALUE) {
-                frames.extend(self.sealed_message_frame(peer_id, &chunk)?);
+            for record in &records {
+                frames.extend(self.sealed_record_frame(peer_id, record)?);
             }
-            return Ok(frames);
+            return Ok(SentDirectMessages { ids, frames });
         }
 
-        // Order matters: queueing needs a session object to hang the message
-        // on, and initiating the handshake is what creates one. Queue first and
-        // the text is dropped on the floor with only a `false` to say so.
         let opening = self
             .sessions
             .initiate_handshake(peer_id)
             .map_err(|error| format!("could not start a handshake: {error}"))?;
-        if !self.sessions.queue_message(peer_id, content.to_string()) {
-            return Err("could not hold the message while the channel opens".to_string());
-        }
-        Ok(self
-            .noise_frame(MessageType::NoiseHandshake, peer_id, opening)
-            .into_iter()
-            .collect())
+        self.pending_dms
+            .entry(peer_id.to_string())
+            .or_default()
+            .extend(records);
+        Ok(SentDirectMessages {
+            ids,
+            frames: self
+                .noise_frame(MessageType::NoiseHandshake, peer_id, opening)
+                .into_iter()
+                .collect(),
+        })
     }
 
     /// Wraps one chunk of text as a private-message record, seals it, and
     /// addresses the frame.
-    fn sealed_message_frame(
+    fn sealed_record_frame(
         &mut self,
         peer_id: &str,
-        chunk: &str,
+        record: &PrivateMessagePacket,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let record = PrivateMessagePacket::new(chunk)
+        let encoded = record
             .encode()
             .ok_or_else(|| "message does not fit the wire format".to_string())?;
-        let payload = NoisePayload::new(NoisePayloadType::PrivateMessage, record).encode();
+        let payload = NoisePayload::new(NoisePayloadType::PrivateMessage, encoded).encode();
         let sealed = self
             .sessions
             .encrypt(&payload, peer_id)
@@ -438,6 +485,33 @@ impl MeshService {
             .noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
             .into_iter()
             .collect())
+    }
+
+    /// A sealed receipt naming one message.
+    ///
+    /// Returns `None` rather than an error when there is no session: a receipt
+    /// is not worth opening a channel for, and the peer will resend if it
+    /// cares.
+    fn receipt_frame(
+        &mut self,
+        peer_id: &str,
+        kind: NoisePayloadType,
+        message_id: &str,
+    ) -> Option<Vec<u8>> {
+        if !self.sessions.has_established_session(peer_id) {
+            return None;
+        }
+        let payload = NoisePayload::receipt(kind, message_id).encode();
+        let sealed = self.sessions.encrypt(&payload, peer_id).ok()?;
+        self.noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
+    }
+
+    /// Frames telling a peer their messages have been read.
+    pub fn read_receipt_frames(&mut self, peer_id: &str, message_ids: &[String]) -> Vec<Vec<u8>> {
+        message_ids
+            .iter()
+            .filter_map(|id| self.receipt_frame(peer_id, NoisePayloadType::ReadReceipt, id))
+            .collect()
     }
 
     /// Encrypts anything queued while the handshake was still running, and
@@ -458,15 +532,13 @@ impl MeshService {
                 .unwrap_or_default(),
         });
 
-        for text in self.sessions.get_pending_messages(peer_id) {
-            for chunk in split_into_chunks(&text, MAX_TLV_VALUE) {
-                match self.sealed_message_frame(peer_id, &chunk) {
-                    Ok(frames) => events.extend(frames.into_iter().map(MeshEvent::Send)),
-                    Err(reason) => events.push(MeshEvent::Notice(format!(
-                        "queued message to {} was lost: {reason}",
-                        short_display(peer_id)
-                    ))),
-                }
+        for record in self.pending_dms.remove(peer_id).unwrap_or_default() {
+            match self.sealed_record_frame(peer_id, &record) {
+                Ok(frames) => events.extend(frames.into_iter().map(MeshEvent::Send)),
+                Err(reason) => events.push(MeshEvent::Notice(format!(
+                    "queued message to {} was lost: {reason}",
+                    short_display(peer_id)
+                ))),
             }
         }
         events
@@ -548,11 +620,38 @@ impl MeshService {
                     .get(&sender)
                     .map(|peer| peer.nickname.clone())
                     .unwrap_or_else(|| short_display(&sender));
-                vec![MeshEvent::PrivateMessage {
-                    peer_id: sender,
+                // Acknowledge receipt immediately. Upstream expects the ack
+                // for the id it sent, so it goes out whether or not the user
+                // ever looks at the conversation - delivered is about the
+                // radio, read is about the person.
+                let mut events = vec![MeshEvent::PrivateMessage {
+                    peer_id: sender.clone(),
                     sender: nickname,
                     content,
-                }]
+                    message_id: record.message_id.clone(),
+                }];
+                if let Some(frame) = self.receipt_frame(
+                    &sender,
+                    NoisePayloadType::Delivered,
+                    &record.message_id,
+                ) {
+                    events.push(MeshEvent::Send(frame));
+                }
+                events
+            }
+            NoisePayloadType::Delivered | NoisePayloadType::ReadReceipt => {
+                let Some(message_id) = payload.message_id() else {
+                    return vec![MeshEvent::Trace(format!(
+                        "unreadable receipt from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                let status = if payload.kind == NoisePayloadType::ReadReceipt {
+                    DeliveryStatus::Read
+                } else {
+                    DeliveryStatus::Delivered
+                };
+                vec![MeshEvent::DeliveryUpdate { message_id, status }]
             }
             // Everything else is decoded and named but not yet acted on.
             // Naming it matters: /debug reporting a bare number is how an
@@ -1486,7 +1585,7 @@ mod noise_dm_tests {
         // out by itself after the handshake rather than being dropped.
         let (mut alice, mut bob) = pair();
         let target = bob.my_peer_id.clone();
-        let opening = alice.dm_frames(&target, "the docks at nine").unwrap();
+        let opening = alice.dm_frames(&target, "the docks at nine").unwrap().frames;
         assert!(!opening.is_empty(), "a DM must put something on the air");
 
         let events = settle(&mut alice, &mut bob, opening);
@@ -1513,7 +1612,7 @@ mod noise_dm_tests {
         // ends disagree, verification is theatre.
         let (mut alice, mut bob) = pair();
         let target = bob.my_peer_id.clone();
-        let opening = alice.dm_frames(&target, "hi").unwrap();
+        let opening = alice.dm_frames(&target, "hi").unwrap().frames;
         let events = settle(&mut alice, &mut bob, opening);
 
         let fingerprints: Vec<&String> = events
@@ -1537,13 +1636,13 @@ mod noise_dm_tests {
         let (mut alice, mut bob) = pair();
         let bob_id = bob.my_peer_id.clone();
         let alice_id = alice.my_peer_id.clone();
-        let opening = alice.dm_frames(&bob_id, "ping").unwrap();
+        let opening = alice.dm_frames(&bob_id, "ping").unwrap().frames;
         settle(&mut alice, &mut bob, opening);
 
         // Bob now has a session, so his reply should encrypt immediately rather
         // than starting a second handshake.
         assert!(bob.has_session(&alice_id));
-        let reply = bob.dm_frames(&alice_id, "pong").unwrap();
+        let reply = bob.dm_frames(&alice_id, "pong").unwrap().frames;
         let events = settle(&mut bob, &mut alice, reply);
 
         assert!(events.iter().any(|event| matches!(
@@ -1559,7 +1658,7 @@ mod noise_dm_tests {
         let mut carol = MeshService::new([31; 32], [32; 32], "carol");
         let bob_id = bob.my_peer_id.clone();
 
-        let opening = alice.dm_frames(&bob_id, "not for carol").unwrap();
+        let opening = alice.dm_frames(&bob_id, "not for carol").unwrap().frames;
         for frame in &opening {
             assert!(
                 carol.handle_frame(frame).is_empty(),
@@ -1576,11 +1675,11 @@ mod noise_dm_tests {
         // has to become several records rather than being truncated.
         let (mut alice, mut bob) = pair();
         let bob_id = bob.my_peer_id.clone();
-        let opening = alice.dm_frames(&bob_id, "x").unwrap();
+        let opening = alice.dm_frames(&bob_id, "x").unwrap().frames;
         settle(&mut alice, &mut bob, opening);
 
         let long = "word ".repeat(200); // ~1000 bytes
-        let frames = alice.dm_frames(&bob_id, &long).unwrap();
+        let frames = alice.dm_frames(&bob_id, &long).unwrap().frames;
         assert!(
             frames.len() > 1,
             "a 1000-byte message must not go out as one record"
@@ -1915,5 +2014,121 @@ mod file_send_tests {
             }
         }
         assert!(arrived);
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    fn established() -> (MeshService, MeshService, String, String) {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        let (alice_id, bob_id) = (alice.my_peer_id.clone(), bob.my_peer_id.clone());
+
+        // Walk the handshake through so both ends hold a session.
+        let mut to_bob = alice.dm_frames(&bob_id, "opening").unwrap().frames;
+        let mut to_alice: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..8 {
+            let (mut next_a, mut next_b) = (Vec::new(), Vec::new());
+            for frame in to_bob.drain(..) {
+                for event in bob.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_a.push(reply);
+                    }
+                }
+            }
+            for frame in to_alice.drain(..) {
+                for event in alice.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_b.push(reply);
+                    }
+                }
+            }
+            if next_a.is_empty() && next_b.is_empty() {
+                break;
+            }
+            to_alice = next_a;
+            to_bob = next_b;
+        }
+        (alice, bob, alice_id, bob_id)
+    }
+
+    #[test]
+    fn receiving_a_private_message_acknowledges_it_unprompted() {
+        // Delivered is about the radio, not the reader, so it goes out without
+        // anyone opening the conversation.
+        let (mut alice, mut bob, _, bob_id) = established();
+        let sent = alice.dm_frames(&bob_id, "are you there").unwrap();
+        let message_id = sent.ids[0].clone();
+
+        let mut ack = None;
+        for frame in sent.frames {
+            for event in bob.handle_frame(&frame) {
+                if let MeshEvent::Send(reply) = event {
+                    ack = Some(reply);
+                }
+            }
+        }
+
+        // That acknowledgement, delivered back, must tick the right message.
+        let ack = ack.expect("an inbound private message must be acknowledged");
+        let events = alice.handle_frame(&ack);
+        match events.as_slice() {
+            [MeshEvent::DeliveryUpdate { message_id: id, status }] => {
+                assert_eq!(*id, message_id, "the ack must name the message we sent");
+                assert_eq!(*status, DeliveryStatus::Delivered);
+            }
+            other => panic!("expected a delivery update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_receipt_reports_read_not_delivered() {
+        let (mut alice, mut bob, alice_id, bob_id) = established();
+        let sent = alice.dm_frames(&bob_id, "did you see this").unwrap();
+        let message_id = sent.ids[0].clone();
+        for frame in sent.frames {
+            bob.handle_frame(&frame);
+        }
+
+        for frame in bob.read_receipt_frames(&alice_id, std::slice::from_ref(&message_id)) {
+            match alice.handle_frame(&frame).as_slice() {
+                [MeshEvent::DeliveryUpdate { message_id: id, status }] => {
+                    assert_eq!(*id, message_id);
+                    assert_eq!(*status, DeliveryStatus::Read);
+                }
+                other => panic!("expected a read receipt, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_outranks_delivered_however_they_race() {
+        // The two acknowledgements can arrive in either order; a late delivered
+        // must not walk a read message backwards.
+        assert!(DeliveryStatus::Read > DeliveryStatus::Delivered);
+    }
+
+    #[test]
+    fn a_receipt_is_not_worth_opening_a_channel_for() {
+        // No session, no receipt - and no error either. The peer will resend
+        // if it cares.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(mesh
+            .read_receipt_frames("00000000000000aa", &["some-id".to_string()])
+            .is_empty());
+    }
+
+    #[test]
+    fn every_chunk_of_a_split_message_is_acknowledged_separately() {
+        // A long message becomes several records, each with its own id, so a
+        // single tick would be reporting on only one of them.
+        let (mut alice, _bob, _, bob_id) = established();
+        let sent = alice.dm_frames(&bob_id, &"word ".repeat(200)).unwrap();
+        assert!(sent.ids.len() > 1);
+        assert_eq!(sent.ids.len(), sent.frames.len());
+        let unique: std::collections::HashSet<&String> = sent.ids.iter().collect();
+        assert_eq!(unique.len(), sent.ids.len(), "ids must not repeat");
     }
 }

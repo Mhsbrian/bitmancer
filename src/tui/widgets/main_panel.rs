@@ -258,6 +258,19 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
                             Style::default().fg(theme::arriving(theme::LIVE, intensity)),
                         ),
                     ];
+                    // Acknowledgement sits in the marker column on our own
+                    // lines, where the image glyph would be. A private message
+                    // is the only kind anyone acknowledges.
+                    if let Some(status) = msg.delivery {
+                        spans.pop();
+                        spans.push(Span::styled(
+                            match status {
+                                crate::mesh::DeliveryStatus::Delivered => " ✓ ",
+                                crate::mesh::DeliveryStatus::Read => " ✓✓",
+                            },
+                            Style::default().fg(theme::arriving(theme::MINE, intensity)),
+                        ));
+                    }
                     spans.extend(reveal_spans(
                         &line_content,
                         row_start,
