@@ -86,6 +86,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(20);
             std::process::exit(nostr::client::sample_doctor(&prefix, seconds).await);
         }
+        Some("--dm-doctor") => {
+            // Uses the real stored identity: the address a peer was given is
+            // the one mail arrives at, so a generated key would test nothing.
+            let state = persistence::load_state();
+            let Some(seed) = fixed_key(state.nostr_device_seed.as_deref()) else {
+                eprintln!("no nostr device seed in ~/.bitmancer/state.json; start the client once first");
+                std::process::exit(2);
+            };
+            let pubkey = nostr::identity::IdentityStore::new(seed).main_pubkey_hex();
+            let seconds = args
+                .get(1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(15);
+            std::process::exit(nostr::client::dm_doctor(&pubkey, seconds).await);
+        }
         Some("--version" | "-V") => {
             println!("bitmancer {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -99,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  bitmancer                        Start the client\n  \
                  bitmancer --doctor [secs]        Check Bluetooth, list nearby BitChat peers\n  \
                  bitmancer --geo-doctor <gh> [s]  Check relays for a geohash channel\n  \
+                 bitmancer --dm-doctor [secs]     Check private mail, print your address\n  \
                  bitmancer --version\n\n\
                  In the client, /map opens the world map, /geo #<geohash> joins\n\
                  a location channel, and /help lists everything else.\n"

@@ -710,13 +710,16 @@ pub async fn doctor(geohash: &str, seconds: u64) -> i32 {
             Err(_) => break,
             Ok(None) => break,
             Ok(Some(event)) => match event {
+                // On change, not on first sight: a relay that drops and comes
+                // back counts as live in the summary, so suppressing the
+                // recovery line makes the two disagree.
                 GeoEvent::RelayConnected { relay, .. } => {
-                    if connected.insert(relay.clone(), true).is_none() {
+                    if connected.insert(relay.clone(), true) != Some(true) {
                         println!("  [ok]   connected  {relay}");
                     }
                 }
                 GeoEvent::RelayFailed { relay, reason, .. } => {
-                    if connected.insert(relay.clone(), false).is_none() {
+                    if connected.insert(relay.clone(), false) != Some(false) {
                         println!("  [FAIL] {relay}: {reason}");
                     }
                 }
@@ -759,6 +762,87 @@ pub async fn doctor(geohash: &str, seconds: u64) -> i32 {
     if messages == 0 && presence == 0 {
         println!("\n  Note: this channel was silent. That is normal for an empty");
         println!("        geohash - try a dense city cell, or a shorter geohash.");
+    }
+    0
+}
+
+/// `--dm-doctor`: check that private mail can actually be collected.
+///
+/// The geohash doctor cannot answer this — DMs use a different relay set, a
+/// different filter and a stored-event window rather than an ephemeral one, and
+/// every one of those is a way for the transport to be quietly broken while
+/// location channels work perfectly.
+///
+/// Prints our address, because a DM cannot be tested alone: someone has to send
+/// one, and this is the string they need. Subscribe-only, like the others.
+pub async fn dm_doctor(pubkey: &str, seconds: u64) -> i32 {
+    let relays = dm_relays();
+    println!("bitmancer private mail doctor\n");
+    println!("  address:  {pubkey}");
+    if let Some(bytes) = crate::nostr::npub::to_bytes(pubkey) {
+        if let Some(npub) = crate::nostr::npub::from_bytes(&bytes) {
+            println!("            {npub}");
+        }
+    }
+    println!("  relays:   {} built in", relays.len());
+    for relay in &relays {
+        println!("            {relay}");
+    }
+    println!("  window:   {}h of stored mail, {DM_LIMIT} per relay", DM_LOOKBACK_SECONDS / 3600);
+
+    let mut client = NostrClient::spawn();
+    client.subscribe_direct(pubkey, relays.clone()).await;
+    println!("\n  Listening {seconds}s...\n");
+
+    let mut connected: HashMap<String, bool> = HashMap::new();
+    let mut wraps = 0usize;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, client.events.recv()).await {
+            Err(_) | Ok(None) => break,
+            // Reported on change rather than on first sight. A relay that
+            // fails and then reconnects is counted as live below, so printing
+            // only its first event would show three [ok] lines above a summary
+            // claiming four.
+            Ok(Some(GeoEvent::RelayConnected { relay, .. })) => {
+                if connected.insert(relay.clone(), true) != Some(true) {
+                    println!("  [ok]   connected  {relay}");
+                }
+            }
+            Ok(Some(GeoEvent::RelayFailed { relay, reason, .. })) => {
+                if connected.insert(relay.clone(), false) != Some(false) {
+                    println!("  [FAIL] {relay}: {reason}");
+                }
+            }
+            Ok(Some(GeoEvent::PrivateEnvelope { wrap })) => {
+                wraps += 1;
+                // Not opened. This process holds no keys, and printing who
+                // wrote to you is not a diagnostic.
+                println!("  wrap   {} ({} bytes sealed)", &wrap.id[..16], wrap.content.len());
+            }
+            Ok(Some(_)) => {}
+        }
+    }
+
+    let live = connected.values().filter(|ok| **ok).count();
+    println!("\n  {live}/{} relays connected", relays.len());
+    println!("  {wraps} envelope(s) addressed to you");
+
+    if live == 0 {
+        println!("\n  [FAIL] No relay accepted a connection. Check internet access.");
+        return 1;
+    }
+    println!("\n  [ok]   The filter was accepted and the subscription is live.");
+    if wraps == 0 {
+        println!("\n  Note: an empty mailbox is the normal result. To prove the");
+        println!("        whole path, have someone favourite you and send a DM,");
+        println!("        then run this again — anything they sent in the last");
+        println!("        {}h will still be waiting on these relays.", DM_LOOKBACK_SECONDS / 3600);
     }
     0
 }
