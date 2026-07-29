@@ -388,9 +388,26 @@ packets addressed to us, presence, and unknown types.
   transport per DM (Bluetooth preferred, Nostr fallback) and queues when neither
   is up, so a peer out of BLE range is still reachable. Ours are not. The
   unhandled `nostrCarrier 0x28` and the never-populated `TLV_BRIDGE_GEOHASH
-  0x06` still belong to this gap. The address exchange it depends on is done
-  (see favourites above); what remains is NIP-17 sealing, transport selection,
-  and an outbox that retries until an ack clears it.
+  0x06` still belong to this gap. Four of five layers are done: the address
+  exchange (favourites, above), the envelope cryptography, the three-layer
+  assembly, and the routing and retention decisions (`outbox.rs`). What remains
+  is relay plumbing — a gift-wrap filter (`kind 1059` tagged with our pubkey), a
+  DM subscription, and a publish path — since `nostr/client.rs` is currently
+  shaped entirely around geohash channels.
+- **The mesh is preferred over Nostr for every private message**, and not only
+  for latency: a message that stays on the local radio tells no third party the
+  conversation exists, while the relay path necessarily reveals that *someone*
+  addressed this recipient even though the envelope hides who and what.
+- **A send is not a delivery.** The outbox keeps its copy until a receipt
+  clears it, matching upstream. Unlike upstream it also gives up eventually:
+  "until acknowledged" with no ceiling means holding a peer's plaintext forever
+  when they never return, which is what this client exists not to do. Held
+  content is dropped by `/wipe` along with everything else.
+- **The outbox holds content, not sealed frames.** Each transport encodes
+  differently, the route can change between a failed attempt and a successful
+  one, and every sealing draws a fresh nonce — holding ciphertext would mean
+  holding something sendable exactly one way, and resending it would reuse a
+  nonce.
 - **`courierEnvelope 0x04` is store-and-forward.** Upstream hands a sealed copy
   of an undeliverable message to nearby peers who may physically encounter the
   recipient, addressed by a 16-byte rotating tag — an HMAC of the recipient's

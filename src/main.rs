@@ -19,6 +19,7 @@ mod noise_payload;
 mod noise_protocol;
 mod nostr;
 mod noise_session;
+mod outbox;
 mod peer_id;
 mod persistence;
 mod protocol;
