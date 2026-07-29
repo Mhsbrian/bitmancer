@@ -70,33 +70,38 @@ impl std::fmt::Display for EnvelopeError {
     }
 }
 
-/// The ECDH shared secret, as this protocol wants it.
+/// The two shared secrets this protocol could mean.
 ///
-/// `secp256k1`'s own `SharedSecret` hashes the point; upstream uses the raw
-/// compressed serialisation instead, so the point is rebuilt here by hand. The
-/// parity byte comes from the y coordinate, which is why the full point is
-/// needed rather than just x.
-fn shared_secret(secret: &SecretKey, public: &XOnlyPublicKey) -> [u8; 33] {
-    // A Nostr key is x-only, so the peer's point is lifted to the even one.
-    // Our own secret has to be normalised the same way or the two sides do not
-    // agree: lifting their key to even while ours corresponds to an odd point
-    // makes each side compute the negation of the other's result. Same x,
-    // opposite parity byte, different HKDF output, and a ciphertext nobody can
-    // open. This is BIP-340's rule, applied to key agreement rather than
-    // signing.
-    let normalised = if secret.x_only_public_key(secp256k1::SECP256K1).1 == secp256k1::Parity::Odd
-    {
-        secret.negate()
-    } else {
-        *secret
-    };
-    let full = PublicKey::from_x_only_public_key(*public, secp256k1::Parity::Even);
-    let point = secp256k1::ecdh::shared_secret_point(&full, &normalised);
+/// The secret is the 33-byte compressed point, not the SHA-256 of it that
+/// libsecp256k1 returns by default. Because the point's parity byte is part of
+/// the key material, and a Nostr key is x-only, the result depends on a bit
+/// that was never transmitted: the sender used their own secret as stored,
+/// whose parity the receiver cannot recover from an x-only public key.
+///
+/// So there are two candidates and the receiver has to try both. This is not a
+/// workaround for a bug of ours — it is a property of pairing a
+/// parity-sensitive key derivation with parity-free identities, and the
+/// upstream fixture demonstrates both cases occurring in real traffic: its
+/// gift-wrap layer wants one and its seal layer the other. NIP-44 sidesteps
+/// this by hashing only the x coordinate; this construction does not.
+fn shared_secrets(secret: &SecretKey, public: &XOnlyPublicKey) -> [[u8; 33]; 2] {
+    [secp256k1::Parity::Even, secp256k1::Parity::Odd].map(|parity| {
+        let full = PublicKey::from_x_only_public_key(*public, parity);
+        let point = secp256k1::ecdh::shared_secret_point(&full, secret);
+        let mut compressed = [0u8; 33];
+        compressed[0] = if point[63] & 1 == 0 { 0x02 } else { 0x03 };
+        compressed[1..].copy_from_slice(&point[..32]);
+        compressed
+    })
+}
 
-    let mut compressed = [0u8; 33];
-    compressed[0] = if point[63] & 1 == 0 { 0x02 } else { 0x03 };
-    compressed[1..].copy_from_slice(&point[..32]);
-    compressed
+/// The secret to seal with.
+///
+/// Sealing has to pick one, and picks the same one upstream does: the secret
+/// exactly as stored, with the peer's key lifted to even. A reader who lands on
+/// the other candidate will find it on their second attempt.
+fn sealing_secret(secret: &SecretKey, public: &XOnlyPublicKey) -> [u8; 33] {
+    shared_secrets(secret, public)[0]
 }
 
 fn symmetric_key(shared: &[u8; 33]) -> [u8; 32] {
@@ -115,7 +120,7 @@ pub fn encrypt(
     sender_secret: &SecretKey,
     nonce24: [u8; NONCE_BYTES],
 ) -> Result<String, EnvelopeError> {
-    let key = symmetric_key(&shared_secret(sender_secret, recipient));
+    let key = symmetric_key(&sealing_secret(sender_secret, recipient));
     let cipher = XChaCha20Poly1305::new((&key).into());
     let sealed = cipher
         .encrypt(
@@ -158,19 +163,24 @@ pub fn decrypt(
     }
 
     let (nonce24, sealed) = combined.split_at(NONCE_BYTES);
-    let key = symmetric_key(&shared_secret(recipient_secret, sender));
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let plaintext = cipher
-        .decrypt(
+    // Both candidates, because the sender's parity is not on the wire. The
+    // authentication tag decides which one was meant: a wrong key fails to
+    // authenticate rather than producing plausible plaintext, so this cannot
+    // pick the wrong one, only spend one extra AEAD when the first misses.
+    for shared in shared_secrets(recipient_secret, sender) {
+        let key = symmetric_key(&shared);
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        if let Ok(plaintext) = cipher.decrypt(
             XNonce::from_slice(nonce24),
             Payload {
                 msg: sealed,
                 aad: &[],
             },
-        )
-        .map_err(|_| EnvelopeError::Undecryptable)?;
-
-    String::from_utf8(plaintext).map_err(|_| EnvelopeError::Undecryptable)
+        ) {
+            return String::from_utf8(plaintext).map_err(|_| EnvelopeError::Undecryptable);
+        }
+    }
+    Err(EnvelopeError::Undecryptable)
 }
 
 #[cfg(test)]
@@ -270,14 +280,16 @@ mod tests {
     }
 
     #[test]
-    fn both_ends_derive_the_same_key() {
-        // ECDH is symmetric; if our point reconstruction broke that, sealing
-        // would work and opening would not.
+    fn the_secret_a_sender_used_is_always_one_of_the_two_a_reader_tries() {
+        // The reader cannot know which, so the guarantee that matters is that
+        // the sealing choice is always among the candidates.
         let a = keypair(13);
         let b = keypair(14);
-        assert_eq!(
-            shared_secret(&a.secret_key(), &b.x_only_public_key().0),
-            shared_secret(&b.secret_key(), &a.x_only_public_key().0)
+        let sealed_with = sealing_secret(&a.secret_key(), &b.x_only_public_key().0);
+        let candidates = shared_secrets(&b.secret_key(), &a.x_only_public_key().0);
+        assert!(
+            candidates.contains(&sealed_with),
+            "a reader would never find the key this was sealed with"
         );
     }
 
@@ -366,5 +378,88 @@ mod tests {
         let first = encrypt("same text", &to, &sender.secret_key(), [1u8; NONCE_BYTES]).unwrap();
         let second = encrypt("same text", &to, &sender.secret_key(), [2u8; NONCE_BYTES]).unwrap();
         assert_ne!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod real_envelope {
+    use super::tests_support::*;
+
+    /// Upstream's own expectations for this fixture.
+    const EXPECTED_PLAINTEXT: &str = "legacy fixture from 733098bb";
+    const EXPECTED_SENDER: &str =
+        "2e3d79df7047204f02b726c574e256f8de1dd80510f7dcb8b0d12df13acb87e6";
+
+    #[test]
+    fn both_layers_of_a_real_envelope_open_to_the_expected_message() {
+        // End to end against traffic produced by a different implementation.
+        // The two layers of this very fixture disagree about key parity, which
+        // is exactly why the reader tries both — a single-candidate reader
+        // opens the wrap and then fails on the seal.
+        let seal_json = open_wrap();
+        let seal: serde_json::Value = serde_json::from_str(&seal_json).unwrap();
+        assert_eq!(seal["kind"], 13, "the wrap must hold a seal");
+        assert_eq!(
+            seal["tags"].as_array().unwrap().len(),
+            0,
+            "a BitChat seal is tagless, and the reader binds to that shape"
+        );
+        assert_eq!(seal["pubkey"], EXPECTED_SENDER);
+
+        let rumor_json = open_seal(&seal_json);
+        let rumor: serde_json::Value = serde_json::from_str(&rumor_json).unwrap();
+        assert_eq!(rumor["kind"], 14, "the seal must hold a rumor");
+        assert_eq!(rumor["content"], EXPECTED_PLAINTEXT);
+        assert_eq!(
+            rumor["pubkey"], EXPECTED_SENDER,
+            "the rumor's claimed author must be the key that signed the seal"
+        );
+        assert!(
+            rumor.get("sig").is_none() || rumor["sig"].is_null(),
+            "the rumor is unsigned; authentication comes from the seal"
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod tests_support {
+    use super::*;
+
+    pub const FIXTURE: &str = include_str!("../../tests/fixtures/legacy_private_envelope.json");
+    const RECIPIENT_SECRET: &str =
+        "8355a5c110cdfef2e644f4ad5d51c39f253b2c2c80ebb6856379fb16531dc1fa";
+
+    pub fn recipient() -> SecretKey {
+        SecretKey::from_byte_array(
+            <[u8; 32]>::try_from(hex::decode(RECIPIENT_SECRET).unwrap().as_slice()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn xonly_of(hex_str: &str) -> XOnlyPublicKey {
+        XOnlyPublicKey::from_byte_array(
+            <[u8; 32]>::try_from(hex::decode(hex_str).unwrap().as_slice()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    pub fn open_wrap() -> String {
+        let wrap: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        decrypt(
+            wrap["content"].as_str().unwrap(),
+            &recipient(),
+            &xonly_of(wrap["pubkey"].as_str().unwrap()),
+        )
+        .unwrap()
+    }
+
+    pub fn open_seal(seal_json: &str) -> String {
+        let seal: serde_json::Value = serde_json::from_str(seal_json).unwrap();
+        decrypt(
+            seal["content"].as_str().unwrap(),
+            &recipient(),
+            &xonly_of(seal["pubkey"].as_str().unwrap()),
+        )
+        .unwrap()
     }
 }

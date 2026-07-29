@@ -359,16 +359,19 @@ packets addressed to us, presence, and unknown types.
   throwaway key so relays never learn the sender). Cipher is
   XChaCha20-Poly1305 over `v2:` + base64url(nonce24 ‖ ct ‖ tag); key is
   HKDF-SHA256(ikm = shared secret, salt = empty, info = `"nip44-v2"`).
-- **The ECDH input is the compressed point, and both secrets must be
-  parity-normalised.** The shared secret is the 33-byte compressed
-  serialisation, not the SHA-256 of it that libsecp256k1 returns by default.
-  And because a Nostr key is x-only, each side lifts the peer's key to even
-  parity — so each side must normalise *its own* secret the same way
-  (BIP-340's rule, applied to key agreement). Skip that and the two ends
-  compute negations of each other: same x, opposite parity byte, different
-  HKDF output, ciphertext nobody can open. Everything still encrypts and still
-  looks like valid base64, which is why this is checked against a real
-  envelope rather than a round trip.
+- **The ECDH input is the compressed point, and the reader must try both
+  parities.** The shared secret is the 33-byte compressed serialisation, not
+  the SHA-256 of it that libsecp256k1 returns by default — so the point's
+  *parity byte is key material*. A Nostr key is x-only, and the sender uses
+  their own secret as stored, so the parity that went into their derivation is
+  a bit that never reaches the wire. There are therefore two candidate secrets
+  and the receiver has to try both; the Poly1305 tag decides, so this cannot
+  pick wrongly, it only costs one extra AEAD when the first misses. NIP-44
+  avoids the whole problem by hashing only the x coordinate. This construction
+  does not, and the upstream fixture proves both cases occur in real traffic:
+  its gift-wrap layer wants one candidate and its seal layer the other. A
+  single-candidate reader opens the wrap and then fails on the seal, which is
+  exactly the bug this repo shipped for an afternoon.
 - **`tests/fixtures/legacy_private_envelope.json`** is a genuine envelope from
   upstream's own suite, produced by BitChat release 733098bb. Opening it is the
   only evidence that separates a correct implementation from two wrong ones
