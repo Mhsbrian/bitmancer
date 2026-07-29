@@ -379,6 +379,45 @@ the radio with every link it already has. Losing one link of several does *not*
 clear the peer list — peers reachable only through the lost link age out on their
 own, while the rest are still there.
 
+## Verifying who a peer actually is
+
+**Two different claims were both called "verified" until this existed.**
+`MeshPeer.verified` says an announce carried a signature matching the key inside
+it — which an attacker in the middle satisfies trivially, by signing with their
+own key. Being on the verified list says a human read a fingerprint off a screen
+in front of them. The peer listing now labels the first "unsigned announce" when
+it fails, and the second "verified in person".
+
+This is the only trust in the client that does not come off the air, and the
+only stored thing that costs a walk across town to rebuild, so it persists in
+`state.json` under `verified_fingerprints` and is cleared by `/wipe`.
+
+- **A card is `bitchat://verify?…`**, carrying both public keys, a nickname, an
+  optional npub, a timestamp and a nonce, signed by the Ed25519 half. Formats
+  are upstream's `VerificationService.swift`: the signed bytes are
+  length-prefixed fields in a fixed order behind a `bitchat-verify-v1` context,
+  with both key fields lowercased there but not in the URL, so a card retyped in
+  capitals still verifies. There is a test asserting that layout explicitly
+  rather than round-tripping it — a round trip passes just as happily against a
+  consistently wrong implementation, and getting it wrong fails in exactly one
+  place: someone else's client.
+- **Cards expire after five minutes**, in both directions. A card from the
+  future is refused as firmly as an expired one, or a card is minted once with a
+  distant timestamp and shown for a week.
+- **A card missing a signed field fails safely**, which is not hypothetical:
+  copying a card out of a wrapped terminal drops the trailing `&npub=` and the
+  signature stops matching. Found by driving the real binary rather than by
+  testing — the unit tests round-trip a card that was never truncated.
+- **Only the responder half of challenge/response is wired.** Issuing challenges
+  would prove the peer holds the signing key behind a noise key, which the Noise
+  session already establishes since it binds the static key, and a card supplies
+  the fingerprint to compare against. Upstream marks its own equivalent
+  "scaffold only". Answering is different and not optional: a phone verifying us
+  sends a challenge, and if we cannot answer, verification fails at their end
+  with nothing on ours to notice. We refuse to sign a challenge naming a key
+  that is not ours — otherwise a peer collects our signature over a claim about
+  a third party.
+
 ## What is not done
 - **A favourite is an address exchange, not a bookmark** (`favorites.rs`).
   Upstream sends it as the *content of an ordinary private message* —

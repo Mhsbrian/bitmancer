@@ -349,6 +349,76 @@ impl MeshService {
         }
     }
 
+    /// Builds the card we show someone standing next to us.
+    ///
+    /// Signed here rather than by the caller because this is the only place
+    /// that holds the signing key, and handing it out to be signed elsewhere
+    /// would make every future caller a place the key could leak from.
+    pub fn verification_card(
+        &self,
+        npub: Option<&str>,
+        now: i64,
+        nonce: [u8; crate::verification::NONCE_BYTES],
+    ) -> crate::verification::Card {
+        crate::verification::Card::build(
+            &self.signing_key,
+            &self.noise_public_key,
+            &self.nickname,
+            npub,
+            now,
+            nonce,
+        )
+    }
+
+    /// Records that a fingerprint was checked against a card shown in person.
+    ///
+    /// Distinct from `MeshPeer.verified`, which only says an announce carried a
+    /// signature matching the key inside it. That proves the sender holds the
+    /// key they claim; it says nothing about whose key it is, which is the whole
+    /// question here, and an attacker in the middle passes it effortlessly.
+    pub fn mark_verified(&mut self, fingerprint: &str) {
+        self.sessions.verify_fingerprint(&fingerprint.to_lowercase());
+    }
+
+    /// Whether a peer ID or fingerprint has been verified in person.
+    ///
+    /// Takes either, matching `is_blocked`: the client addresses peers by the
+    /// 16-character peer ID, and a fingerprint begins with it.
+    pub fn is_verified(&self, peer_id_or_fingerprint: &str) -> bool {
+        let needle = peer_id_or_fingerprint.to_lowercase();
+        self.sessions
+            .get_verified_fingerprints()
+            .iter()
+            .any(|fingerprint| fingerprint.starts_with(&needle) || needle.starts_with(fingerprint))
+    }
+
+    pub fn verified_fingerprints(&self) -> HashSet<String> {
+        self.sessions.get_verified_fingerprints()
+    }
+
+    /// Verified peers by name where we know one, by fingerprint prefix where we
+    /// do not — someone verified months ago may not be in range today, and the
+    /// list is worth reading either way.
+    pub fn verified_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .verified_fingerprints()
+            .iter()
+            .map(|fingerprint| {
+                self.peers
+                    .values()
+                    .find(|peer| peer.fingerprint == *fingerprint)
+                    .map(|peer| format!("{} (here now)", peer.nickname))
+                    .unwrap_or_else(|| fingerprint.chars().take(16).collect())
+            })
+            .collect();
+        labels.sort();
+        labels
+    }
+
+    pub fn load_verified(&mut self, fingerprints: HashSet<String>) {
+        self.sessions.load_verified_fingerprints(fingerprints);
+    }
+
     /// Their long-lived Nostr address, if they ever handed it over.
     pub fn nostr_address_for(&self, peer_id: &str) -> Option<&str> {
         self.favorites
@@ -778,6 +848,51 @@ impl MeshService {
                     DeliveryStatus::Delivered
                 };
                 vec![MeshEvent::DeliveryUpdate { message_id, status }]
+            }
+            // Someone is checking that we hold the signing key behind the noise
+            // key we announced. We answer whether or not we are verifying them:
+            // a challenge is a question about us, and refusing to answer just
+            // makes us unverifiable to a peer doing the right thing.
+            //
+            // Only the responder side exists. Issuing challenges would prove
+            // something the Noise session already establishes — it binds the
+            // static key, and a card read off a screen supplies the fingerprint
+            // to compare it against — so there is nothing left for us to ask.
+            // Answering is different: a phone verifying us needs a reply, and
+            // without one verification fails at their end.
+            NoisePayloadType::VerifyChallenge => {
+                let Some((noise_key_hex, nonce)) = crate::verification::parse_challenge(&payload.body)
+                else {
+                    return vec![MeshEvent::Trace(format!(
+                        "unreadable verification challenge from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                // Only ever sign a challenge about our own key. Signing one
+                // naming someone else's would let a peer collect our signature
+                // over a claim about a third party.
+                if noise_key_hex.to_lowercase() != hex::encode(self.noise_public_key) {
+                    return vec![MeshEvent::Trace(format!(
+                        "verification challenge from {} names another peer's key",
+                        short_display(&sender)
+                    ))];
+                }
+                let body = crate::verification::response(&noise_key_hex, &nonce, &self.signing_key);
+                let payload = NoisePayload::new(NoisePayloadType::VerifyResponse, body).encode();
+                let answer = self
+                    .sessions
+                    .encrypt(&payload, &sender)
+                    .ok()
+                    .and_then(|sealed| {
+                        self.noise_frame(MessageType::NoiseEncrypted, &sender, sealed)
+                    });
+                match answer {
+                    Some(frame) => vec![MeshEvent::Send(frame)],
+                    None => vec![MeshEvent::Trace(format!(
+                        "could not answer a verification challenge from {}",
+                        short_display(&sender)
+                    ))],
+                }
             }
             // Everything else is decoded and named but not yet acted on.
             // Naming it matters: /debug reporting a bare number is how an
@@ -2147,7 +2262,9 @@ mod file_send_tests {
 mod receipt_tests {
     use super::*;
 
-    fn established() -> (MeshService, MeshService, String, String) {
+    /// Two clients with a Noise session already up. Shared with the
+    /// verification tests, which need the same starting point.
+    pub(super) fn established() -> (MeshService, MeshService, String, String) {
         let mut alice = MeshService::new([11; 32], [12; 32], "alice");
         let mut bob = MeshService::new([21; 32], [22; 32], "bob");
         let (alice_id, bob_id) = (alice.my_peer_id.clone(), bob.my_peer_id.clone());
@@ -2403,6 +2520,119 @@ mod favorite_tests {
             alice.favorites.nostr_key_for(&bob_fp),
             Some("npub1bob")
         );
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use crate::verification;
+
+    /// The initiator's half, which the client does not implement: a peer
+    /// checking us sends this, so answering it correctly is what is under test.
+    fn challenge_frame(
+        asker: &mut MeshService,
+        target: &str,
+        noise_key_hex: &str,
+        nonce: &[u8],
+    ) -> Vec<u8> {
+        let body = verification::challenge(noise_key_hex, nonce);
+        let payload = NoisePayload::new(NoisePayloadType::VerifyChallenge, body).encode();
+        let sealed = asker.sessions.encrypt(&payload, target).expect("a session");
+        asker
+            .noise_frame(MessageType::NoiseEncrypted, target, sealed)
+            .expect("a frame")
+    }
+
+    /// Pulls the response out of whatever the answering side put on the air.
+    fn opened_response(
+        asker: &mut MeshService,
+        from: &str,
+        events: Vec<MeshEvent>,
+    ) -> Option<(String, Vec<u8>, Vec<u8>)> {
+        for event in events {
+            let MeshEvent::Send(frame) = event else {
+                continue;
+            };
+            let packet = Packet::decode(&frame)?;
+            let plain = asker.sessions.decrypt(&packet.payload, from).ok()?;
+            let payload = NoisePayload::decode(&plain)?;
+            if payload.kind == NoisePayloadType::VerifyResponse {
+                return verification::parse_response(&payload.body);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_challenge_about_our_key_is_answered_provably() {
+        // A phone verifying us sends this. If we cannot answer, verification
+        // fails at their end and there is nothing on ours to notice it.
+        let (mut alice, mut bob, alice_id, bob_id) = super::receipt_tests::established();
+        let bob_key = hex::encode(bob.noise_public_key);
+        let nonce = [0x5A; verification::NONCE_BYTES];
+
+        let frame = challenge_frame(&mut alice, &bob_id, &bob_key, &nonce);
+        let answered = bob.handle_frame(&frame);
+        let (key, echoed, signature) =
+            opened_response(&mut alice, &bob_id, answered).expect("bob answers");
+
+        assert_eq!(key, bob_key, "the answer is about the key that was asked");
+        assert!(
+            verification::verify_response(
+                &bob_key,
+                &nonce,
+                &echoed,
+                &signature,
+                &hex::encode(bob.signing_key.verifying_key().to_bytes())
+            ),
+            "and it is signed by the key bob announces"
+        );
+        let _ = alice_id;
+    }
+
+    #[test]
+    fn a_challenge_naming_someone_elses_key_is_refused() {
+        // Otherwise a peer collects our signature over a claim about a third
+        // party, which is exactly the material needed to impersonate them.
+        let (mut alice, mut bob, _, bob_id) = super::receipt_tests::established();
+        let nonce = [0x5A; verification::NONCE_BYTES];
+        let stranger = hex::encode([0xEE; 32]);
+
+        let frame = challenge_frame(&mut alice, &bob_id, &stranger, &nonce);
+        let answered = bob.handle_frame(&frame);
+        assert!(
+            opened_response(&mut alice, &bob_id, answered).is_none(),
+            "bob must not sign a statement about a key that is not his"
+        );
+    }
+
+    #[test]
+    fn verification_survives_a_restart() {
+        // The only trust here not derived from the air, and the only kind that
+        // costs a walk across town to rebuild.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let fingerprint = "aa11bb22cc33dd44ee55";
+        mesh.mark_verified(fingerprint);
+        assert!(mesh.is_verified(fingerprint));
+        assert!(mesh.is_verified("aa11bb22cc33dd44"), "a peer ID resolves too");
+
+        let saved = mesh.verified_fingerprints();
+        let mut restarted = MeshService::new([1; 32], [2; 32], "me");
+        assert!(!restarted.is_verified(fingerprint));
+        restarted.load_verified(saved);
+        assert!(restarted.is_verified(fingerprint));
+    }
+
+    #[test]
+    fn a_card_names_the_fingerprint_the_client_marks() {
+        // If these ever disagreed, /verify would mark something nobody is.
+        let mesh = MeshService::new([1; 32], [2; 32], "me");
+        let card = mesh.verification_card(None, 1_700_000_000, [0; verification::NONCE_BYTES]);
+        assert_eq!(card.check(1_700_000_000), Ok(()));
+        assert_eq!(card.fingerprint().unwrap(), mesh.my_fingerprint());
+        assert_eq!(card.peer_id().unwrap(), mesh.my_peer_id);
+        assert_eq!(card.nickname, "me");
     }
 }
 

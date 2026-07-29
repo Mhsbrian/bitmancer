@@ -39,6 +39,10 @@ pub enum CommandOutcome {
     /// a nickname: resolution can fail or be ambiguous, and that is worth
     /// reporting to the user before anything is encrypted.
     SendDirectMessage { target: String, content: String },
+    /// Show the card someone standing next to us should read.
+    ShowVerificationCard,
+    /// Read a card they showed us and, if it holds up, trust the fingerprint.
+    AcceptVerificationCard(String),
     Quit,
 }
 
@@ -196,6 +200,29 @@ pub fn handle(
         ]),
         "/wipe" | "/panic" => CommandOutcome::WipeIdentity,
 
+        "/verify" if rest.is_empty() => {
+            let verified = mesh.verified_labels();
+            let mut lines = vec![
+                "Verification is the one thing here that cannot be done over the".to_string(),
+                "air: anyone able to sit between you and a peer can hand each side".to_string(),
+                "their own key, and both fingerprints will look stable forever.".to_string(),
+                String::new(),
+                "/verify me            show your card, for them to read".to_string(),
+                "/verify <bitchat://…> read theirs".to_string(),
+            ];
+            if verified.is_empty() {
+                lines.push(String::new());
+                lines.push("Nobody is verified yet.".to_string());
+            } else {
+                lines.push(String::new());
+                lines.push(format!("Verified ({}):", verified.len()));
+                lines.extend(verified.into_iter().map(|label| format!("  {label}")));
+            }
+            CommandOutcome::Reply(lines)
+        }
+        "/verify" if rest.eq_ignore_ascii_case("me") => CommandOutcome::ShowVerificationCard,
+        "/verify" => CommandOutcome::AcceptVerificationCard(rest.to_string()),
+
         "/block" if rest.is_empty() => {
             let blocked = mesh.blocked_labels();
             if blocked.is_empty() {
@@ -254,11 +281,28 @@ fn status_lines(mesh: &MeshService, connected: bool) -> Vec<String> {
         let mut peers: Vec<_> = mesh.peers.values().collect();
         peers.sort_by(|a, b| a.nickname.cmp(&b.nickname));
         for peer in peers {
+            // Two different claims, and they were both called "verified" until
+            // in-person checking existed. `peer.verified` says the announce
+            // carried a signature matching the key inside it — which an
+            // attacker in the middle satisfies trivially, since they sign with
+            // their own key. Being on the verified list says someone read this
+            // fingerprint off a screen in front of them.
+            let mut notes = Vec::new();
+            if !peer.verified {
+                notes.push("unsigned announce");
+            }
+            if mesh.is_verified(&peer.fingerprint) {
+                notes.push("verified in person");
+            }
             lines.push(format!(
                 "    {} ({}){}",
                 peer.nickname,
                 short_display(&peer.peer_id),
-                if peer.verified { "" } else { " unverified" }
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", notes.join(", "))
+                }
             ));
         }
     }
@@ -321,10 +365,17 @@ fn help_text() -> Vec<String> {
         "  /geo #<geohash>       Join a location channel (over Nostr)".to_string(),
         "  /geo list, /geo off   List or leave location channels".to_string(),
         "  /online, /w           List peers on the mesh".to_string(),
+        "  /dm <nick> <message>  Send an encrypted private message".to_string(),
+        "  /fav <nick>           Favourite someone: hands them your Nostr".to_string(),
+        "                        address, so you stay reachable out of range".to_string(),
+        "  /verify               Check a peer is who you think, in person".to_string(),
+        "  /send <path>          Send a file to everyone on the mesh".to_string(),
+        "  /block <nick>         Refuse everything from a peer".to_string(),
         "  /status               Link, peer and identity info".to_string(),
         "  /fingerprint          Show your peer ID and key fingerprint".to_string(),
         "  /debug                Toggle a trace of every packet received".to_string(),
         "  /clear                Clear the current conversation".to_string(),
+        "  /wipe                 Destroy your identity and quit".to_string(),
         "  /exit                 Quit".to_string(),
         "Anything else you type is sent to the public mesh.".to_string(),
     ]

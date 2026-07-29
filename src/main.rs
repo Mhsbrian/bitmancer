@@ -26,6 +26,7 @@ mod protocol;
 mod relay;
 mod transport;
 mod tui;
+mod verification;
 
 use std::time::{Duration, Instant};
 
@@ -146,6 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore the block list before the radio starts, so a blocked peer cannot
     // slip a frame in during the window between connecting and loading.
     mesh.load_blocked(state.blocked_peers.clone());
+    // The only trust here that was not derived from something off the air, and
+    // the only thing in this file that costs a walk across town to rebuild.
+    mesh.load_verified(state.verified_fingerprints.clone());
     // Favourites carry the only addresses we have for peers who are not in
     // radio range, so they are restored before anything can need one.
     {
@@ -611,6 +615,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(reason) => {
                             app.add_log_message(format!("system: {reason}"));
                         }
+                    }
+                }
+                CommandOutcome::ShowVerificationCard => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|since| since.as_secs() as i64)
+                        .unwrap_or_default();
+                    let card = mesh.verification_card(
+                        Some(&geo.main_nostr_npub()),
+                        now,
+                        rand::random(),
+                    );
+                    app.add_log_message(format!(
+                        "system: your card, good for {} minutes:",
+                        verification::MAX_AGE_SECONDS / 60
+                    ));
+                    app.add_log_message(format!("system: {}", card.to_url()));
+                    app.add_log_message(
+                        "system: they run /verify <that line>. It is only worth anything if they read it from your screen."
+                            .to_string(),
+                    );
+                }
+                CommandOutcome::AcceptVerificationCard(url) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|since| since.as_secs() as i64)
+                        .unwrap_or_default();
+                    let outcome = verification::Card::from_url(&url)
+                        .and_then(|card| card.check(now).map(|()| card));
+                    match outcome {
+                        Ok(card) => match card.fingerprint() {
+                            // Verifying yourself proves nothing and leaves your
+                            // own name sitting in a list of people you have
+                            // met, which is exactly the list that has to stay
+                            // trustworthy at a glance.
+                            Ok(fingerprint) if fingerprint == mesh.my_fingerprint() => {
+                                app.add_log_message(
+                                    "system: that is your own card.".to_string(),
+                                );
+                            }
+                            Ok(fingerprint) => {
+                                mesh.mark_verified(&fingerprint);
+                                state.verified_fingerprints = mesh.verified_fingerprints();
+                                let saved = persistence::save_state(&state).is_ok();
+                                app.add_log_message(format!(
+                                    "system: verified {} ({})",
+                                    card.nickname,
+                                    card.peer_id().unwrap_or_default()
+                                ));
+                                if !saved {
+                                    app.add_log_message(
+                                        "system: could not write that to disk; it will be forgotten on exit."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            Err(_) => app.add_log_message(
+                                "system: that card's key is malformed.".to_string(),
+                            ),
+                        },
+                        Err(verification::VerifyError::Malformed) => app.add_log_message(
+                            "system: that is not a verification card. Expected a bitchat://verify line."
+                                .to_string(),
+                        ),
+                        Err(verification::VerifyError::Stale) => app.add_log_message(format!(
+                            "system: that card has expired; cards are good for {} minutes. Ask them for a fresh one.",
+                            verification::MAX_AGE_SECONDS / 60
+                        )),
+                        Err(verification::VerifyError::BadSignature) => app.add_log_message(
+                            "system: that card's signature does not match its keys. Do not trust it."
+                                .to_string(),
+                        ),
                     }
                 }
                 CommandOutcome::SetNickname(name) => app.pending_nickname_update = Some(name),

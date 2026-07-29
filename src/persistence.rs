@@ -27,6 +27,13 @@ pub struct AppState {
     /// Peers who favourited us, by fingerprint.
     #[serde(default)]
     pub favorited_us: HashSet<String>,
+    /// Fingerprints checked against a card shown out of band, by fingerprint.
+    ///
+    /// This is the only trust in the client that does not come off the air, so
+    /// it is the only thing here that would be genuinely expensive to rebuild:
+    /// re-earning it means standing next to each of these people again.
+    #[serde(default)]
+    pub verified_fingerprints: HashSet<String>,
     pub identity_key: Option<Vec<u8>>,                        // bitchat.identityKey (Ed25519 private key)
     pub noise_static_key: Option<Vec<u8>>,                   // bitchat.noiseStaticKey (X25519 private key)
     /// Seed that per-geohash Nostr identities are derived from. Kept separate
@@ -46,6 +53,7 @@ impl AppState {
             favorite_nostr_keys: HashMap::new(),
             favorite_nicknames: HashMap::new(),
             favorited_us: HashSet::new(),
+            verified_fingerprints: HashSet::new(),
             identity_key: None,
             noise_static_key: None,
             nostr_device_seed: None,
