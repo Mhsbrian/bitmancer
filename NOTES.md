@@ -305,6 +305,26 @@ Two non-obvious pieces:
   active cells are centred nodes rather than outlines, because neighbouring
   outlines share edges and merge back into heavy rules. Palette is coastline
   slate, one cyan ramp for activity, magenta reserved for the cursor alone.
+- **The hotspot list keeps what the roll-up throws away.** `note_voice` receives
+  each event's exact geohash and immediately folds it into whichever square is
+  on screen, which is right for heat and wrong for "where should I go": at the
+  world view it collapses a thousand channels into thirty-two continents, and a
+  continent is not somewhere anyone can join. The same events are therefore also
+  kept at the precision they arrived at, which is by construction a real channel
+  — the sampler only ever subscribes at channel levels. So the panel beside the
+  world map is a live global leaderboard built from traffic the client was
+  already receiving and discarding.
+  - Ranked by people, matching the grid's heat, with messages breaking ties and
+    the geohash breaking those: a list redrawn continuously that reshuffles when
+    nothing changed cannot be read, let alone aimed at.
+  - Cleared when the view moves, because moving re-points the sampler and a
+    leaderboard carried across would be sourced from subscriptions we no longer
+    hold — stale numbers shown as live ones.
+  - Enter travels rather than joins; the next Enter joins. Joining straight from
+    the list would drop someone into a channel they have not looked at.
+  - The panel's width is *computed* from its column budget rather than chosen
+    alongside it. The first version picked a width by eye and the footer was
+    clipped mid-word — which reads as a broken renderer, not a long phrase.
 
 Two details in the relay pool that look optional and are not: stored events
 arrive newest-first, so a new subscription buffers until **every** relay sends

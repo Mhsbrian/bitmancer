@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::tui::app::{App, FocusArea};
+use crate::tui::map::MapFocus;
 use crate::tui::widgets::sidebar::sidebar_visible_items;
 
 pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
@@ -110,10 +111,31 @@ fn handle_map_events(app: &mut App, key_event: KeyEvent) {
         KeyCode::Char('h') if ctrl => {
             app.map.drill_out();
         }
+        // Tab moves the keyboard between the grid and the hotspot list. It
+        // refuses to hand it to an empty list, so the key never appears to do
+        // nothing while quietly taking the arrows away from the map.
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.map.toggle_pane();
+        }
+        KeyCode::Up if app.map.pane == MapFocus::Hotspots => {
+            app.map.move_hotspot_selection(-1)
+        }
+        KeyCode::Down if app.map.pane == MapFocus::Hotspots => {
+            app.map.move_hotspot_selection(1)
+        }
         KeyCode::Up => app.map.move_selection(-1, 0),
         KeyCode::Down => app.map.move_selection(1, 0),
         KeyCode::Left => app.map.move_selection(0, -1),
         KeyCode::Right => app.map.move_selection(0, 1),
+        // On the list, Enter travels: the map re-centres on that cell with it
+        // under the cursor, so the next Enter joins. Two presses to arrive and
+        // commit, rather than one that does both and drops you somewhere you
+        // have not seen.
+        KeyCode::Enter if app.map.pane == MapFocus::Hotspots => {
+            if let Some(hotspot) = app.map.selected_hotspot() {
+                app.map.dive_to(&hotspot.geohash);
+            }
+        }
         // Enter is "go in" in the sense the user means it. On a cell that is a
         // real channel level, that means joining the conversation; on the
         // in-between precisions (1 and 3) no channel exists to join, so it
@@ -256,6 +278,79 @@ mod tests {
         let mut app = App::new_with_nickname("tui".into());
         app.open_map();
         app
+    }
+
+    /// A map with traffic in two cells, so the hotspot list has something in it.
+    fn busy_map_app() -> App {
+        let mut app = map_app();
+        for index in 0..5 {
+            app.map.note_voice("9q", &format!("p{index}"), index < 2);
+        }
+        app.map.note_voice("dr", "someone", false);
+        app
+    }
+
+    #[test]
+    fn tab_moves_the_keyboard_to_the_hotspots_and_back() {
+        let mut app = busy_map_app();
+        assert_eq!(app.map.pane, MapFocus::Grid);
+        handle_map_events(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.map.pane, MapFocus::Hotspots);
+        handle_map_events(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.map.pane, MapFocus::Grid);
+    }
+
+    #[test]
+    fn tab_does_nothing_visible_when_there_is_nothing_to_pick() {
+        // Handing the keyboard to an empty list would take the arrows away
+        // from the map and put them nowhere the user can see.
+        let mut app = map_app();
+        handle_map_events(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.map.pane, MapFocus::Grid);
+        // And the arrows still drive the grid.
+        let start = app.map.selected_geohash().to_string();
+        handle_map_events(&mut app, press(KeyCode::Right));
+        assert_ne!(app.map.selected_geohash(), start);
+    }
+
+    #[test]
+    fn arrows_drive_whichever_pane_has_the_keyboard() {
+        let mut app = busy_map_app();
+        let cell = app.map.selected_geohash().to_string();
+
+        handle_map_events(&mut app, press(KeyCode::Tab));
+        handle_map_events(&mut app, press(KeyCode::Down));
+        assert_eq!(app.map.hotspot_cursor(), 1, "the list moved");
+        assert_eq!(
+            app.map.selected_geohash(),
+            cell,
+            "and the grid cursor stayed exactly where it was"
+        );
+
+        handle_map_events(&mut app, press(KeyCode::Tab));
+        handle_map_events(&mut app, press(KeyCode::Down));
+        assert_ne!(app.map.selected_geohash(), cell, "now the grid moves again");
+    }
+
+    #[test]
+    fn enter_on_a_hotspot_travels_rather_than_joining() {
+        // Joining straight from the list would drop the user into a channel
+        // they have not looked at. Enter takes them there; the next Enter
+        // commits.
+        let mut app = busy_map_app();
+        handle_map_events(&mut app, press(KeyCode::Tab));
+        let target = app.map.selected_hotspot().unwrap().geohash;
+        assert_eq!(target, "9q", "the busiest cell is on top");
+
+        handle_map_events(&mut app, press(KeyCode::Enter));
+        assert!(app.map_open, "still on the map");
+        assert_eq!(app.map.selected_geohash(), "9q", "with the cell under the cursor");
+        assert_eq!(app.map.focus(), "9", "and its surroundings on screen");
+        assert_eq!(app.map.pane, MapFocus::Grid, "keyboard handed back");
+
+        // The second Enter is the one that joins.
+        handle_map_events(&mut app, press(KeyCode::Enter));
+        assert!(!app.map_open, "joining closes the map");
     }
 
     #[test]

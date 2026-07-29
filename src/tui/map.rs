@@ -33,6 +33,31 @@ impl CellActivity {
     }
 }
 
+/// How many cells the hotspot list will name.
+///
+/// Short on purpose. The point is to answer "where is anything happening" at a
+/// glance; a list long enough to need reading is a list nobody reads.
+pub const HOTSPOT_LIMIT: usize = 8;
+
+/// A live channel, ranked against the others currently being sampled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hotspot {
+    /// The channel itself, at the precision the sampler subscribed to — so this
+    /// is a geohash someone can actually join, not a display cell.
+    pub geohash: String,
+    pub people: usize,
+    pub messages: usize,
+}
+
+/// Which half of the map the keyboard is driving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapFocus {
+    /// The grid of cells, navigated with the arrow keys.
+    Grid,
+    /// The hotspot list beside it.
+    Hotspots,
+}
+
 pub struct MapState {
     /// Prefix currently subdivided across the grid. Empty means the world.
     focus: String,
@@ -40,6 +65,18 @@ pub struct MapState {
     selection: usize,
     layout: Vec<GridCell>,
     activity: HashMap<String, CellActivity>,
+    /// The same traffic, kept at the precision it actually arrived at.
+    ///
+    /// `activity` answers "how hot is this square", so it rolls every event up
+    /// to whichever cell is on screen. That is the wrong shape for the question
+    /// "where should I go": at the world view it collapses a thousand channels
+    /// into thirty-two continents, and a continent is not somewhere you can
+    /// join. The sampler has always subscribed to real channels and this keeps
+    /// what it hears from them.
+    hotspots: HashMap<String, CellActivity>,
+    /// Index into `top_hotspots()`, when the list has the keyboard.
+    hotspot_selection: usize,
+    pub pane: MapFocus,
     /// Set by navigation so the main loop knows to re-point the sampler.
     pub view_dirty: bool,
 }
@@ -57,6 +94,9 @@ impl MapState {
             selection: 0,
             layout: Vec::new(),
             activity: HashMap::new(),
+            hotspots: HashMap::new(),
+            hotspot_selection: 0,
+            pane: MapFocus::Grid,
             view_dirty: true,
         };
         map.set_focus(String::new());
@@ -92,6 +132,12 @@ impl MapState {
             .position(|cell| cell.row == 0 && cell.col == 0)
             .unwrap_or(0);
         self.activity.clear();
+        // Cleared with the view, not kept across it. Moving the map re-points
+        // the sampler, so a leaderboard held over from the last view would be
+        // sourced from subscriptions we no longer hold — stale readings
+        // presented as live ones, which is worse than an empty list.
+        self.hotspots.clear();
+        self.hotspot_selection = 0;
         self.view_dirty = true;
     }
 
@@ -209,6 +255,97 @@ impl MapState {
         if is_message {
             entry.messages += 1;
         }
+
+        // The same event, kept where it happened. `geohash` here is the cell
+        // the sampler subscribed to, so it is a channel with people in it
+        // rather than the square it is drawn inside.
+        let hotspot = self.hotspots.entry(geohash.to_string()).or_default();
+        hotspot.seen.insert(pubkey.to_string());
+        if is_message {
+            hotspot.messages += 1;
+        }
+    }
+
+    /// The busiest channels currently being sampled, best first.
+    ///
+    /// Ranked by people rather than messages, matching the heat on the grid: a
+    /// room's draw is who is in it, and the readout has always distinguished
+    /// being *there* from *talking*. Messages break the tie, so between two
+    /// equally full cells the one holding a conversation wins, and the geohash
+    /// breaks that — a list that reshuffles between frames cannot be read.
+    pub fn top_hotspots(&self) -> Vec<Hotspot> {
+        let mut ranked: Vec<Hotspot> = self
+            .hotspots
+            .iter()
+            .filter(|(_, activity)| !activity.is_silent())
+            .map(|(geohash, activity)| Hotspot {
+                geohash: geohash.clone(),
+                people: activity.people(),
+                messages: activity.messages,
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.people
+                .cmp(&a.people)
+                .then(b.messages.cmp(&a.messages))
+                .then(a.geohash.cmp(&b.geohash))
+        });
+        ranked.truncate(HOTSPOT_LIMIT);
+        ranked
+    }
+
+    /// Where the cursor actually sits, which is not always where it was left.
+    ///
+    /// The list is rebuilt from live traffic and shrinks when a cell goes
+    /// quiet, so the stored index can point past the end. Clamping in one place
+    /// keeps the highlight and the Enter key agreeing about which row is under
+    /// the cursor — if they ever disagreed, the map would dive somewhere other
+    /// than the row the user is looking at.
+    pub fn hotspot_cursor(&self) -> usize {
+        self.hotspot_selection
+            .min(self.top_hotspots().len().saturating_sub(1))
+    }
+
+    /// The hotspot under the cursor, when the list has the keyboard.
+    pub fn selected_hotspot(&self) -> Option<Hotspot> {
+        self.top_hotspots().into_iter().nth(self.hotspot_cursor())
+    }
+
+    /// Moves within the list, stopping at both ends.
+    ///
+    /// Deliberately not wrapping. The list reorders itself as traffic arrives,
+    /// and a cursor that jumps from the last row to the first would be
+    /// indistinguishable from the ranking shifting under it.
+    pub fn move_hotspot_selection(&mut self, delta: isize) {
+        let count = self.top_hotspots().len();
+        if count == 0 {
+            self.hotspot_selection = 0;
+            return;
+        }
+        let next = (self.hotspot_selection as isize + delta).clamp(0, count as isize - 1);
+        self.hotspot_selection = next as usize;
+    }
+
+    /// Switches which pane the keyboard drives.
+    ///
+    /// Refuses to hand the keyboard to an empty list, which would look exactly
+    /// like the key doing nothing.
+    pub fn toggle_pane(&mut self) -> MapFocus {
+        self.pane = match self.pane {
+            MapFocus::Grid if !self.top_hotspots().is_empty() => MapFocus::Hotspots,
+            _ => MapFocus::Grid,
+        };
+        self.pane
+    }
+
+    /// Jumps the map to a cell and puts the cursor on it, so the surroundings
+    /// are visible rather than the cell alone.
+    ///
+    /// Hands the keyboard back to the grid: having arrived somewhere, the next
+    /// thing anyone wants is to look around it or go in.
+    pub fn dive_to(&mut self, geohash: &str) {
+        self.focus_on(geohash);
+        self.pane = MapFocus::Grid;
     }
 
     pub fn activity(&self, geohash: &str) -> Option<&CellActivity> {
@@ -257,6 +394,173 @@ impl MapState {
             .iter()
             .flat_map(|cell| geohash::children(&cell.geohash))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod hotspot_tests {
+    use super::*;
+
+    /// Traffic in a cell, from `people` distinct identities.
+    fn crowd(map: &mut MapState, geohash: &str, people: usize, messages: usize) {
+        for index in 0..people {
+            map.note_voice(geohash, &format!("{geohash}-person-{index}"), false);
+        }
+        for _ in 0..messages {
+            map.note_voice(geohash, &format!("{geohash}-person-0"), true);
+        }
+    }
+
+    #[test]
+    fn the_list_names_channels_not_the_squares_they_are_drawn_in() {
+        // The whole point. At the world view the grid shows 32 single-character
+        // continents, and a continent is not somewhere anyone can join. The
+        // sampler has always subscribed to real channels; this keeps what it
+        // hears from them instead of averaging it into a landmass.
+        let mut map = MapState::new();
+        crowd(&mut map, "9q", 5, 2);
+        crowd(&mut map, "9x", 2, 0);
+
+        assert_eq!(map.activity("9").map(|a| a.people()), Some(7), "the square holds both");
+
+        let top = map.top_hotspots();
+        assert_eq!(top.len(), 2, "and the list keeps them apart");
+        assert_eq!(top[0].geohash, "9q");
+        assert_eq!(top[0].people, 5);
+        assert_eq!(top[0].messages, 2);
+        assert_eq!(top[1].geohash, "9x");
+    }
+
+    #[test]
+    fn a_crowd_outranks_a_conversation_but_not_an_equal_one() {
+        // People first, matching the grid's heat; messages break the tie, so
+        // between two equally full rooms the one talking wins.
+        let mut map = MapState::new();
+        crowd(&mut map, "bc", 9, 0);
+        crowd(&mut map, "cd", 3, 40);
+        crowd(&mut map, "ce", 9, 5);
+
+        let ranked = map.top_hotspots();
+        let order: Vec<&str> = ranked.iter().map(|h| h.geohash.as_str()).collect();
+        assert_eq!(order, vec!["ce", "bc", "cd"]);
+    }
+
+    #[test]
+    fn the_order_is_stable_between_frames() {
+        // The list is redrawn continuously. One that reshuffles when nothing
+        // changed cannot be read, let alone aimed at.
+        let mut map = MapState::new();
+        for cell in ["bc", "cd", "ce", "cf"] {
+            crowd(&mut map, cell, 4, 1);
+        }
+        assert_eq!(map.top_hotspots(), map.top_hotspots());
+        let ranked = map.top_hotspots();
+        let order: Vec<&str> = ranked.iter().map(|h| h.geohash.as_str()).collect();
+        assert_eq!(order, vec!["bc", "cd", "ce", "cf"], "ties fall back to the name");
+    }
+
+    #[test]
+    fn the_list_is_short_and_silent_cells_are_left_out() {
+        let mut map = MapState::new();
+        // Real children of a real cell, so these are geohashes the view
+        // actually contains rather than strings that merely look like them.
+        for (index, cell) in crate::geohash::children("z")
+            .into_iter()
+            .take(HOTSPOT_LIMIT + 6)
+            .enumerate()
+        {
+            crowd(&mut map, &cell, index + 1, 0);
+        }
+        assert_eq!(map.top_hotspots().len(), HOTSPOT_LIMIT);
+        assert!(
+            map.top_hotspots().iter().all(|hotspot| hotspot.people > 0),
+            "a cell nobody is in is not a place to go"
+        );
+    }
+
+    #[test]
+    fn moving_the_map_forgets_the_list() {
+        // Navigating re-points the sampler. A leaderboard carried across would
+        // be built from subscriptions we no longer hold — stale numbers shown
+        // as live ones, which is worse than showing nothing.
+        let mut map = MapState::new();
+        crowd(&mut map, "9q", 5, 1);
+        assert!(!map.top_hotspots().is_empty());
+        map.drill_in();
+        assert!(map.top_hotspots().is_empty());
+    }
+
+    #[test]
+    fn the_cursor_never_points_past_the_list() {
+        // The list shrinks when a cell goes quiet. If the highlight and the
+        // Enter key disagreed about which row is under the cursor, the map
+        // would dive somewhere other than where the user is looking.
+        let mut map = MapState::new();
+        crowd(&mut map, "bc", 3, 0);
+        crowd(&mut map, "cd", 2, 0);
+        map.toggle_pane();
+        map.move_hotspot_selection(5);
+        assert_eq!(map.hotspot_cursor(), 1, "clamped to the last row");
+        assert_eq!(map.selected_hotspot().unwrap().geohash, "cd");
+
+        // Now the list is rebuilt shorter, without the cursor being touched.
+        map.hotspots.remove("cd");
+        assert_eq!(map.hotspot_cursor(), 0);
+        assert_eq!(map.selected_hotspot().unwrap().geohash, "bc");
+    }
+
+    #[test]
+    fn the_cursor_stops_at_both_ends() {
+        let mut map = MapState::new();
+        crowd(&mut map, "bc", 3, 0);
+        crowd(&mut map, "cd", 2, 0);
+        map.move_hotspot_selection(-5);
+        assert_eq!(map.hotspot_cursor(), 0, "and does not wrap round to the bottom");
+        map.move_hotspot_selection(1);
+        assert_eq!(map.hotspot_cursor(), 1);
+    }
+
+    #[test]
+    fn the_keyboard_is_never_handed_to_an_empty_list() {
+        // Otherwise the key looks broken: focus moves somewhere invisible and
+        // every subsequent arrow press does nothing.
+        let mut map = MapState::new();
+        assert_eq!(map.toggle_pane(), MapFocus::Grid);
+
+        crowd(&mut map, "9q", 1, 0);
+        assert_eq!(map.toggle_pane(), MapFocus::Hotspots);
+        assert_eq!(map.toggle_pane(), MapFocus::Grid, "and back again");
+    }
+
+    #[test]
+    fn diving_shows_the_cell_in_its_surroundings() {
+        // Not the cell alone: arriving somewhere with no context is
+        // disorienting, and the next thing anyone does is look around.
+        let mut map = MapState::new();
+        crowd(&mut map, "9q", 5, 2);
+        map.toggle_pane();
+        let target = map.selected_hotspot().unwrap().geohash;
+        assert_eq!(target, "9q");
+
+        map.dive_to(&target);
+        assert_eq!(map.focus(), "9", "focused on the parent");
+        assert_eq!(map.selected_geohash(), "9q", "with the cell under the cursor");
+        assert_eq!(map.pane, MapFocus::Grid, "and the keyboard back on the grid");
+        assert!(map.view_dirty, "so the sampler follows");
+    }
+
+    #[test]
+    fn a_dive_target_is_a_channel_anyone_can_join() {
+        // The list is built from what the sampler subscribed to, and the
+        // sampler only ever subscribes at real channel precisions. If that
+        // stopped holding, Enter would offer to join something that cannot be.
+        let map = MapState::new();
+        for target in map.sample_targets() {
+            assert!(
+                crate::geohash::level_name(target.chars().count()).is_some(),
+                "{target} is not a channel level"
+            );
+        }
     }
 }
 
