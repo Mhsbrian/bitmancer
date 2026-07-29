@@ -5,6 +5,7 @@
 // pool. Nothing here touches the BLE mesh — geohash channels ride the internet.
 
 pub mod client;
+pub mod envelope;
 pub mod event;
 pub mod identity;
 pub mod pow;

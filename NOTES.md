@@ -349,6 +349,30 @@ packets addressed to us, presence, and unknown types.
   exist to be unlinkable from one another; the main one exists to be findable,
   and is what a favourite hands out. Its derivation label is ours and need not
   match another client's — a peer never re-derives it, it is exchanged.
+- **The private envelope is not NIP-17** (`nostr/envelope.rs`). Upstream states
+  it outright: the construction "is deliberately BitChat-specific and is not
+  NIP-17, NIP-44, or NIP-59 compatible, even though it historically reuses those
+  NIPs' kind numbers (1059/13/14) and a `v2:` content prefix." Implementing the
+  standard would produce something no BitChat client can open. Three layers:
+  rumor (kind 14, unsigned), seal (kind 13, encrypted to the recipient and
+  signed with the sender's real key), gift wrap (kind 1059, encrypted under a
+  throwaway key so relays never learn the sender). Cipher is
+  XChaCha20-Poly1305 over `v2:` + base64url(nonce24 ‖ ct ‖ tag); key is
+  HKDF-SHA256(ikm = shared secret, salt = empty, info = `"nip44-v2"`).
+- **The ECDH input is the compressed point, and both secrets must be
+  parity-normalised.** The shared secret is the 33-byte compressed
+  serialisation, not the SHA-256 of it that libsecp256k1 returns by default.
+  And because a Nostr key is x-only, each side lifts the peer's key to even
+  parity — so each side must normalise *its own* secret the same way
+  (BIP-340's rule, applied to key agreement). Skip that and the two ends
+  compute negations of each other: same x, opposite parity byte, different
+  HKDF output, ciphertext nobody can open. Everything still encrypts and still
+  looks like valid base64, which is why this is checked against a real
+  envelope rather than a round trip.
+- **`tests/fixtures/legacy_private_envelope.json`** is a genuine envelope from
+  upstream's own suite, produced by BitChat release 733098bb. Opening it is the
+  only evidence that separates a correct implementation from two wrong ones
+  agreeing with each other. Keep the test.
 - **Nostr as a DM transport.** Geohash channels already run over Nostr, so the
   client is no longer mesh-only — but private messages are. Upstream selects a
   transport per DM (Bluetooth preferred, Nostr fallback) and queues when neither
