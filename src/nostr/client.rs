@@ -95,6 +95,15 @@ pub enum GeoEvent {
         pubkey: String,
         is_message: bool,
     },
+    /// A verified relay event, still in the exact JSON the relay served, for a
+    /// gateway to put on the mesh.
+    ///
+    /// Emitted only while carrying is switched on. The signature is what makes a
+    /// gateway safe to trust, and it only survives if the bytes do — so this
+    /// carries the original text rather than anything re-encoded from the parsed
+    /// event. Kept off the normal path because a client that is not carrying has
+    /// no use for it and would pay for the clone on every message.
+    Carryable { geohash: String, event_json: String },
     /// A gift wrap addressed to us, still sealed.
     ///
     /// It arrives unopened because this task holds no keys: it speaks the relay
@@ -112,6 +121,9 @@ enum Command {
     StopSampling,
     /// Listen for private mail addressed to one identity.
     SubscribeDirect { pubkey: String, relays: Vec<String> },
+    /// Whether to hand verified channel events back in their original JSON, so
+    /// a gateway can put them on the mesh.
+    SetCarrying(bool),
 }
 
 /// Reserved subscription keys, for the two subscriptions that are not a joined
@@ -251,6 +263,12 @@ impl NostrClient {
             .await;
     }
 
+    /// Starts or stops handing back the original JSON of verified channel
+    /// events. Off by default: only a gateway has any use for it.
+    pub async fn set_carrying(&self, carrying: bool) {
+        let _ = self.commands.send(Command::SetCarrying(carrying)).await;
+    }
+
     /// Posts a gift wrap to the DM relays.
     ///
     /// Silently does nothing until `subscribe_direct` has run, because it
@@ -293,6 +311,8 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
     let mut backlogs: HashMap<String, Backlog> = HashMap::new();
     // Cells the map is currently watching, if any.
     let mut sampler_cells: HashSet<String> = HashSet::new();
+    // Whether a gateway downstream wants the raw JSON of what we verify.
+    let mut carrying = false;
 
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
 
@@ -380,6 +400,7 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
                         }
                         subscriptions.insert(DM_KEY.to_string(), senders);
                     }
+                    Some(Command::SetCarrying(wanted)) => carrying = wanted,
                     Some(Command::StopSampling) => {
                         subscriptions.remove(SAMPLER_KEY);
                         backlogs.remove(SAMPLER_KEY);
@@ -493,6 +514,23 @@ async fn supervisor(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<
                     }
                     continue;
                 }
+                // Offered to a gateway before the backlog buffers anything:
+                // carrying is about getting live traffic onto the mesh, and a
+                // replayed hour of history is not worth the airtime. Sent
+                // outside the backlog for the same reason — it must not be held
+                // back and released in a burst.
+                if carrying && event.kind == KIND_EPHEMERAL && !backlogs.contains_key(&geohash) {
+                    if let Ok(event_json) = serde_json::to_string(&event) {
+                        let offer = GeoEvent::Carryable {
+                            geohash: geohash.clone(),
+                            event_json,
+                        };
+                        if events.send(offer).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+
                 let out = match event.kind {
                     KIND_EPHEMERAL => GeoEvent::Message {
                         geohash: geohash.clone(),
@@ -775,9 +813,10 @@ pub async fn doctor(geohash: &str, seconds: u64) -> i32 {
                     speakers.entry(pubkey.clone()).or_insert_with(|| pubkey[..8].to_string());
                 }
                 // The doctor starts neither the map sampler nor a DM
-                // subscription, so neither can arrive here.
+                // subscription, and never carries, so none of these arrive.
                 GeoEvent::Activity { .. }
                 | GeoEvent::HistoryEnd { .. }
+                | GeoEvent::Carryable { .. }
                 | GeoEvent::PrivateEnvelope { .. } => {}
             },
         }

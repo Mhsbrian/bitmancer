@@ -77,6 +77,13 @@ fn telemetry(app: &App) -> Vec<Span<'static>> {
     ));
     spans.push(Span::raw("  "));
 
+    // Only present while carrying, so the band does not spend width on a mode
+    // that is off — and is impossible to miss while it is on.
+    if let Some(carried) = app.carrying {
+        spans.extend(theme::field("gw", format!("↑{carried:<4}"), theme::LIVE));
+        spans.push(Span::raw("  "));
+    }
+
     spans.extend(theme::field("up", uptime(app.started.elapsed()), theme::TEXT));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(

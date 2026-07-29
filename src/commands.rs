@@ -39,6 +39,8 @@ pub enum CommandOutcome {
     /// a nickname: resolution can fail or be ambiguous, and that is worth
     /// reporting to the user before anything is encrypted.
     SendDirectMessage { target: String, content: String },
+    /// Start or stop carrying other people's geohash traffic to the relays.
+    SetGateway(bool),
     /// Show the card someone standing next to us should read.
     ShowVerificationCard,
     /// Read a card they showed us and, if it holds up, trust the fingerprint.
@@ -199,6 +201,41 @@ pub fn handle(
             format!("Type  {command} confirm  to go ahead."),
         ]),
         "/wipe" | "/panic" => CommandOutcome::WipeIdentity,
+
+        "/gateway" if rest.eq_ignore_ascii_case("on") => CommandOutcome::SetGateway(true),
+        "/gateway" if rest.eq_ignore_ascii_case("off") => CommandOutcome::SetGateway(false),
+        "/gateway" => CommandOutcome::Reply(vec![
+            "Gateway mode shares this machine's internet with the mesh.".to_string(),
+            String::new(),
+            "Nearby peers with a radio but no data hand you geohash messages".to_string(),
+            "they signed themselves; you publish them to the relays and pass".to_string(),
+            "back what the relays send. You are a courier, not a party to it:".to_string(),
+            "every message stays signed by whoever wrote it, so you cannot".to_string(),
+            "read into it or alter it without the far end noticing.".to_string(),
+            String::new(),
+            "What it costs you: your bandwidth, and your address appears on".to_string(),
+            "relays publishing events you did not write.".to_string(),
+            String::new(),
+            // Said here because otherwise the counter reading zero beside a
+            // channel with a dozen people in it looks like a fault. Almost all
+            // geohash traffic is presence beacons — hundreds a minute — and
+            // carrying those would spend the entire airtime budget announcing
+            // that people exist. Conversation is what is worth the radio.
+            "Only conversation is carried, not presence. A busy channel with".to_string(),
+            "nobody talking has nothing to carry, so the counter stays at zero.".to_string(),
+            String::new(),
+            format!(
+                "Currently: {}",
+                if mesh.gateway_ready {
+                    "carrying, and advertised to nearby peers"
+                } else {
+                    "not carrying"
+                }
+            ),
+            String::new(),
+            "  /gateway on     start carrying".to_string(),
+            "  /gateway off    stop, and drop anything still held".to_string(),
+        ]),
 
         "/verify" if rest.is_empty() => {
             let verified = mesh.verified_labels();
@@ -385,6 +422,7 @@ fn help_text() -> Vec<String> {
         "  /fav <nick>           Favourite someone: hands them your Nostr".to_string(),
         "                        address, so you stay reachable out of range".to_string(),
         "  /verify               Check a peer is who you think, in person".to_string(),
+        "  /gateway on|off       Share your internet with nearby mesh peers".to_string(),
         "  /send <path>          Send a file to everyone on the mesh".to_string(),
         "  /block <nick>         Refuse everything from a peer".to_string(),
         "  /status               Link, peer and identity info".to_string(),

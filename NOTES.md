@@ -438,6 +438,56 @@ only stored thing that costs a walk across town to rebuild, so it persists in
   that is not ours — otherwise a peer collects our signature over a claim about
   a third party.
 
+## Gateway mode: sharing this machine's internet with the mesh
+
+A phone in a crowd often has a radio and no data. This client usually runs on
+something with mains power, a real connection and six BLE links, so `/gateway on`
+turns that asymmetry into infrastructure: mesh-only peers hand us geohash events
+they signed themselves, we publish them, and we hand back what the relays send.
+
+**We are a courier, not a party.** Every carried event is a complete signed Nostr
+event whose contents are public geohash chat, already plaintext on relays. Keys
+never leave the originating device; we cannot forge or alter anything, because
+the signature is checked before we act and again by the relays and receivers.
+Carrying adds reach without adding trust — which is the whole security argument,
+and why `gateway.rs` is a policy engine rather than a crypto one.
+
+- **Three loop-prevention sets, each a bug someone already had.** Traffic learned
+  from another gateway's broadcast is never re-published or re-broadcast, or two
+  gateways hand it back and forth until the TTL runs out. An event is published
+  once. And an event we published is *never* rebroadcast — upstream names this
+  one: our own subscription returns what we just sent, and putting it back on the
+  air spends airtime returning a message to the peer that wrote it.
+- **Direction must agree with addressing.** `toGateway` rides a directed packet
+  because it is a request of *us*; accepting a broadcast one would have every
+  gateway publish the same event. `fromGateway` rides a broadcast because it is
+  for everyone; accepting it directed would let one peer feed us a private
+  version of a channel.
+- **The offer is advertised only while relays actually answer**, and withdrawn
+  when they stop. A standing claim is a promise every mesh-only peer in range
+  acts on and nobody keeps.
+- **Only conversation is carried, not presence.** Presence is ~99% of geohash
+  traffic — hundreds of beacons a minute — and would spend the whole airtime
+  budget announcing that people exist. This is worth stating in the UI: a channel
+  with twelve people and no chat carries nothing, and a counter reading zero next
+  to a busy channel otherwise looks like a fault. Verified against live relays:
+  `#ey` served 326 presence beacons and zero messages in 25 seconds.
+- **The carrier's TLV lengths are 2-byte big-endian**, the only place in this
+  codebase that is so, because an event JSON blob does not fit in one byte. Its
+  unknown fields are *skipped*, unlike `PrivateMessagePacket` where an
+  unrecognised record aborts the whole thing. The capability bits next door are
+  little-endian. All three conventions are deliberate and all three are pinned by
+  tests asserting literal bytes.
+- **Deposits are held through a relay outage** and sent when it clears, bounded
+  per peer and overall, dropping the oldest rather than refusing the newest.
+  Queued deposits still count against the rate budget, or a peer could wait for
+  the relays to blink and then flood. Switching off drops the mailbag, because
+  those deposits were made on a promise just withdrawn.
+- **Not done: the mesh-only side.** We can be the gateway; we cannot yet be the
+  peer that uses one. That needs relay-reachability detection driving a
+  `toGateway` deposit, and consuming `fromGateway` as chat — with dedup against
+  our own relay subscription, which currently lives inside the supervisor task.
+
 ## What is not done
 - **A favourite is an address exchange, not a bookmark** (`favorites.rs`).
   Upstream sends it as the *content of an ordinary private message* —

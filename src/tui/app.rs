@@ -170,6 +170,13 @@ pub struct App {
     pub map: crate::tui::map::MapState,
     /// Geohash channels currently joined, so the map can mark them.
     pub joined_geohashes: std::collections::HashSet<String>,
+    /// How much of other people's traffic we have carried, and `None` when we
+    /// are not carrying at all.
+    ///
+    /// On the status band rather than behind a command: this mode spends the
+    /// user's bandwidth and puts their address on relays for messages they did
+    /// not write, and a mode like that should not be possible to forget.
+    pub carrying: Option<usize>,
     /// Set when the map asks to join the cell under the cursor.
     pub pending_geohash_join: Option<String>,
     /// Recognises floods of arriving lines so they do not all light up.
@@ -354,6 +361,7 @@ impl App {
             map_open: false,
             map: crate::tui::map::MapState::new(),
             joined_geohashes: std::collections::HashSet::new(),
+            carrying: None,
             pending_geohash_join: None,
         };
         

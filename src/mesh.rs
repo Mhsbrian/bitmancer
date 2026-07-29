@@ -12,6 +12,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::announce::{self, Announcement};
 use crate::compression;
+use crate::nostr::carrier;
 use crate::favorites::{FavoriteNotice, Favorites};
 use crate::file_packet::FilePacket;
 use crate::fragment::{self, Append, Assembler};
@@ -53,6 +54,20 @@ pub enum MeshEvent {
         nickname: String,
         fingerprint: String,
         notice: FavoriteNotice,
+    },
+    /// A signed Nostr event a peer handed us over Bluetooth, either asking us
+    /// to publish it or passing on what a gateway published.
+    ///
+    /// Surfaced rather than acted on here: whether to carry it depends on relay
+    /// reachability and a user toggle, neither of which the mesh layer can see.
+    /// The signature is deliberately *not* checked yet — the caller does that,
+    /// because the caller is the one that would act on it.
+    CarriedEvent {
+        /// Who handed it to us, so a rate budget can be spent per peer.
+        depositor: String,
+        direction: carrier::Direction,
+        geohash: String,
+        event_json: String,
     },
     /// A message we sent has been acknowledged.
     DeliveryUpdate {
@@ -935,6 +950,70 @@ impl MeshService {
         }
     }
 
+    /// A carried Nostr event, from a peer asking us to publish it or from a
+    /// gateway passing on what it published.
+    ///
+    /// The direction has to agree with how the packet was addressed. A
+    /// `toGateway` request rides a directed packet because it is a request of
+    /// *us*; accepting a broadcast one would mean every gateway on the mesh
+    /// publishing the same event. A `fromGateway` announcement rides a
+    /// broadcast because it is for everyone; accepting it directed would let one
+    /// peer feed us a channel privately.
+    fn handle_carrier(&mut self, packet: &Packet, sender: &str) -> Vec<MeshEvent> {
+        let Some(carried) = carrier::Carrier::decode(&packet.payload) else {
+            return vec![MeshEvent::Trace(format!(
+                "unreadable carrier from {}",
+                short_display(sender)
+            ))];
+        };
+
+        let directed = self.addressed_to_us(packet);
+        let addressing_agrees = match carried.direction {
+            carrier::Direction::ToGateway => directed,
+            carrier::Direction::FromGateway => packet.is_broadcast(),
+            // Island bridging, which we do not do. Named so it is recognised
+            // and dropped rather than counted as malformed.
+            carrier::Direction::ToBridge | carrier::Direction::FromBridge => {
+                return vec![MeshEvent::Trace(format!(
+                    "bridge carrier from {} ignored",
+                    short_display(sender)
+                ))]
+            }
+        };
+        if !addressing_agrees {
+            return vec![MeshEvent::Trace(format!(
+                "carrier from {} was addressed the wrong way for its direction",
+                short_display(sender)
+            ))];
+        }
+
+        vec![MeshEvent::CarriedEvent {
+            depositor: sender.to_string(),
+            direction: carried.direction,
+            geohash: carried.geohash,
+            event_json: carried.event_json,
+        }]
+    }
+
+    /// Wraps a signed event for the mesh, either as a request to a gateway or as
+    /// a gateway's announcement to everyone.
+    pub fn carrier_frame(
+        &self,
+        carried: &carrier::Carrier,
+        recipient: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let mut packet = Packet::new(
+            MessageType::NostrCarrier,
+            self.sender_bytes(),
+            carried.encode(),
+            MESSAGE_TTL,
+        );
+        if let Some(recipient) = recipient {
+            packet = packet.with_recipient(peer_id_to_bytes(recipient));
+        }
+        packet.encode()
+    }
+
     /// Encrypted traffic is point-to-point. A frame addressed to someone else
     /// is not ours to open, and answering a broadcast handshake would announce
     /// our presence to anyone who asked.
@@ -1110,6 +1189,7 @@ impl MeshService {
             Some(MessageType::Message) => self.handle_public_message(&packet),
             Some(MessageType::Leave) => self.handle_leave(&sender),
             Some(MessageType::FileTransfer) => self.handle_file(&packet),
+            Some(MessageType::NostrCarrier) => self.handle_carrier(&packet, &sender),
             Some(MessageType::NoiseHandshake) => self.handle_noise_handshake(&packet),
             Some(MessageType::NoiseEncrypted) => self.handle_noise_encrypted(&packet),
             Some(_) => Vec::new(),
@@ -2560,6 +2640,161 @@ mod favorite_tests {
             alice.favorites.nostr_key_for(&bob_fp),
             Some("npub1bob")
         );
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+    use crate::nostr::carrier::{Carrier, Direction};
+
+    fn signed_event() -> crate::nostr::event::Event {
+        use secp256k1::{Keypair, SecretKey, SECP256K1};
+        let secret = SecretKey::from_byte_array([9u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
+        crate::nostr::event::Event::signed(
+            &keypair,
+            1_700_000_000,
+            crate::nostr::event::KIND_EPHEMERAL,
+            crate::nostr::event::geohash_tags("9q", Some("phone"), false),
+            "no data, but a radio".into(),
+        )
+    }
+
+    #[test]
+    fn a_deposit_reaches_the_gateway_with_its_signature_intact() {
+        // The whole path: a peer with no internet signs locally, hands the
+        // finished event over Bluetooth, and the gateway can still prove who
+        // wrote it. If the JSON did not survive byte-for-byte the signature
+        // would fail at the relay, not here.
+        let phone = MeshService::new([21; 32], [22; 32], "phone");
+        let mut gateway = MeshService::new([11; 32], [12; 32], "laptop");
+        let event = signed_event();
+        let json = serde_json::to_string(&event).unwrap();
+
+        let carried = Carrier::new(Direction::ToGateway, "9q", &json).unwrap();
+        let frame = phone
+            .carrier_frame(&carried, Some(&gateway.my_peer_id))
+            .expect("a directed carrier");
+
+        let events = gateway.handle_frame(&frame);
+        let deposit = events
+            .iter()
+            .find_map(|event| match event {
+                MeshEvent::CarriedEvent {
+                    depositor,
+                    direction,
+                    geohash,
+                    event_json,
+                } => Some((depositor, direction, geohash, event_json)),
+                _ => None,
+            })
+            .expect("the gateway sees the deposit");
+
+        assert_eq!(deposit.0, &phone.my_peer_id);
+        assert_eq!(*deposit.1, Direction::ToGateway);
+        assert_eq!(deposit.2, "9q");
+        let arrived: crate::nostr::event::Event = serde_json::from_str(deposit.3).unwrap();
+        assert_eq!(arrived, event);
+        assert!(arrived.verify(), "still provably theirs");
+    }
+
+    #[test]
+    fn a_request_to_publish_must_be_addressed_to_us() {
+        // Broadcast it and every gateway on the mesh publishes the same event.
+        // The direction and the addressing have to agree.
+        let phone = MeshService::new([21; 32], [22; 32], "phone");
+        let mut gateway = MeshService::new([11; 32], [12; 32], "laptop");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        let carried = Carrier::new(Direction::ToGateway, "9q", &json).unwrap();
+        let broadcast = phone.carrier_frame(&carried, None).unwrap();
+
+        assert!(
+            !gateway
+                .handle_frame(&broadcast)
+                .iter()
+                .any(|event| matches!(event, MeshEvent::CarriedEvent { .. })),
+            "a broadcast request to publish is not a request of anyone"
+        );
+    }
+
+    #[test]
+    fn an_announcement_to_the_mesh_must_not_be_directed() {
+        // Directed, it would let one peer feed us a channel privately — a
+        // version of the world only we can see.
+        let carrier_peer = MeshService::new([21; 32], [22; 32], "gateway");
+        let mut phone = MeshService::new([11; 32], [12; 32], "phone");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        let carried = Carrier::new(Direction::FromGateway, "9q", &json).unwrap();
+        let directed = carrier_peer
+            .carrier_frame(&carried, Some(&phone.my_peer_id))
+            .unwrap();
+
+        assert!(
+            !phone
+                .handle_frame(&directed)
+                .iter()
+                .any(|event| matches!(event, MeshEvent::CarriedEvent { .. }))
+        );
+    }
+
+    #[test]
+    fn a_gateways_announcement_reaches_everyone() {
+        let gateway = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut phone = MeshService::new([11; 32], [12; 32], "phone");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        let carried = Carrier::new(Direction::FromGateway, "9q", &json).unwrap();
+        let frame = gateway.carrier_frame(&carried, None).unwrap();
+
+        let seen = phone.handle_frame(&frame);
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            MeshEvent::CarriedEvent {
+                direction: Direction::FromGateway,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn bridge_traffic_is_recognised_and_left_alone() {
+        // We do not bridge islands. Naming the directions means this is dropped
+        // as "not ours" rather than counted as a malformed carrier, which is the
+        // difference between a quiet log and a noisy one.
+        let island = MeshService::new([21; 32], [22; 32], "island");
+        let mut us = MeshService::new([11; 32], [12; 32], "us");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        for direction in [Direction::ToBridge, Direction::FromBridge] {
+            let carried = Carrier::new(direction, "9q", &json).unwrap();
+            let frame = island.carrier_frame(&carried, Some(&us.my_peer_id)).unwrap();
+            assert!(
+                !us.handle_frame(&frame)
+                    .iter()
+                    .any(|event| matches!(event, MeshEvent::CarriedEvent { .. })),
+                "{direction:?} is not ours to act on"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_carrier_is_not_fatal() {
+        let mut us = MeshService::new([11; 32], [12; 32], "us");
+        let packet = Packet::new(
+            MessageType::NostrCarrier,
+            peer_id_to_bytes("aa11bb22cc33dd44"),
+            vec![0xFF; 24],
+            7,
+        )
+        .with_recipient(peer_id_to_bytes(&us.my_peer_id));
+        let frame = packet.encode().unwrap();
+        assert!(!us
+            .handle_frame(&frame)
+            .iter()
+            .any(|event| matches!(event, MeshEvent::CarriedEvent { .. })));
     }
 }
 

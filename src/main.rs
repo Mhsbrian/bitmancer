@@ -11,6 +11,7 @@ mod discovery;
 mod file_packet;
 mod favorites;
 mod fragment;
+mod gateway;
 mod geo;
 mod geohash;
 mod media;
@@ -210,6 +211,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // count: a packet may go to every link except the one it arrived on.
     let mut links: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut forwarded = relay::Forwarded::default();
+    // Gateway mode: off until asked, and only advertised while the relays are
+    // actually answering.
+    let mut carrier = gateway::Gateway::new();
+    let mut relays_up = false;
+    // Relays currently answering. Held as a set rather than a count so a
+    // repeated failure from one host cannot take the whole gateway down.
+    let mut live_relays: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // How much we have carried this session, for the readout.
+    let mut carried_out = 0usize;
     // Whether the map sampler is currently running, so it can be torn down
     // exactly once when the map closes.
     let mut sampling = false;
@@ -254,14 +264,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // decision needs the raw frame and the link it came from.
                     let onward = relay_plan(&mesh, &data, &link, &links, &mut forwarded);
                     for mesh_event in mesh.handle_frame(&data) {
-                        // A handshake reply originates down in the mesh layer
-                        // rather than from a user action, so it has to be put
-                        // on the air here.
-                        if let MeshEvent::Send(outgoing) = mesh_event {
-                            let _ = transport.outbound.send(Outbound::All(outgoing)).await;
-                            continue;
+                        match mesh_event {
+                            // A handshake reply originates down in the mesh
+                            // layer rather than from a user action, so it has
+                            // to be put on the air here.
+                            MeshEvent::Send(outgoing) => {
+                                let _ = transport.outbound.send(Outbound::All(outgoing)).await;
+                            }
+                            MeshEvent::CarriedEvent {
+                                depositor,
+                                direction,
+                                geohash,
+                                event_json,
+                            } => {
+                                if let Some(event) = uplink(
+                                    &mut app,
+                                    &mut carrier,
+                                    &depositor,
+                                    direction,
+                                    &geohash,
+                                    &event_json,
+                                    relays_up,
+                                ) {
+                                    nostr_client.publish(&geohash, event).await;
+                                }
+                            }
+                            other => apply_mesh_event(&mut app, other, &mut last_notice),
                         }
-                        apply_mesh_event(&mut app, mesh_event, &mut last_notice);
                     }
                     if let Some(forwarded) = onward {
                         let _ = transport
@@ -617,11 +646,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                CommandOutcome::SetGateway(wanted) => {
+                    let dropped = carrier.set_enabled(wanted);
+                    // The relay pool only hands back raw event JSON while we are
+                    // carrying, so the toggle reaches it too.
+                    nostr_client.set_carrying(wanted).await;
+                    // Re-announce immediately: the capability bit is what tells
+                    // mesh-only peers they can start depositing, and waiting for
+                    // the next scheduled announce would leave the offer unheard
+                    // for up to the announce interval.
+                    mesh.gateway_ready = wanted && relays_up;
+                    if let Some(frame) = mesh.announce_frame() {
+                        let _ = transport.outbound.send(Outbound::All(frame)).await;
+                    }
+                    if wanted {
+                        app.add_log_message(if relays_up {
+                            "system: carrying mesh traffic to the relays. Nearby peers with no data can now use your connection.".to_string()
+                        } else {
+                            "system: gateway mode is on, but no relay is answering yet — the offer is not advertised until one does.".to_string()
+                        });
+                    } else {
+                        app.add_log_message("system: no longer carrying mesh traffic.".to_string());
+                        if dropped > 0 {
+                            app.add_log_message(format!(
+                                "system: dropped {dropped} message(s) that were waiting; their senders were told nothing, so they will retry."
+                            ));
+                        }
+                    }
+                }
                 CommandOutcome::ShowVerificationCard => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|since| since.as_secs() as i64)
-                        .unwrap_or_default();
+                    let now = epoch_seconds();
                     let card = mesh.verification_card(
                         Some(&geo.main_nostr_npub()),
                         now,
@@ -638,10 +692,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 CommandOutcome::AcceptVerificationCard(url) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|since| since.as_secs() as i64)
-                        .unwrap_or_default();
+                    let now = epoch_seconds();
                     let outcome = verification::Card::from_url(&url)
                         .and_then(|card| card.check(now).map(|()| card));
                     match outcome {
@@ -801,6 +852,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 continue;
             }
+            // A verified channel event, offered for the mesh. Only reaches here
+            // while carrying is on.
+            if let GeoEvent::Carryable {
+                geohash,
+                event_json,
+            } = &geo_event
+            {
+                // Built before the policy is consulted, so an event too large
+                // for the air is refused by the format rather than counted
+                // against the airtime budget and then dropped.
+                let carried = nostr::carrier::Carrier::new(
+                    nostr::carrier::Direction::FromGateway,
+                    geohash,
+                    event_json,
+                );
+                if let Some(carried) = carried {
+                    if let Some(event) = carried.event() {
+                        if carrier.accept_downlink(&event.id, epoch_seconds())
+                            == gateway::Downlink::Broadcast
+                        {
+                            if let Some(frame) = mesh.carrier_frame(&carried, None) {
+                                let _ = transport.outbound.send(Outbound::All(frame)).await;
+                                carried_out += 1;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            // Relay reachability decides whether we can honestly claim to be a
+            // gateway, so it is observed rather than assumed: a client that
+            // advertises `gateway` with nothing to publish to has made a promise
+            // every mesh-only peer in range will act on.
+            match &geo_event {
+                GeoEvent::RelayConnected { relay, .. } => {
+                    live_relays.insert(relay.clone());
+                }
+                GeoEvent::RelayFailed { relay, .. } => {
+                    live_relays.remove(relay);
+                }
+                _ => {}
+            }
+            relays_up = !live_relays.is_empty();
             apply_geo_event(&mut app, &mut geo, geo_event, &mut relay_health);
         }
 
@@ -819,9 +913,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (target, event) in geo.due_presence() {
                 nostr_client.publish(&target, event).await;
             }
+
+            // The offer has to track reality: relays come and go, and a claim
+            // left standing while they are gone is one a mesh-only peer acts on
+            // and nobody keeps.
+            let offering = carrier.is_enabled() && relays_up;
+            if offering != mesh.gateway_ready {
+                mesh.gateway_ready = offering;
+                if let Some(frame) = mesh.announce_frame() {
+                    let _ = transport.outbound.send(Outbound::All(frame)).await;
+                }
+                app.add_log_message(if offering {
+                    "system: relays are answering; now advertising as a gateway.".to_string()
+                } else {
+                    "system: no relay is answering; withdrew the gateway offer.".to_string()
+                });
+            }
+            // Mail held through an outage. Sent now rather than dropped: the
+            // depositor was told we would carry it.
+            if offering && carrier.held_count() > 0 {
+                let waiting = carrier.take_held();
+                app.add_log_message(format!(
+                    "system: relays are back; sending {} held message(s).",
+                    waiting.len()
+                ));
+                for held in waiting {
+                    if let Ok(event) =
+                        serde_json::from_str::<nostr::event::Event>(&held.event_json)
+                    {
+                        nostr_client.publish(&held.geohash, event).await;
+                        carried_out += 1;
+                    }
+                }
+            }
             geo.prune_participants();
         }
         sync_people(&mut app, &mesh, &geo);
+        // Reflected every frame rather than set at the toggle: the count climbs
+        // as traffic is carried, and the band is the only place it shows.
+        app.carrying = carrier.is_enabled().then_some(carried_out);
 
         // 6. Draw.
         // Read receipts, sent for whatever the user is actually looking at.
@@ -1035,6 +1165,9 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             let clock = chrono::Local::now().format("%H%M");
             app.add_log_message(format!("__DM__:{sender}:{clock}:{message_id}:{content}"));
         }
+        // Handled in the frame loop, where the gateway policy, the relay pool
+        // and the toggle are all in scope. Nothing routes one here.
+        MeshEvent::CarriedEvent { .. } => {}
         MeshEvent::SessionUp {
             nickname,
             fingerprint,
@@ -1112,6 +1245,83 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             }
         }
         MeshEvent::Trace(text) => app.add_log_message(format!("system: {text}")),
+    }
+}
+
+/// Seconds since the epoch, or zero if the clock is before it.
+fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// Decides whether to publish an event a peer handed us, and returns it when the
+/// answer is yes.
+///
+/// The signature is checked here, before the policy is even consulted. That
+/// check is the entire reason a gateway is safe to use: we are a courier who
+/// cannot open or alter the parcel, and a courier who does not look at the seal
+/// is just a peer with our bandwidth.
+#[allow(clippy::too_many_arguments)]
+fn uplink(
+    app: &mut App,
+    carrier: &mut gateway::Gateway,
+    depositor: &str,
+    direction: nostr::carrier::Direction,
+    geohash: &str,
+    event_json: &str,
+    relays_up: bool,
+) -> Option<nostr::event::Event> {
+    let now = epoch_seconds();
+    let Ok(event) = serde_json::from_str::<nostr::event::Event>(event_json) else {
+        return None;
+    };
+    if !event.verify() {
+        // Worth a line: a neighbour handing us unverifiable events is either
+        // broken or trying something, and either way we are the only one who
+        // can see it happening.
+        app.add_log_message(format!(
+            "system: refused an unsigned carried event from {}",
+            peer_id::short_display(depositor)
+        ));
+        return None;
+    }
+
+    match direction {
+        // Someone else's gateway announcing to the mesh. We only note it, so
+        // neither of us hands it back to the other — see gateway.rs. Reading it
+        // as *chat* is the mesh-only role, which needs no internet and is not
+        // what this client is doing here.
+        nostr::carrier::Direction::FromGateway => {
+            carrier.note_carried_on_mesh(&event.id);
+            None
+        }
+        nostr::carrier::Direction::ToGateway => {
+            match carrier.accept_uplink(
+                depositor,
+                geohash,
+                &event.id,
+                event_json,
+                event.created_at,
+                now,
+                relays_up,
+            ) {
+                gateway::Uplink::Publish => Some(event),
+                // Held until the relays answer. Said out loud because the
+                // depositor cannot tell the difference between waiting and lost.
+                gateway::Uplink::Queued => {
+                    app.add_log_message(format!(
+                        "system: holding a message for #{geohash} until the relays answer ({} waiting)",
+                        carrier.held_count()
+                    ));
+                    None
+                }
+                gateway::Uplink::Refused(_) => None,
+            }
+        }
+        // Island bridging, which the mesh layer already declined to hand us.
+        _ => None,
     }
 }
 
@@ -1378,10 +1588,9 @@ fn apply_geo_event(
             pubkey,
             is_message,
         } => app.map.note_voice(&geohash, &pubkey, is_message),
-        // Opened by the caller, which holds the identity keys and the record of
-        // what has already been acted on. Nothing subscribes to private mail
-        // yet, so nothing reaches here.
-        GeoEvent::PrivateEnvelope { .. } => {}
+        // Both are handled in the loop, where the identity keys, the gateway
+        // policy and the radio are in scope. Nothing routes one here.
+        GeoEvent::PrivateEnvelope { .. } | GeoEvent::Carryable { .. } => {}
     }
 }
 

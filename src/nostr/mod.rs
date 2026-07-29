@@ -4,6 +4,7 @@
 // NIP-01 events, per-geohash identities, NIP-13 proof of work, and a relay
 // pool. Nothing here touches the BLE mesh — geohash channels ride the internet.
 
+pub mod carrier;
 pub mod client;
 pub mod embedded;
 pub mod envelope;
