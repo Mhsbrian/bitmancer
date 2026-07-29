@@ -377,7 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 CommandOutcome::SetFavorite { target, favorite } => {
-                    let our_key = geo.main_nostr_pubkey();
+                    let our_key = geo.main_nostr_npub();
                     match mesh.favorite_frames(&target, favorite, &our_key) {
                         Ok(sent) => {
                             for frame in sent.frames {
@@ -493,6 +493,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(reason) => app.add_log_message(format!("system: {reason}")),
                 },
                 CommandOutcome::SendDirectMessage { target, content } => {
+                    // Which way to send. A peer we can currently see takes the
+                    // radio, and not only because it is faster: a message that
+                    // never leaves the local mesh tells no relay the
+                    // conversation exists.
+                    let present = mesh.peers.contains_key(&target);
+                    let address = mesh.nostr_address_for(&target).map(str::to_string);
+                    if matches!(outbox::route(present, address.as_deref()), outbox::Route::Nostr) {
+                        let address = address.expect("Route::Nostr means we hold an address");
+                        match send_over_nostr(&mut geo, &mesh, &address, &target, &content) {
+                            Some((event, message_id)) => {
+                                nostr_client.publish_direct(event).await;
+                                let clock = chrono::Local::now().format("%H%M");
+                                let who = mesh
+                                    .favorites
+                                    .resolve(&target)
+                                    .map(|(_, entry)| entry.nickname.clone())
+                                    .filter(|nickname| !nickname.is_empty())
+                                    .unwrap_or_else(|| target.clone());
+                                app.add_log_message(format!(
+                                    "__DM_SENT__:{who}:{clock}:{message_id}:{content}"
+                                ));
+                                app.add_log_message(format!(
+                                    "system: {who} is out of range; sent over the internet."
+                                ));
+                            }
+                            None => app.add_log_message(
+                                "system: could not address that peer over the internet; their stored address is unreadable.".to_string(),
+                            ),
+                        }
+                        continue;
+                    }
                     match mesh.dm_frames(&target, &content) {
                         Ok(sent) => {
                             for frame in sent.frames {
@@ -1055,6 +1086,31 @@ fn open_private_envelope(
         // `payload_of` already refused everything else.
         _ => None,
     }
+}
+
+/// Frames and seals a private message for a peer we cannot see.
+///
+/// Returns the event to post and the id it was sent under, so the local echo
+/// can be ticked by a receipt that arrives later — possibly over the radio, if
+/// they walk back into range before answering.
+fn send_over_nostr(
+    geo: &mut GeoService,
+    mesh: &MeshService,
+    their_address: &str,
+    their_peer_id: &str,
+    content: &str,
+) -> Option<(nostr::event::Event, String)> {
+    // Their address arrives as bech32 from upstream and as hex from us.
+    let recipient = nostr::npub::to_bytes(their_address)?;
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let framed = nostr::embedded::private_message(
+        &message_id,
+        content,
+        &mesh.my_peer_id,
+        their_peer_id,
+    )?;
+    let event = seal_for(&framed, &hex::encode(recipient), &geo.main_nostr_keypair())?;
+    Some((event, message_id))
 }
 
 /// Seals `content` for one recipient, drawing the fresh randomness every

@@ -322,6 +322,40 @@ impl MeshService {
         }
     }
 
+    /// Resolves a name to something we can address, whether or not the peer is
+    /// in range.
+    ///
+    /// Live peers win, then favourites. Without the second step the internet
+    /// transport is unreachable by design: `/dm bob` would answer "nobody here
+    /// is called bob" for exactly the peer it exists to carry a message to.
+    /// A favourite's fingerprint begins with their peer ID, so the caller gets
+    /// the same kind of value from either source.
+    pub fn addressable_peer_id_for(&self, nickname: &str) -> Result<String, String> {
+        if let Ok(peer_id) = self.peer_id_for_nickname(nickname) {
+            return Ok(peer_id);
+        }
+        match self.favorites.by_nickname(nickname).as_slice() {
+            [] => Err(format!("nobody here is called {nickname}")),
+            [(fingerprint, _)] => Ok(fingerprint.chars().take(16).collect()),
+            several => Err(format!(
+                "{} favourites are called {nickname}; use a peer ID instead ({})",
+                several.len(),
+                several
+                    .iter()
+                    .map(|(fingerprint, _)| short_display(fingerprint))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Their long-lived Nostr address, if they ever handed it over.
+    pub fn nostr_address_for(&self, peer_id: &str) -> Option<&str> {
+        self.favorites
+            .resolve(peer_id)
+            .and_then(|(_, entry)| entry.their_nostr_key.as_deref())
+    }
+
     /// Forgets every peer, session and block.
     ///
     /// The static secret cannot be dropped from a live service, so this is not
@@ -2368,6 +2402,78 @@ mod favorite_tests {
         assert_eq!(
             alice.favorites.nostr_key_for(&bob_fp),
             Some("npub1bob")
+        );
+    }
+}
+
+#[cfg(test)]
+mod addressing_tests {
+    use super::*;
+
+    #[test]
+    fn a_favourite_can_be_addressed_after_they_go_out_of_range() {
+        // The case the internet transport exists for. Before this, /dm to an
+        // absent peer answered "nobody here is called bob" — so the fallback
+        // path could never be reached at all.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let fingerprint = "aa11bb22cc33dd44ee55";
+        mesh.favorites.apply_notice(
+            fingerprint,
+            "bob",
+            &crate::favorites::FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1bob".into()),
+            },
+        );
+        assert!(
+            mesh.peers.is_empty(),
+            "nobody is in range; this is the whole point"
+        );
+
+        let target = mesh
+            .addressable_peer_id_for("bob")
+            .expect("a favourite is addressable without being present");
+        assert_eq!(target, "aa11bb22cc33dd44", "the peer ID prefixes the fingerprint");
+        assert_eq!(mesh.nostr_address_for(&target), Some("npub1bob"));
+    }
+
+    #[test]
+    fn a_present_peer_is_preferred_over_a_stored_one() {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+        let live = bob.my_peer_id.clone();
+
+        // A stale favourite under the same nickname must not shadow the peer
+        // who is actually here.
+        alice.favorites.apply_notice(
+            "ffffffffffffffffffff",
+            "bob",
+            &crate::favorites::FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1stale".into()),
+            },
+        );
+        assert_eq!(alice.addressable_peer_id_for("bob").unwrap(), live);
+    }
+
+    #[test]
+    fn an_unknown_name_is_still_an_error() {
+        let mesh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(mesh.addressable_peer_id_for("nobody").is_err());
+        assert!(mesh.nostr_address_for("aa11bb22cc33dd44").is_none());
+    }
+
+    #[test]
+    fn a_favourite_without_an_address_has_no_internet_route() {
+        // We favourited them, so they can reach us; they never favourited us,
+        // so we have nothing to send to. Addressable by name, not by relay.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        mesh.favorites.set_ours("aa11bb22cc33dd44ee55", "carol", true);
+        let target = mesh.addressable_peer_id_for("carol").unwrap();
+        assert!(
+            mesh.nostr_address_for(&target).is_none(),
+            "no address means the message waits, not that it is sent nowhere"
         );
     }
 }

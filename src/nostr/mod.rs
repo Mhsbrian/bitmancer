@@ -9,6 +9,7 @@ pub mod embedded;
 pub mod envelope;
 pub mod event;
 pub mod identity;
+pub mod npub;
 pub mod pow;
 pub mod processed;
 pub mod relay;

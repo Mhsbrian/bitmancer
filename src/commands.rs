@@ -132,7 +132,7 @@ pub fn handle(
             let target = if mesh.peers.contains_key(who) {
                 Ok(who.to_string())
             } else {
-                mesh.peer_id_for_nickname(who)
+                mesh.addressable_peer_id_for(who)
             };
             match target {
                 Ok(target) => CommandOutcome::SendDirectMessage {

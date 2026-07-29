@@ -78,6 +78,19 @@ impl GeoService {
         self.identities.main_pubkey_hex()
     }
 
+    /// The same address in the spelling other clients hand out.
+    ///
+    /// Upstream appends `npub` to a favourite notification, and while its
+    /// reader also accepts raw hex, an address is a thing people copy and
+    /// compare. Sending the form everything else in the ecosystem prints keeps
+    /// ours recognisable as the same key.
+    pub fn main_nostr_npub(&mut self) -> String {
+        let hex = self.identities.main_pubkey_hex();
+        crate::nostr::npub::to_bytes(&hex)
+            .and_then(|bytes| crate::nostr::npub::from_bytes(&bytes))
+            .unwrap_or(hex)
+    }
+
     /// The secret half of that address, for opening private mail and signing
     /// the seal inside it.
     ///

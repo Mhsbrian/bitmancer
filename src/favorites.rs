@@ -145,6 +145,40 @@ impl Favorites {
             .and_then(|entry| entry.their_nostr_key.as_deref())
     }
 
+    /// Finds a relationship from a peer ID or a full fingerprint.
+    ///
+    /// The table is keyed by fingerprint but the client addresses peers by peer
+    /// ID, which is the fingerprint's first 16 hex characters. Matching on that
+    /// prefix reuses the protocol's own assumption that 64 bits of hash name a
+    /// peer — the same one peer IDs already rest on — rather than inventing a
+    /// weaker one, and it is how `is_blocked` answers the same question.
+    pub fn resolve(&self, peer_id_or_fingerprint: &str) -> Option<(&str, &Relationship)> {
+        let needle = peer_id_or_fingerprint.to_lowercase();
+        self.by_fingerprint
+            .iter()
+            .find(|(fingerprint, _)| {
+                fingerprint.starts_with(&needle) || needle.starts_with(*fingerprint)
+            })
+            .map(|(fingerprint, entry)| (fingerprint.as_str(), entry))
+    }
+
+    /// Everyone we could reach over the internet, by nickname.
+    ///
+    /// Used to address someone who has walked out of radio range: the peer list
+    /// has forgotten them, but this table keeps the nickname and the address.
+    pub fn by_nickname(&self, nickname: &str) -> Vec<(&str, &Relationship)> {
+        let mut found: Vec<(&str, &Relationship)> = self
+            .by_fingerprint
+            .iter()
+            .filter(|(_, entry)| entry.nickname.eq_ignore_ascii_case(nickname))
+            .map(|(fingerprint, entry)| (fingerprint.as_str(), entry))
+            .collect();
+        // Stable order, so a name shared by two people reports the same pair
+        // every run rather than whichever the hash iterated to first.
+        found.sort_by_key(|(fingerprint, _)| *fingerprint);
+        found
+    }
+
     /// Fingerprint behind a Nostr address, for routing an inbound DM back to a
     /// mesh identity.
     #[allow(dead_code)]
@@ -317,6 +351,54 @@ mod tests {
         );
         assert_eq!(favorites.fingerprint_for_nostr_key("npub1bob"), Some(FP));
         assert!(favorites.fingerprint_for_nostr_key("npub1nobody").is_none());
+    }
+
+    #[test]
+    fn a_peer_id_finds_the_fingerprint_it_prefixes() {
+        // The client addresses peers by the 16-character peer ID; this table is
+        // keyed by the full fingerprint it is a prefix of.
+        let full = "aa11bb22cc33dd44ee55ff66";
+        let peer_id = "aa11bb22cc33dd44";
+        let mut favorites = Favorites::new();
+        favorites.apply_notice(
+            full,
+            "bob",
+            &FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1bob".into()),
+            },
+        );
+
+        let (found, entry) = favorites.resolve(peer_id).expect("a peer ID resolves");
+        assert_eq!(found, full);
+        assert_eq!(entry.their_nostr_key.as_deref(), Some("npub1bob"));
+        // And the whole thing still works.
+        assert!(favorites.resolve(full).is_some());
+        assert!(favorites.resolve("ffffffffffffffff").is_none());
+    }
+
+    #[test]
+    fn a_favourite_is_reachable_by_name_after_they_leave() {
+        // The peer list forgets someone who walked out of range. This table is
+        // the only thing that still knows the name, which is the entire point:
+        // otherwise the internet transport can never be addressed.
+        let mut favorites = Favorites::new();
+        favorites.set_ours("aa11", "bob", true);
+        let found = favorites.by_nickname("BOB");
+        assert_eq!(found.len(), 1, "the lookup ignores case");
+        assert_eq!(found[0].0, "aa11");
+        assert!(favorites.by_nickname("nobody").is_empty());
+    }
+
+    #[test]
+    fn a_shared_nickname_reports_every_holder_in_a_stable_order() {
+        // A nickname is claimed, not owned. Returning one arbitrary match would
+        // send a private message to whichever the hash happened to iterate to.
+        let mut favorites = Favorites::new();
+        favorites.set_ours("bb22", "sam", true);
+        favorites.set_ours("aa11", "sam", true);
+        let names: Vec<&str> = favorites.by_nickname("sam").iter().map(|(f, _)| *f).collect();
+        assert_eq!(names, vec!["aa11", "bb22"]);
     }
 
     #[test]

@@ -388,9 +388,10 @@ packets addressed to us, presence, and unknown types.
   transport per DM (Bluetooth preferred, Nostr fallback) and queues when neither
   is up, so a peer out of BLE range is still reachable. Ours are not. The
   unhandled `nostrCarrier 0x28` and the never-populated `TLV_BRIDGE_GEOHASH
-  0x06` still belong to this gap. Inbound now works end to end: the client
+  0x06` still belong to this gap. Both directions now work: the client
   subscribes to gift wraps at startup, opens them, files the message and
-  acknowledges it. Outbound is the remaining half — see the npub note below.
+  acknowledges it; and `/dm` to a peer who is out of range seals the message to
+  their stored address and posts it. Untested against another implementation.
 - **A rumor does not carry text; it carries a mesh packet.** Upstream puts
   `"bitchat1:" + base64url(BitchatPacket)` in the rumor, and
   `NostrInboundPipeline` ignores content without that prefix outright. A client
@@ -430,11 +431,19 @@ packets addressed to us, presence, and unknown types.
   our address drop a message into someone else's conversation. Upstream resolves
   the same way, via favourites with a fallback derived from the Nostr key.
 - **Upstream hands out `npub`, not hex.** `sendFavoriteNotification` appends
-  `":" + myNostrIdentity.npub`, so a peer's stored address is bech32. We send
-  hex, which upstream's `findNoiseKey` accepts through its raw-hex branch, but
-  addressing *them* needs a bech32 decoder we do not have. That is what blocks
-  outbound: `embedded::private_message` is written and tested with nothing
-  calling it.
+  `":" + myNostrIdentity.npub`, so a peer's stored address is bech32 while
+  everything downstream — the seal, the `#p` filter, the ECDH — needs bytes.
+  `nostr/npub.rs` accepts either spelling and we now hand out the bech32 form
+  ourselves. It refuses an `nsec`: same encoding, different prefix, and sealing
+  to a point derived from someone's secret half would fail silently.
+  Cross-checked against the BIP-173 reference decoder rather than only
+  round-tripped, because a consistently wrong codec round-trips perfectly.
+- **A peer who has left can still be addressed.** `/dm bob` used to resolve only
+  against live peers, so it answered "nobody here is called bob" for precisely
+  the peer the internet transport exists to reach. Resolution now falls through
+  to the favourites table, which keeps the nickname and the address after the
+  peer list has forgotten them. A favourite's fingerprint begins with their peer
+  ID, so both sources yield the same kind of value.
 - **The mesh is preferred over Nostr for every private message**, and not only
   for latency: a message that stays on the local radio tells no third party the
   conversation exists, while the relay path necessarily reveals that *someone*
