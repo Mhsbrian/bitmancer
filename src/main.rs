@@ -39,7 +39,7 @@ use mesh::{DeliveryStatus, MeshEvent, MeshService};
 use noise_payload::{NoisePayloadType, PrivateMessagePacket};
 use nostr::client::GeoEvent;
 use nostr::health::Notice;
-use transport::TransportEvent;
+use transport::{Outbound, TransportEvent};
 use tui::app::{App, TuiPhase};
 use tui::event;
 use tui::tui as tui_mod;
@@ -202,6 +202,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per relay, because two relays failing with different reasons is exactly
     // what defeats a single-slot filter.
     let mut relay_health = nostr::health::RelayHealth::new();
+    // Which BLE links are up. The relay policy needs the names, not just the
+    // count: a packet may go to every link except the one it arrived on.
+    let mut links: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut forwarded = relay::Forwarded::default();
     // Whether the map sampler is currently running, so it can be torn down
     // exactly once when the map closes.
     let mut sampling = false;
@@ -222,33 +226,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.add_popup_message(text);
                     }
                 }
-                TransportEvent::Connected => {
-                    app.transition_to_connected();
-                    app.add_log_message("system: Connected to the mesh.".to_string());
-                    // Announce immediately so peers can see us.
+                TransportEvent::LinkUp { link, label, held } => {
+                    links.insert(link);
+                    if held == 1 {
+                        app.transition_to_connected();
+                        app.add_log_message("system: Connected to the mesh.".to_string());
+                    } else {
+                        app.add_log_message(format!(
+                            "system: linked to {label} ({held} peers linked)"
+                        ));
+                    }
+                    // Announce down the new link so the peer behind it sees us.
+                    // Sent to every link rather than just this one: an announce
+                    // is how we stay current with everyone, and re-sending it
+                    // costs a frame.
                     if let Some(frame) = mesh.announce_frame() {
-                        let _ = transport.outbound.send(frame).await;
+                        let _ = transport.outbound.send(Outbound::All(frame)).await;
                     }
                 }
-                TransportEvent::Frame(frame) => {
-                    for mesh_event in mesh.handle_frame(&frame) {
+                TransportEvent::Frame { link, data } => {
+                    // Decide whether to pass it on before handling it. The
+                    // packet is moved into the mesh layer, and the relay
+                    // decision needs the raw frame and the link it came from.
+                    let onward = relay_plan(&mesh, &data, &link, &links, &mut forwarded);
+                    for mesh_event in mesh.handle_frame(&data) {
                         // A handshake reply originates down in the mesh layer
                         // rather than from a user action, so it has to be put
                         // on the air here.
                         if let MeshEvent::Send(outgoing) = mesh_event {
-                            let _ = transport.outbound.send(outgoing).await;
+                            let _ = transport.outbound.send(Outbound::All(outgoing)).await;
                             continue;
                         }
                         apply_mesh_event(&mut app, mesh_event, &mut last_notice);
                     }
+                    if let Some(forwarded) = onward {
+                        let _ = transport
+                            .outbound
+                            .send(Outbound::Except {
+                                link,
+                                data: forwarded,
+                            })
+                            .await;
+                    }
                 }
-                TransportEvent::Disconnected(reason) => {
-                    mesh.clear_peers();
-                    app.people.clear();
-                    app.connected = false;
-                    app.phase = TuiPhase::Connecting;
-                    app.popup_messages.clear();
-                    app.add_popup_message(reason);
+                TransportEvent::LinkDown { link, reason, held } => {
+                    links.remove(&link);
+                    if held == 0 {
+                        // Only now are we actually off the mesh. Losing one of
+                        // several links must not clear peers reachable through
+                        // the others; those age out on their own if they were
+                        // only behind the link that went.
+                        mesh.clear_peers();
+                        app.people.clear();
+                        app.connected = false;
+                        app.phase = TuiPhase::Connecting;
+                        app.popup_messages.clear();
+                        app.add_popup_message(format!("{reason}. Reconnecting..."));
+                    } else {
+                        app.add_log_message(format!(
+                            "system: a link ended ({reason}); {held} still up"
+                        ));
+                    }
                 }
                 TransportEvent::Fatal(reason) => app.transition_to_error(reason),
             }
@@ -300,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.add_log_message(format!("system: You are now {}.", mesh.nickname));
             if app.connected {
                 if let Some(frame) = mesh.announce_frame() {
-                    let _ = transport.outbound.send(frame).await;
+                    let _ = transport.outbound.send(Outbound::All(frame)).await;
                 }
             }
         }
@@ -401,7 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match mesh.favorite_frames(&target, favorite, &our_key) {
                         Ok(sent) => {
                             for frame in sent.frames {
-                                let _ = transport.outbound.send(frame).await;
+                                let _ = transport.outbound.send(Outbound::All(frame)).await;
                             }
                             let who = mesh
                                 .peers
@@ -432,7 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         frames.len()
                                     ));
                                     for frame in frames {
-                                        let _ = transport.outbound.send(frame).await;
+                                        let _ = transport.outbound.send(Outbound::All(frame)).await;
                                     }
                                     app.add_log_message(format!("system: {name} sent."));
                                 }
@@ -448,7 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Tell the mesh we are going before the keys are gone, so
                     // peers drop us now rather than timing us out.
                     if let Some(frame) = mesh.leave_frame() {
-                        let _ = transport.outbound.send(frame).await;
+                        let _ = transport.outbound.send(Outbound::All(frame)).await;
                     }
                     match persistence::wipe_state() {
                         Ok(existed) => {
@@ -547,7 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match mesh.dm_frames(&target, &content) {
                         Ok(sent) => {
                             for frame in sent.frames {
-                                let _ = transport.outbound.send(frame).await;
+                                let _ = transport.outbound.send(Outbound::All(frame)).await;
                             }
                             // Echo locally straight away. The wire copy is
                             // encrypted to the peer and never comes back to us,
@@ -664,7 +702,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ));
                                 }
                                 for frame in frames {
-                                    let _ = transport.outbound.send(frame).await;
+                                    let _ = transport.outbound.send(Outbound::All(frame)).await;
                                 }
                             }
                         }
@@ -696,7 +734,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_maintenance = Instant::now();
             if app.connected && mesh.announce_due() {
                 if let Some(frame) = mesh.announce_frame() {
-                    let _ = transport.outbound.send(frame).await;
+                    let _ = transport.outbound.send(Outbound::All(frame)).await;
                 }
             }
             for mesh_event in mesh.prune_peers() {
@@ -720,7 +758,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !ids.is_empty() {
                     if let Ok(target) = mesh.peer_id_for_nickname(&peer) {
                         for frame in mesh.read_receipt_frames(&target, &ids) {
-                            let _ = transport.outbound.send(frame).await;
+                            let _ = transport.outbound.send(Outbound::All(frame)).await;
                         }
                     }
                 }
@@ -743,7 +781,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Tell the mesh we are going before tearing the link down.
     if app.connected {
         if let Some(frame) = mesh.leave_frame() {
-            let _ = transport.outbound.send(frame).await;
+            let _ = transport.outbound.send(Outbound::All(frame)).await;
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
@@ -999,6 +1037,35 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
         }
         MeshEvent::Trace(text) => app.add_log_message(format!("system: {text}")),
     }
+}
+
+/// Whether to pass a received frame along, and what to put on the air.
+///
+/// The forwarded copy is re-encoded with one less TTL rather than resent
+/// verbatim. That is safe because the packet signature deliberately excludes the
+/// TTL — it is the one field a relay is expected to change — so a rebuilt frame
+/// still verifies at the far end.
+fn relay_plan(
+    mesh: &MeshService,
+    data: &[u8],
+    ingress: &str,
+    links: &std::collections::HashSet<String>,
+    forwarded: &mut relay::Forwarded,
+) -> Option<Vec<u8>> {
+    let packet = protocol::Packet::decode(data)?;
+    let names: Vec<String> = links.iter().cloned().collect();
+    let relay::Relay::Forward { ttl, .. } = relay::plan(&packet, &names, ingress, &mesh.my_peer_id)
+    else {
+        return None;
+    };
+    // Checked only once the policy has said yes, so the set fills with packets
+    // we actually relayed rather than every packet that ever arrived.
+    if !forwarded.accept(&packet) {
+        return None;
+    }
+    let mut onward = packet;
+    onward.ttl = ttl;
+    onward.encode()
 }
 
 /// Opens a gift wrap and acts on what is inside, returning an acknowledgement

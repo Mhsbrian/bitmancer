@@ -345,19 +345,41 @@ older senders wrote 2, so the decoder tries the canonical width and falls back.
 Images are handed to the same viewer as linked ones under a `mesh:` key, so they
 are never fetched — the bytes are already in hand.
 
-**Relaying (`relay.rs`) is a policy, not a rebroadcast, and it deliberately never
-fires today.** A flood terminates because a packet is never sent back out the
-link it arrived on — and this client holds exactly one BLE link, so every
-"relay" would be an echo to the peer that just spoke. `plan()` returns
-`Suppress("no link other than the one it came from")` in that case. Written this
-way, forwarding becomes correct by construction if multi-link support lands,
-instead of being a bug someone has to remember. It also refuses inflated TTLs,
-packets addressed to us, presence, and unknown types.
+**Relaying (`relay.rs`) is a policy, not a rebroadcast.** A flood terminates
+because a packet is never sent back out the link it arrived on. While the client
+held a single link there was no "except", so every possible rebroadcast was an
+echo to the peer that had just spoken and `plan()` returned `Suppress("no link
+other than the one it came from")` for all of them. Written as a policy rather
+than as a rebroadcast that happened to be harmful, it started forwarding
+unchanged the moment the transport held two links. It also refuses inflated
+TTLs, packets addressed to us, presence, and unknown types.
+
+Two details that are load-bearing:
+
+- **A forwarded packet is re-encoded with one less TTL, not resent verbatim**,
+  and that is only safe because the packet signature deliberately excludes the
+  TTL — the one field a relay is expected to change. If that ever stopped
+  holding, every relayed packet would be rejected as forged by the peer it
+  reached and *nothing local would fail*, so there is a test that carries a
+  signed packet through a full hop rather than only checking `signing_bytes`.
+- **TTL alone is not enough to stop a flood looping.** A node with three links
+  hands a copy to two neighbours who hand it to each other; the packet dies
+  eventually but goes round several times first. `Forwarded` keys on everything
+  about a packet *except* the TTL — which mutates every hop and is precisely
+  what must not distinguish two copies of one message.
+
+**The transport holds up to `MAX_LINKS` peers** (six, upstream's
+`bleMaxCentralLinks`). One dialler finds peers and brings links up, one pump task
+per live link carries traffic, and a router fans outbound frames across them.
+Connection attempts stay in the dialler and are made one at a time with a 500ms
+gap, matching upstream's `bleConnectRateLimitInterval`: BLE stacks handle
+parallel connects badly, and serialising them gives the rate limit somewhere
+honest to live. Scanning backs off hard once any link is held, because it shares
+the radio with every link it already has. Losing one link of several does *not*
+clear the peer list — peers reachable only through the lost link age out on their
+own, while the rest are still there.
 
 ## What is not done
-
-- **Multi-link.** The transport connects to one peripheral, which is why relaying
-  never fires. Upstream holds up to six central links.
 - **A favourite is an address exchange, not a bookmark** (`favorites.rs`).
   Upstream sends it as the *content of an ordinary private message* —
   `"[FAVORITED]:" + npub` — and intercepts it on arrival, so it needs no packet

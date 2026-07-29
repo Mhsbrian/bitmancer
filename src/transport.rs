@@ -4,7 +4,23 @@
 // and so a dropped link can be re-established without user action: the old
 // client connected to the first advertiser it saw, once, and silently froze if
 // that link went away.
+//
+// It holds several links at once, which is what makes this client a mesh node
+// rather than a leaf. A flooded mesh works because every node repeats what it
+// hears out of every link except the one it arrived on — with a single link
+// there is no "except", so every possible rebroadcast is an echo back to the
+// peer that just spoke, and `relay.rs` correctly refuses all of them. Holding a
+// second link is the difference between carrying other people's traffic and
+// only ever carrying our own.
+//
+// The shape is: one dialler that finds peers and brings links up, one pump task
+// per live link, and a router that fans outbound frames across them. Connection
+// attempts stay in the dialler and are made one at a time — BLE stacks handle
+// parallel connects badly, and serialising them also gives the rate limit
+// somewhere honest to live.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use btleplug::api::{
@@ -17,6 +33,24 @@ use tokio::time;
 
 use crate::data_structures::{BITCHAT_CHARACTERISTIC_UUID, BITCHAT_SERVICE_UUID};
 use crate::discovery::{self, Candidate, FailureLog};
+
+/// How many peers to hold at once, matching upstream's `bleMaxCentralLinks`.
+///
+/// The ceiling is the radio's, not ours: a BLE central multiplexes every link
+/// over the same antenna, so each additional peer costs airtime for all of
+/// them. Six is where upstream settled and there is no reason to differ.
+pub const MAX_LINKS: usize = 6;
+/// Minimum gap between connection attempts, matching upstream's
+/// `bleConnectRateLimitInterval`. Dialling several peers back to back tends to
+/// make BlueZ fail all of them.
+const CONNECT_RATE_LIMIT: Duration = Duration::from_millis(500);
+/// How long to wait before looking for more peers when links are already held.
+/// Scanning is not free — it costs power and airtime on the same radio the
+/// links are using — so a client with peers looks around far less often than
+/// one with none.
+const RESCAN_WITH_LINKS: Duration = Duration::from_secs(45);
+/// Poll interval when every slot is full: nothing to do but notice a departure.
+const IDLE_POLL: Duration = Duration::from_secs(5);
 
 /// How long one scan pass looks for an advertiser before reporting back.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -42,16 +76,91 @@ const SETTLE_AFTER_LINK_LOSS: Duration = Duration::from_secs(2);
 pub enum TransportEvent {
     /// Progress text for the connection popup.
     Status(String),
-    Connected,
-    Frame(Vec<u8>),
-    Disconnected(String),
+    /// A link came up. `held` is how many we have now, so the UI can tell the
+    /// first one — which means we are on the mesh — from the rest.
+    LinkUp {
+        link: String,
+        label: String,
+        held: usize,
+    },
+    /// A link ended. `held` is how many remain; zero means we are off the mesh.
+    LinkDown {
+        link: String,
+        reason: String,
+        held: usize,
+    },
+    /// A frame, and which link it arrived on. The link is what makes relaying
+    /// possible: the one rule that stops a flood looping forever is never
+    /// sending a packet back the way it came.
+    Frame { link: String, data: Vec<u8> },
     /// The adapter itself is unusable; retrying will not help.
     Fatal(String),
 }
 
+/// Where an outbound frame should go.
+#[derive(Debug)]
+pub enum Outbound {
+    /// Every link. Our own traffic floods outwards in all directions.
+    All(Vec<u8>),
+    /// Every link but one — a packet being passed along, kept off the link it
+    /// arrived on so it cannot echo back to whoever sent it.
+    Except { link: String, data: Vec<u8> },
+}
+
 pub struct Transport {
     pub events: mpsc::Receiver<TransportEvent>,
-    pub outbound: mpsc::Sender<Vec<u8>>,
+    pub outbound: mpsc::Sender<Outbound>,
+}
+
+/// The live links, shared between the router that writes to them and the
+/// dialler that opens them.
+///
+/// A plain mutex rather than a channel because both sides only ever ask small
+/// synchronous questions of it — how many, which addresses, give me the senders
+/// — and nothing is awaited while it is held.
+#[derive(Clone, Default)]
+struct LinkSet {
+    inner: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+}
+
+impl LinkSet {
+    fn count(&self) -> usize {
+        self.inner.lock().map(|links| links.len()).unwrap_or(0)
+    }
+
+    fn addresses(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|links| links.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn insert(&self, address: &str, sender: mpsc::Sender<Vec<u8>>) {
+        if let Ok(mut links) = self.inner.lock() {
+            links.insert(address.to_string(), sender);
+        }
+    }
+
+    fn remove(&self, address: &str) {
+        if let Ok(mut links) = self.inner.lock() {
+            links.remove(address);
+        }
+    }
+
+    /// The senders to write a frame to. Cloned out so the lock is released
+    /// before anything is awaited.
+    fn senders_except(&self, except: Option<&str>) -> Vec<mpsc::Sender<Vec<u8>>> {
+        self.inner
+            .lock()
+            .map(|links| {
+                links
+                    .iter()
+                    .filter(|(address, _)| Some(address.as_str()) != except)
+                    .map(|(_, sender)| sender.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub fn spawn() -> Transport {
@@ -64,7 +173,12 @@ pub fn spawn() -> Transport {
     }
 }
 
-async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<Vec<u8>>) {
+/// Routes outbound frames across the live links.
+///
+/// This is all `run` does once started: the dialler and the per-link pumps do
+/// the radio work, so a slow write on one link cannot hold up the UI or the
+/// other links.
+async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<Outbound>) {
     let adapter = match first_adapter().await {
         Ok(adapter) => adapter,
         Err(message) => {
@@ -73,89 +187,139 @@ async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<
         }
     };
 
-    let mut backoff = RECONNECT_BACKOFF_START;
+    let links = LinkSet::default();
+    tokio::spawn(dialler(adapter, links.clone(), events.clone()));
+
+    while let Some(frame) = outbound.recv().await {
+        let (except, data) = match frame {
+            Outbound::All(data) => (None, data),
+            Outbound::Except { link, data } => (Some(link), data),
+        };
+        for sender in links.senders_except(except.as_deref()) {
+            // A link whose pump has died or fallen behind must not stall the
+            // others; its queue draining is that link's problem.
+            let _ = sender.try_send(data.clone());
+        }
+    }
+}
+
+/// Finds peers and brings links up, one connection attempt at a time.
+async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<TransportEvent>) {
     let mut failures = FailureLog::default();
+    let mut announced_empty = false;
+
     loop {
         failures.prune();
-        let _ = events
-            .send(TransportEvent::Status(
-                "» Scanning for bitchat service...".to_string(),
-            ))
-            .await;
 
-        let (peripheral, candidate) = match scan_for_peer(&adapter, &failures).await {
-            Ok(Some(found)) => found,
-            Ok(None) => {
-                let _ = events
-                    .send(TransportEvent::Disconnected(format!(
-                        "No BitChat peer in range (scan timed out after {}s). Retrying...",
-                        SCAN_TIMEOUT.as_secs()
-                    )))
-                    .await;
-                time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                continue;
-            }
+        if links.count() >= MAX_LINKS {
+            time::sleep(IDLE_POLL).await;
+            continue;
+        }
+
+        // Only worth saying while we have nobody; once a link is up this is
+        // background housekeeping and belongs in no one's log.
+        if links.count() == 0 && !announced_empty {
+            announced_empty = true;
+            let _ = events
+                .send(TransportEvent::Status(
+                    "» Scanning for bitchat service...".to_string(),
+                ))
+                .await;
+        }
+
+        let found = match scan_for_peers(&adapter).await {
+            Ok(found) => found,
             Err(error) => {
-                let _ = events
-                    .send(TransportEvent::Disconnected(format!(
-                        "Scan failed: {error}. Another Bluetooth program may be using the adapter."
-                    )))
-                    .await;
-                time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                if links.count() == 0 {
+                    let _ = events
+                        .send(TransportEvent::Status(format!(
+                            "» Scan failed: {error}. Another Bluetooth program may be using the adapter."
+                        )))
+                        .await;
+                }
+                time::sleep(RECONNECT_BACKOFF_MAX).await;
                 continue;
             }
         };
 
-        // Name the peer being tried. When several ghosts are in the list this
-        // is the difference between "it is stuck" and "it is working through
-        // stale entries".
-        let _ = events
-            .send(TransportEvent::Status(format!(
-                "» Connecting to {}",
-                candidate.label()
-            )))
-            .await;
+        let held = links.addresses();
+        let candidates: Vec<Candidate> = found
+            .iter()
+            .map(|(_, candidate)| candidate.clone())
+            .filter(|candidate| !held.contains(&candidate.address))
+            .collect();
 
-        let started = std::time::Instant::now();
-        match session(&peripheral, &events, &mut outbound).await {
-            Ok(ending) => {
-                failures.forget(&candidate.address);
-                let reason = match ending {
-                    LinkEnd::PeerGone => "Link lost".to_string(),
-                    LinkEnd::WentQuiet => format!(
-                        "Peer went silent for {}s",
-                        LINK_SILENCE_TIMEOUT.as_secs()
-                    ),
-                };
-                let _ = events
-                    .send(TransportEvent::Disconnected(format!(
-                        "{reason} after {}. Reconnecting...",
-                        format_duration(started.elapsed())
-                    )))
-                    .await;
-                backoff = RECONNECT_BACKOFF_START;
-                let _ = peripheral.disconnect().await;
-                time::sleep(SETTLE_AFTER_LINK_LOSS).await;
-                continue;
+        for candidate in discovery::rank(&candidates, &failures) {
+            if links.count() >= MAX_LINKS {
+                break;
             }
-            Err(error) => {
-                // Remember the address so the next pass prefers a different
-                // one rather than hammering a device that is not there.
-                failures.record(&candidate.address);
+            let Some((peripheral, _)) = found
+                .iter()
+                .find(|(_, found)| found.address == candidate.address)
+            else {
+                continue;
+            };
+
+            // Dialling several peers at once tends to make BlueZ fail all of
+            // them, so attempts are spaced whether or not the last succeeded.
+            time::sleep(CONNECT_RATE_LIMIT).await;
+
+            if links.count() == 0 {
                 let _ = events
-                    .send(TransportEvent::Disconnected(format!(
-                        "{} failed: {error}. Trying another peer...",
-                        candidate.address
+                    .send(TransportEvent::Status(format!(
+                        "» Connecting to {}",
+                        candidate.label()
                     )))
                     .await;
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            }
+
+            match establish(peripheral).await {
+                Ok(link) => {
+                    failures.forget(&candidate.address);
+                    announced_empty = false;
+                    let (inbox_tx, inbox_rx) = mpsc::channel::<Vec<u8>>(64);
+                    links.insert(&candidate.address, inbox_tx);
+                    let _ = events
+                        .send(TransportEvent::LinkUp {
+                            link: candidate.address.clone(),
+                            label: candidate.label(),
+                            held: links.count(),
+                        })
+                        .await;
+                    tokio::spawn(pump(
+                        peripheral.clone(),
+                        candidate.address.clone(),
+                        link,
+                        inbox_rx,
+                        links.clone(),
+                        events.clone(),
+                    ));
+                }
+                Err(error) => {
+                    // Remember the address so the next pass prefers a different
+                    // one rather than hammering a device that is not there.
+                    failures.record(&candidate.address);
+                    let _ = peripheral.disconnect().await;
+                    if links.count() == 0 {
+                        let _ = events
+                            .send(TransportEvent::Status(format!(
+                                "» {} failed: {error}. Trying another peer...",
+                                candidate.address
+                            )))
+                            .await;
+                    }
+                }
             }
         }
 
-        let _ = peripheral.disconnect().await;
-        time::sleep(backoff).await;
+        // A client with peers looks around far less often: scanning shares the
+        // radio with every link it already holds.
+        let quiet = if links.count() > 0 {
+            RESCAN_WITH_LINKS
+        } else {
+            RECONNECT_BACKOFF_START
+        };
+        time::sleep(quiet).await;
     }
 }
 
@@ -318,10 +482,12 @@ fn is_already_in_progress(error: &btleplug::Error) -> bool {
     text.contains("already in progress") || text.contains("inprogress")
 }
 
-async fn scan_for_peer(
-    adapter: &Adapter,
-    failures: &FailureLog,
-) -> Result<Option<(Peripheral, Candidate)>, btleplug::Error> {
+/// One scan pass, returning everything that claims to speak BitChat.
+///
+/// Returns the whole list rather than a pick, because with several links to
+/// fill the ranking is the caller's to work down. An empty result is a normal
+/// outcome, not an error.
+async fn scan_for_peers(adapter: &Adapter) -> Result<Vec<(Peripheral, Candidate)>, btleplug::Error> {
     if let Err(error) = adapter.start_scan(ScanFilter::default()).await {
         if !is_already_in_progress(&error) {
             return Err(error);
@@ -343,19 +509,10 @@ async fn scan_for_peer(
                 > Duration::from_millis(1500);
 
             if !found.is_empty() && (heard_any || past_grace) {
-                let candidates: Vec<Candidate> =
-                    found.iter().map(|(_, candidate)| candidate.clone()).collect();
-                if let Some(chosen) = discovery::choose(&candidates, failures) {
-                    if let Some((peripheral, candidate)) = found
-                        .into_iter()
-                        .find(|(_, candidate)| candidate.address == chosen.address)
-                    {
-                        return Ok(Some((peripheral, candidate)));
-                    }
-                }
+                return Ok(found);
             }
             if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
+                return Ok(found);
             }
             time::sleep(Duration::from_millis(500)).await;
         }
@@ -411,21 +568,19 @@ fn format_duration(elapsed: Duration) -> String {
     }
 }
 
-/// Holds one connection open, pumping frames both ways until it drops.
-/// How a link that was working ended. Neither case says the peer's address is
-/// bad, so neither is held against it when choosing the next candidate.
-enum LinkEnd {
-    /// The radio reported the peer gone, or the notification stream ended.
-    PeerGone,
-    /// The link stayed open but nothing arrived for [`LINK_SILENCE_TIMEOUT`].
-    WentQuiet,
+/// A link that is up: the characteristic to write to, and the stream to read.
+struct Link {
+    characteristic: Characteristic,
+    notifications: std::pin::Pin<
+        Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>,
+    >,
 }
 
-async fn session(
-    peripheral: &Peripheral,
-    events: &mpsc::Sender<TransportEvent>,
-    outbound: &mut mpsc::Receiver<Vec<u8>>,
-) -> Result<LinkEnd, String> {
+/// Brings one link up: connect, discover, subscribe.
+///
+/// Separate from pumping it so the dialler can keep connection attempts
+/// serialised and rate-limited while every live link runs concurrently.
+async fn establish(peripheral: &Peripheral) -> Result<Link, String> {
     // A connect to an address that has rotated away never returns, so it is
     // bounded rather than trusted.
     if !peripheral.is_connected().await.unwrap_or(false) {
@@ -462,59 +617,100 @@ async fn session(
         Ok(Ok(())) => {}
     }
 
-    let mut notifications = peripheral
+    let notifications = peripheral
         .notifications()
         .await
         .map_err(|e| format!("Could not open the notification stream: {e}"))?;
 
-    events
-        .send(TransportEvent::Connected)
-        .await
-        .map_err(|_| "UI channel closed".to_string())?;
+    Ok(Link {
+        characteristic,
+        notifications,
+    })
+}
 
+/// Pumps one live link until it ends, then takes itself out of the set.
+///
+/// Every frame it reports is tagged with this link's address, which is what
+/// lets the mesh layer decide where a relayed copy may go.
+async fn pump(
+    peripheral: Peripheral,
+    address: String,
+    link: Link,
+    mut inbox: mpsc::Receiver<Vec<u8>>,
+    links: LinkSet,
+    events: mpsc::Sender<TransportEvent>,
+) {
+    let Link {
+        characteristic,
+        mut notifications,
+    } = link;
+    let started = std::time::Instant::now();
     let mut liveness = time::interval(Duration::from_secs(2));
     liveness.tick().await;
     let mut last_heard = tokio::time::Instant::now();
 
-    loop {
+    let ending = loop {
         tokio::select! {
             notification = notifications.next() => {
                 match notification {
                     Some(notification) => {
                         last_heard = tokio::time::Instant::now();
-                        if events.send(TransportEvent::Frame(notification.value)).await.is_err() {
-                            return Ok(LinkEnd::PeerGone);
+                        let frame = TransportEvent::Frame {
+                            link: address.clone(),
+                            data: notification.value,
+                        };
+                        if events.send(frame).await.is_err() {
+                            break "the client is shutting down".to_string();
                         }
                     }
                     // Stream end means the peripheral went away.
-                    None => return Ok(LinkEnd::PeerGone),
+                    None => break "link lost".to_string(),
                 }
             }
-            frame = outbound.recv() => {
+            frame = inbox.recv() => {
                 match frame {
                     Some(frame) => {
                         if let Err(error) = peripheral
                             .write(&characteristic, &frame, WriteType::WithoutResponse)
                             .await
                         {
-                            return Err(format!("Write failed: {error}"));
+                            break format!("write failed ({error})");
                         }
                     }
-                    None => return Ok(LinkEnd::PeerGone),
+                    None => break "the client is shutting down".to_string(),
                 }
             }
             _ = liveness.tick() => {
                 // btleplug does not surface disconnects on every platform, so
                 // poll rather than trust the stream to end.
                 if !peripheral.is_connected().await.unwrap_or(false) {
-                    return Ok(LinkEnd::PeerGone);
+                    break "link lost".to_string();
                 }
+                // A BLE link can stay open after the peer's app is gone: the
+                // radio holds the connection while nothing is left to talk to
+                // it. A live node re-announces continuously, so silence this
+                // long means the link is a corpse.
                 if last_heard.elapsed() >= LINK_SILENCE_TIMEOUT {
-                    return Ok(LinkEnd::WentQuiet);
+                    break format!("silent for {}s", LINK_SILENCE_TIMEOUT.as_secs());
                 }
             }
         }
-    }
+    };
+
+    // Out of the set before the event, so a UI reading `held` never sees a
+    // count that still includes this link.
+    links.remove(&address);
+    let _ = peripheral.disconnect().await;
+    let _ = events
+        .send(TransportEvent::LinkDown {
+            link: address,
+            reason: format!("{ending} after {}", format_duration(started.elapsed())),
+            held: links.count(),
+        })
+        .await;
+    // BlueZ frequently refuses an immediate reconnect to a device it just
+    // dropped, so hold the address out of reach until the stack settles.
+    time::sleep(SETTLE_AFTER_LINK_LOSS).await;
 }
 
 #[cfg(test)]

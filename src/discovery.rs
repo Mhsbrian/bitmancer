@@ -66,36 +66,44 @@ impl FailureLog {
     }
 }
 
-/// Picks the peer most likely to actually answer.
+/// Every candidate worth trying, best first.
 ///
-/// Heard-recently beats never-heard, and among those, the strongest signal
-/// wins. Candidates that just failed are skipped entirely unless nothing else
-/// is left — being unable to connect at all is worse than retrying a bad one.
-pub fn choose(candidates: &[Candidate], failures: &FailureLog) -> Option<Candidate> {
-    let pick = |allow_cooling: bool| -> Option<Candidate> {
-        let mut viable: Vec<&Candidate> = candidates
-            .iter()
-            .filter(|candidate| allow_cooling || !failures.is_cooling(&candidate.address))
-            .collect();
-
-        // Live entries first, then by signal strength, then by address so the
-        // choice is stable when two peers are equally loud.
-        viable.sort_by(|a, b| {
-            b.rssi
-                .is_some()
-                .cmp(&a.rssi.is_some())
-                .then(b.rssi.unwrap_or(i16::MIN).cmp(&a.rssi.unwrap_or(i16::MIN)))
-                .then(a.address.cmp(&b.address))
-        });
-        viable.first().map(|candidate| (*candidate).clone())
-    };
-
-    pick(false).or_else(|| pick(true))
+/// Holding several links at once means dialling several peers, so the
+/// second-best entry is a target in its own right rather than a fallback for
+/// when the first fails.
+///
+/// One total order rather than a preferred list with a fallback pass. A
+/// recently-failed address sorts *below* everything else instead of being
+/// filtered out and reconsidered: the two express the same preference — try
+/// anything else first, but a bad peer beats no peer — and as an ordering it
+/// also says what to do with the fifth-best when the first four are taken.
+pub fn rank(candidates: &[Candidate], failures: &FailureLog) -> Vec<Candidate> {
+    let mut viable: Vec<Candidate> = candidates.to_vec();
+    viable.sort_by(|a, b| {
+        // `false` sorts before `true`, so not-cooling comes first.
+        failures
+            .is_cooling(&a.address)
+            .cmp(&failures.is_cooling(&b.address))
+            // Heard-recently beats never-heard: a cached ghost usually has no
+            // RSSI, and connecting to one hangs rather than failing.
+            .then(b.rssi.is_some().cmp(&a.rssi.is_some()))
+            .then(b.rssi.unwrap_or(i16::MIN).cmp(&a.rssi.unwrap_or(i16::MIN)))
+            // Stable when two peers are equally loud.
+            .then(a.address.cmp(&b.address))
+    });
+    viable
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The head of the ranking. The client works down the whole list now, but
+    /// "which peer would be tried first" is still the clearest way to state
+    /// most of these expectations.
+    fn best(candidates: &[Candidate], failures: &FailureLog) -> Option<Candidate> {
+        rank(candidates, failures).into_iter().next()
+    }
 
     fn live(address: &str, rssi: i16) -> Candidate {
         Candidate {
@@ -118,7 +126,7 @@ mod tests {
         // The real bug: BlueZ returned the ghost first and we connected to it.
         let candidates = vec![ghost("AA:AA"), live("BB:BB", -70), ghost("CC:CC")];
         assert_eq!(
-            choose(&candidates, &FailureLog::default()).unwrap().address,
+            best(&candidates, &FailureLog::default()).unwrap().address,
             "BB:BB"
         );
     }
@@ -127,7 +135,7 @@ mod tests {
     fn the_strongest_signal_wins() {
         let candidates = vec![live("AA:AA", -88), live("BB:BB", -52), live("CC:CC", -70)];
         assert_eq!(
-            choose(&candidates, &FailureLog::default()).unwrap().address,
+            best(&candidates, &FailureLog::default()).unwrap().address,
             "BB:BB"
         );
     }
@@ -135,8 +143,8 @@ mod tests {
     #[test]
     fn ties_break_stably() {
         let candidates = vec![live("CC:CC", -60), live("AA:AA", -60)];
-        let first = choose(&candidates, &FailureLog::default()).unwrap();
-        let again = choose(&candidates, &FailureLog::default()).unwrap();
+        let first = best(&candidates, &FailureLog::default()).unwrap();
+        let again = best(&candidates, &FailureLog::default()).unwrap();
         assert_eq!(first, again, "the same input must give the same choice");
         assert_eq!(first.address, "AA:AA");
     }
@@ -147,7 +155,7 @@ mod tests {
         failures.record("BB:BB");
         // BB is louder, but it just failed, so try the other one.
         let candidates = vec![live("AA:AA", -85), live("BB:BB", -40)];
-        assert_eq!(choose(&candidates, &failures).unwrap().address, "AA:AA");
+        assert_eq!(best(&candidates, &failures).unwrap().address, "AA:AA");
     }
 
     #[test]
@@ -156,7 +164,7 @@ mod tests {
         let mut failures = FailureLog::default();
         failures.record("BB:BB");
         let candidates = vec![live("BB:BB", -40)];
-        assert_eq!(choose(&candidates, &failures).unwrap().address, "BB:BB");
+        assert_eq!(best(&candidates, &failures).unwrap().address, "BB:BB");
     }
 
     #[test]
@@ -174,14 +182,73 @@ mod tests {
         // be worse than trying.
         let candidates = vec![ghost("AA:AA")];
         assert_eq!(
-            choose(&candidates, &FailureLog::default()).unwrap().address,
+            best(&candidates, &FailureLog::default()).unwrap().address,
             "AA:AA"
         );
     }
 
     #[test]
     fn nothing_to_choose_from_is_not_a_choice() {
-        assert!(choose(&[], &FailureLog::default()).is_none());
+        assert!(best(&[], &FailureLog::default()).is_none());
+        assert!(rank(&[], &FailureLog::default()).is_empty());
+    }
+
+    fn addresses(ranked: &[Candidate]) -> Vec<&str> {
+        ranked.iter().map(|c| c.address.as_str()).collect()
+    }
+
+    #[test]
+    fn ranking_orders_every_candidate_not_just_the_best() {
+        // Holding several links means the second and third entries are targets,
+        // so the whole list has to be ordered rather than only its head.
+        let candidates = vec![
+            ghost("DD:DD"),
+            live("AA:AA", -80),
+            live("BB:BB", -40),
+            ghost("CC:CC"),
+        ];
+        let ranked = rank(&candidates, &FailureLog::default());
+        assert_eq!(addresses(&ranked), vec!["BB:BB", "AA:AA", "CC:CC", "DD:DD"]);
+    }
+
+    #[test]
+    fn a_cooling_peer_sorts_last_but_is_still_offered() {
+        // It must be reachable when the peers above it are already held: with
+        // six links to fill, "skip it entirely" would leave a slot empty for a
+        // peer that is merely suspect.
+        let mut failures = FailureLog::default();
+        failures.record("BB:BB");
+        let candidates = vec![live("BB:BB", -40), live("AA:AA", -85), ghost("CC:CC")];
+        let ranked = rank(&candidates, &failures);
+        assert_eq!(
+            addresses(&ranked),
+            vec!["AA:AA", "CC:CC", "BB:BB"],
+            "the loudest peer sorts last because it just failed"
+        );
+    }
+
+    #[test]
+    fn ranking_agrees_with_choosing() {
+        let mut failures = FailureLog::default();
+        failures.record("BB:BB");
+        let candidates = vec![live("BB:BB", -40), live("AA:AA", -85), ghost("CC:CC")];
+        assert_eq!(
+            best(&candidates, &failures).as_ref(),
+            rank(&candidates, &failures).first(),
+            "one is defined as the head of the other; they cannot disagree"
+        );
+    }
+
+    #[test]
+    fn ranking_is_stable_across_runs() {
+        // The dialler works down this list. An order that shuffled between
+        // passes would make a connection problem impossible to reproduce.
+        let candidates = vec![live("CC:CC", -60), live("AA:AA", -60), ghost("BB:BB")];
+        let failures = FailureLog::default();
+        assert_eq!(
+            addresses(&rank(&candidates, &failures)),
+            addresses(&rank(&candidates, &failures))
+        );
     }
 
     #[test]
