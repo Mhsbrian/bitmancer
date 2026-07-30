@@ -5,36 +5,24 @@
 // a pattern is needed, and a partial implementation of a cryptographic spec is
 // the kind of thing that looks fine until it does not.
 #![allow(dead_code)]
+use crate::data_structures::noise_trace;
 use crate::debug_full_println;
 use chacha20poly1305::aead::{Aead as ChaChaAead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey};
 use generic_array::GenericArray;
 use hmac::{Hmac, Mac as HmacMac};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
-use std::io::Write;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 // MARK: - Debug Logging
 
-fn write_noise_protocol_debug_log(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("noise_protocol_debug.log")
-    {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let log_entry = format!("[{}] {}\n", timestamp, message);
-        let _ = file.write_all(log_entry.as_bytes());
-    }
-}
-
+/// Every event here runs once per encrypt and once per decrypt, so this is the
+/// hottest logging path in the client. It writes nothing unless the operator has
+/// set `BITMANCER_NOISE_LOG`; see `data_structures::noise_trace` for why that
+/// gate exists and what happened without it.
 fn log_noise_protocol_event(event: &str, details: &str) {
     let message = format!("[NOISE_PROTOCOL_DEBUG] {} - {}", event, details);
-    write_noise_protocol_debug_log(&message);
+    noise_trace(&message);
     debug_full_println!("{}", message);
 }
 

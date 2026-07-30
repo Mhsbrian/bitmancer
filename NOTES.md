@@ -874,6 +874,27 @@ things about it are load-bearing:
 The old `bitchat-tui` package may still be installed from the AUR; it is a
 different binary speaking the 2025 protocol and is unrelated to this one.
 
-## Legacy artifacts
+## The Noise trace
 
-The repo root still tracks `debug.log`, `packet_debug.log`, `noise_debug.log`, `noise_handler_debug.log`, and `noise_protocol_debug.log` from the old client. The modules that wrote the first three are deleted; the two `noise_*` ones will only be written again once the Noise work resumes, and those writers still append unconditionally to the current working directory. If you re-enable that path, run the binary from outside the repo or the files show up dirty in `git status`.
+Both halves of the Noise stack log through `data_structures::noise_trace`, which
+writes nothing unless the operator points `BITMANCER_NOISE_LOG` at a path. There
+is one writer on purpose. There used to be two — a copy in `noise_session.rs` and
+another in `noise_protocol.rs` — and only the session copy was ever gated, so the
+protocol copy went on appending `noise_protocol_debug.log` to whatever directory
+the client was launched from. It ran once per encrypt and once per decrypt, which
+is how a 21 MB, 226,260-line file came to be tracked in the repo root and
+re-dirtied on every run. Duplication is what let one copy be fixed and the other
+missed, so a third module wanting a trace must call the shared writer rather than
+grow its own.
+
+The gate is an environment variable and not `DEBUG_LEVEL`, because `/debug`
+toggles that level at runtime: someone asking to see packets on screen has not
+asked to start a multi-megabyte file on disk. `*.log` is ignored, so a trace
+taken inside the checkout no longer shows up dirty in `git status` — but point
+the variable outside the repo anyway, since a trace carries peer ids, message
+sizes and timings.
+
+Four filenames named in earlier versions of this note — `debug.log`,
+`packet_debug.log`, `noise_debug.log`, `noise_handler_debug.log` — are gone
+along with the modules that wrote them, and were never tracked at the time the
+note claimed they were.

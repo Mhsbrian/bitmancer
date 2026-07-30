@@ -4,46 +4,26 @@
 // the remaining private-messaging work builds on; trimming it to today's call
 // sites would mean restoring it piecemeal.
 #![allow(dead_code)]
-use crate::data_structures::EncryptionStatus;
+use crate::data_structures::{noise_trace, EncryptionStatus};
 use crate::debug_full_println;
 use crate::noise_protocol::{
     NoiseCipherState, NoiseError, NoiseHandshakeState, NoisePattern, NoiseRole, NoiseSymmetricState,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 // MARK: - Debug Logging
 
-/// Appends a handshake trace, but only when the operator has asked for one by
-/// pointing `BITMANCER_NOISE_LOG` at a path.
-///
-/// This used to append to `noise_debug.log` in the current working directory
-/// unconditionally. Every private message a user sent would drop a file
-/// wherever they happened to launch the client from — inside their own repo,
-/// in most cases — carrying peer IDs and handshake state nobody asked to have
-/// written to disk.
-fn write_noise_debug_log(message: &str) {
-    let Ok(path) = std::env::var("BITMANCER_NOISE_LOG") else {
-        return;
-    };
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let log_entry = format!("[{}] {}\n", timestamp, message);
-        let _ = file.write_all(log_entry.as_bytes());
-    }
-}
-
+/// A handshake trace, written only when the operator has set
+/// `BITMANCER_NOISE_LOG`. The gate used to live here as a local copy of the
+/// writer; it now lives in `data_structures::noise_trace` so the protocol half
+/// of the stack cannot go on writing unasked while this half asks permission.
 fn log_noise_event(event: &str, peer_id: &str, details: &str) {
     let message = format!("[NOISE_DEBUG] {} - Peer: {} - {}", event, peer_id, details);
-    write_noise_debug_log(&message);
+    noise_trace(&message);
     debug_full_println!("{}", message);
 }
 
@@ -741,7 +721,7 @@ impl NoiseSessionManager {
         peer_id: String,
         role: NoiseRole,
     ) -> Result<NoiseSession, NoiseError> {
-        write_noise_debug_log(&format!(
+        noise_trace(&format!(
             "[DEBUG] Creating session for peer: {} with role: {:?}",
             peer_id, role
         ));
@@ -755,12 +735,12 @@ impl NoiseSessionManager {
             // handshaking or failed sessions are handled below
         }
 
-        write_noise_debug_log("[DEBUG] About to create new NoiseHandshakeState");
+        noise_trace("[DEBUG] About to create new NoiseHandshakeState");
 
         // Create new handshake state
         let handshake_state = match role {
             NoiseRole::Initiator => {
-                write_noise_debug_log("[DEBUG] Creating handshake state as initiator");
+                noise_trace("[DEBUG] Creating handshake state as initiator");
                 NoiseHandshakeState::new(
                     role,
                     NoisePattern::XX,
@@ -769,7 +749,7 @@ impl NoiseSessionManager {
                 )
             }
             NoiseRole::Responder => {
-                write_noise_debug_log("[DEBUG] Creating handshake state as responder");
+                noise_trace("[DEBUG] Creating handshake state as responder");
                 NoiseHandshakeState::new(
                     role,
                     NoisePattern::XX,
@@ -779,13 +759,13 @@ impl NoiseSessionManager {
             }
         };
 
-        write_noise_debug_log("[DEBUG] Handshake state created successfully");
+        noise_trace("[DEBUG] Handshake state created successfully");
 
         // Check if we need to create a new session or update existing one
         if let Some(existing_session) = sessions.get_mut(&peer_id) {
             // Update existing session with new handshake state
             existing_session.handshake_state = Some(handshake_state);
-            write_noise_debug_log(&format!(
+            noise_trace(&format!(
                 "[DEBUG] Updated existing session for peer: {}",
                 peer_id
             ));
@@ -806,7 +786,7 @@ impl NoiseSessionManager {
                 pending_messages: Vec::new(),
             };
 
-            write_noise_debug_log(&format!(
+            noise_trace(&format!(
                 "[DEBUG] Session created successfully for peer: {}",
                 peer_id
             ));
@@ -825,14 +805,14 @@ impl NoiseSessionManager {
 
     pub fn remove_session(&mut self, peer_id: &str) {
         let mut sessions = self.sessions.lock().unwrap();
-        write_noise_debug_log(&format!("[DEBUG] Removing session for peer: {}", peer_id));
+        noise_trace(&format!("[DEBUG] Removing session for peer: {}", peer_id));
         if let Some(session) = sessions.get(peer_id) {
             if session.is_established() {
                 debug_full_println!("[NOISE] Session expired for {}", peer_id);
             }
         }
         sessions.remove(peer_id);
-        write_noise_debug_log(&format!("[DEBUG] Session removed for peer: {}", peer_id));
+        noise_trace(&format!("[DEBUG] Session removed for peer: {}", peer_id));
 
         // Also remove fingerprint mappings
         {
@@ -891,7 +871,7 @@ impl NoiseSessionManager {
     pub fn has_session(&self, peer_id: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();
         let has_session = sessions.contains_key(peer_id);
-        write_noise_debug_log(&format!(
+        noise_trace(&format!(
             "[DEBUG] Checking if session exists for peer: {} - Result: {}",
             peer_id, has_session
         ));
@@ -1109,7 +1089,7 @@ impl NoiseSessionManager {
     }
 
     pub fn initiate_handshake(&mut self, peer_id: &str) -> Result<Vec<u8>, NoiseError> {
-        write_noise_debug_log(&format!(
+        noise_trace(&format!(
             "[DEBUG] Starting initiate_handshake for peer: {}",
             peer_id
         ));
@@ -1118,7 +1098,7 @@ impl NoiseSessionManager {
 
         // Check if session exists
         if !sessions.contains_key(peer_id) {
-            write_noise_debug_log(&format!(
+            noise_trace(&format!(
                 "[DEBUG] No session exists for peer: {}, creating new session as initiator",
                 peer_id
             ));
@@ -1144,12 +1124,12 @@ impl NoiseSessionManager {
             };
 
             sessions.insert(peer_id.to_string(), session);
-            write_noise_debug_log(&format!(
+            noise_trace(&format!(
                 "[DEBUG] Created new session as initiator for peer: {}",
                 peer_id
             ));
         } else {
-            write_noise_debug_log(&format!(
+            noise_trace(&format!(
                 "[DEBUG] Session already exists for peer: {}",
                 peer_id
             ));
@@ -1157,7 +1137,7 @@ impl NoiseSessionManager {
 
         // Get the session and start handshake
         if let Some(session) = sessions.get_mut(peer_id) {
-            write_noise_debug_log(&format!(
+            noise_trace(&format!(
                 "[DEBUG] Starting handshake for session with role: {:?}",
                 session.role
             ));
@@ -1165,7 +1145,7 @@ impl NoiseSessionManager {
             if let Some(handshake_state) = &mut session.handshake_state {
                 let message = handshake_state.write_message(&[])?;
                 session.sent_handshake_messages.push(message.clone());
-                write_noise_debug_log(&format!(
+                noise_trace(&format!(
                     "[DEBUG] Handshake message created, length: {}",
                     message.len()
                 ));
@@ -1186,11 +1166,11 @@ impl NoiseSessionManager {
 
                 Ok(message)
             } else {
-                write_noise_debug_log("[DEBUG] No handshake state found");
+                noise_trace("[DEBUG] No handshake state found");
                 Err(NoiseError::InvalidState)
             }
         } else {
-            write_noise_debug_log("[DEBUG] Session not found after creation");
+            noise_trace("[DEBUG] Session not found after creation");
             Err(NoiseError::SessionNotFound)
         }
     }
@@ -1200,7 +1180,7 @@ impl NoiseSessionManager {
         peer_id: &str,
         handshake_data: &[u8],
     ) -> Result<Option<Vec<u8>>, NoiseError> {
-        write_noise_debug_log(&format!(
+        noise_trace(&format!(
             "[DEBUG] Starting handle_incoming_handshake for peer: {}",
             peer_id
         ));
@@ -1210,7 +1190,7 @@ impl NoiseSessionManager {
             let sessions = self.sessions.lock().unwrap();
             if let Some(sess) = sessions.get(peer_id) {
                 if sess.get_state() == NoiseSessionState::Established {
-                    write_noise_debug_log(&format!(
+                    noise_trace(&format!(
                         "[DEBUG] Ignoring handshake - session already established for peer: {}",
                         peer_id
                     ));
