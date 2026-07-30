@@ -103,6 +103,14 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
         handle_popup_events(app, key_event, input_tx);
         return;
     }
+    // Before every single-key shortcut below. While the prompt is open each
+    // keystroke is query text, so typing "i" has to reach the query rather than
+    // open the image viewer — searching for "invite" would otherwise be
+    // impossible to type.
+    if app.search.prompt_open {
+        handle_search_events(app, key_event);
+        return;
+    }
     // The viewer takes the keyboard while it is open, before the map so the
     // two overlays cannot both react to one key.
     if app.viewer.open {
@@ -306,14 +314,88 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
     }
 }
 
+/// The search prompt, while it is taking keys.
+///
+/// The hits are recomputed on every keystroke rather than on Enter, so the count
+/// beside the query is live and a query that finds nothing says so before it is
+/// committed. The log does not move until Enter — jumping on each character
+/// would drag the view around while someone is still deciding what to type.
+fn handle_search_events(app: &mut App, key_event: KeyEvent) {
+    match key_event.code {
+        KeyCode::Esc => {
+            app.msg_scroll = app.search.cancel();
+        }
+        KeyCode::Enter => {
+            app.search.commit();
+            jump_to_current_match(app);
+        }
+        KeyCode::Backspace => {
+            app.search.backspace();
+            rerun_search(app);
+        }
+        KeyCode::Char(character) => {
+            app.search.push(character);
+            rerun_search(app);
+        }
+        _ => {}
+    }
+}
+
+fn rerun_search(app: &mut App) {
+    // Cloned because `run` borrows the app mutably while `get_current_messages`
+    // borrows it immutably. A conversation is bounded by what one person has
+    // typed at a prompt, so this is not a hot path.
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+}
+
+/// Scrolls the log so the selected match is on screen.
+fn jump_to_current_match(app: &mut App) {
+    let Some(index) = app.search.current() else {
+        return;
+    };
+    let total = app.get_current_messages().0.len();
+    app.msg_scroll = crate::tui::search::scroll_for(index, total, app.message_viewport_height);
+}
+
 fn handle_main_panel_events(app: &mut App, key_event: KeyEvent) {
     let (messages, _, _) = app.get_current_messages();
     let total_messages = messages.len();
     let messages_height = app.message_viewport_height;
-    
+
     let max_scroll = total_messages.saturating_sub(messages_height);
 
+    // `n` and `N` only mean "walk the matches" while there are matches to walk.
+    // With none they fall through to the arms below and do nothing, rather than
+    // being swallowed by a finished search that found nothing — a key that does
+    // nothing silently reads as a wedged keyboard.
+    if app.search.is_walking() {
+        match key_event.code {
+            KeyCode::Char('n') => {
+                app.search.next();
+                jump_to_current_match(app);
+                return;
+            }
+            KeyCode::Char('N') => {
+                app.search.previous();
+                jump_to_current_match(app);
+                return;
+            }
+            KeyCode::Esc => {
+                app.msg_scroll = app.search.cancel();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key_event.code {
+        // Opens the prompt. Safe as a bare key here because this handler only
+        // runs when the log has focus — in the input box `/` is the command
+        // prefix and stays one.
+        KeyCode::Char('/') => {
+            app.search.open(app.msg_scroll);
+        }
         KeyCode::Tab => app.focus_area = FocusArea::InputBox,
         KeyCode::Up => {
             app.msg_scroll = (app.msg_scroll + 1).min(max_scroll);
@@ -773,6 +855,155 @@ mod tests {
             });
         }
         app
+    }
+
+    /// Drives the search prompt through the same entry point `main.rs` uses,
+    /// rather than calling the handler directly. The ordering against the
+    /// single-key shortcuts is the thing worth testing and it only exists in
+    /// `handle_key_event`.
+    fn type_into_search(app: &mut App, text: &str) {
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        for character in text.chars() {
+            handle_key_event(app, press(KeyCode::Char(character)), &sender);
+        }
+    }
+
+    fn searchable_app() -> App {
+        let mut app = app_with_backlog();
+        app.focus_area = FocusArea::MainPanel;
+        app
+    }
+
+    #[test]
+    fn slash_opens_the_prompt_from_the_log_and_esc_puts_the_scroll_back() {
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        app.msg_scroll = 12;
+
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+        assert!(app.search.prompt_open, "the log's / opens the prompt");
+
+        type_into_search(&mut app, "line 3");
+        handle_key_event(&mut app, press(KeyCode::Esc), &sender);
+
+        assert!(!app.search.prompt_open);
+        assert_eq!(app.msg_scroll, 12, "cancelling returns to where the log was");
+    }
+
+    #[test]
+    fn typing_i_into_the_prompt_searches_rather_than_opening_the_viewer() {
+        // `i` opens the image viewer from the log. While the prompt is taking
+        // keys it must not, or no query containing an i can be typed at all —
+        // and the ordering that guarantees that lives in `handle_key_event`,
+        // which is why this drives the real entry point.
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+
+        type_into_search(&mut app, "line");
+
+        assert!(!app.viewer.open, "the viewer must not have opened");
+        assert_eq!(app.search.query, "line");
+    }
+
+    #[test]
+    fn typing_m_into_the_prompt_does_not_open_the_map() {
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+
+        type_into_search(&mut app, "meshy");
+
+        assert!(!app.map_open, "the map must not have opened");
+        assert_eq!(app.search.query, "meshy");
+    }
+
+    #[test]
+    fn committing_a_search_scrolls_the_match_into_view() {
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+        type_into_search(&mut app, "line 5");
+        handle_key_event(&mut app, press(KeyCode::Enter), &sender);
+
+        assert!(!app.search.prompt_open, "Enter closes the prompt");
+        // "line 5" matches only index 5 of the forty, so the log has to have
+        // moved back from the newest end.
+        assert!(app.msg_scroll > 0, "the log scrolled to reach the match");
+        let (messages, _, _) = app.get_current_messages();
+        let end = messages.len() - app.msg_scroll;
+        let start = end.saturating_sub(app.message_viewport_height);
+        assert!((start..end).contains(&5), "the match is on screen");
+    }
+
+    #[test]
+    fn n_walks_matches_only_once_a_search_has_found_something() {
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+
+        // Before any search, `n` is an ordinary key in the log and must not be
+        // swallowed into a search that does not exist.
+        let before = app.msg_scroll;
+        handle_key_event(&mut app, press(KeyCode::Char('n')), &sender);
+        assert_eq!(app.msg_scroll, before, "n does nothing with no search");
+
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+        type_into_search(&mut app, "line 1");
+        handle_key_event(&mut app, press(KeyCode::Enter), &sender);
+
+        // "line 1" matches 1 and 10..19 — eleven lines, so there is something
+        // to walk in both directions.
+        let first = app.search.current().expect("a match");
+        handle_key_event(&mut app, press(KeyCode::Char('N')), &sender);
+        let older = app.search.current().expect("a match");
+        assert!(older < first, "N steps towards older matches");
+
+        handle_key_event(&mut app, press(KeyCode::Char('n')), &sender);
+        assert_eq!(app.search.current(), Some(first), "n comes back");
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_leaves_the_log_where_it_was() {
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        app.msg_scroll = 7;
+
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+        type_into_search(&mut app, "nonesuch");
+        handle_key_event(&mut app, press(KeyCode::Enter), &sender);
+
+        assert_eq!(app.msg_scroll, 7, "nothing to jump to, nothing moved");
+        assert!(!app.search.is_walking(), "and n is not captured");
+    }
+
+    #[test]
+    fn switching_conversation_forgets_a_finished_search() {
+        // The hits are indices into one conversation. Carried across a switch
+        // they would point at whatever sits at that position in another log.
+        let mut app = searchable_app();
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+        type_into_search(&mut app, "line 5");
+        handle_key_event(&mut app, press(KeyCode::Enter), &sender);
+        assert!(app.search.is_walking());
+
+        app.switch_to_public();
+
+        assert!(!app.search.is_walking(), "the search did not survive the switch");
+        assert_eq!(app.search.current(), None);
+    }
+
+    #[test]
+    fn slash_in_the_compose_box_is_still_a_command_prefix() {
+        // The one thing this feature must not break: `/` starts `/map`,
+        // `/help` and the rest, and the log's `/` must not have stolen it.
+        let mut app = composing("");
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+
+        handle_key_event(&mut app, press(KeyCode::Char('/')), &sender);
+
+        assert!(!app.search.prompt_open, "no search from the input box");
+        assert_eq!(app.input.value(), "/", "the slash was typed as text");
     }
 
     #[test]

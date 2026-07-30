@@ -102,6 +102,8 @@ and flags the ones running BitChat:
 |---|---|
 | `Tab` | move between the sidebar, the log and the input box |
 | wheel | scroll the log, wherever the focus is |
+| `/` | search the log — from the log pane, not the input box |
+| `n` `N` | next and previous match, once a search has found something |
 | `m` | world map (also `/map`) |
 | `i` | view the newest image in this conversation (also `/img`) |
 | `:name:` | becomes an emoji as you close the colon; `Tab` takes a suggestion |
@@ -110,6 +112,13 @@ and flags the ones running BitChat:
 
 Pasting several lines at once puts all of it in the compose box and sends none of
 it — the line breaks become spaces, and nothing goes out until you press `Enter`.
+
+`/` searches the conversation on screen, matching the text of a line or the name
+of whoever said it, case-insensitively. The count beside the query updates as you
+type, `Enter` jumps to the newest match, and `n`/`N` walk the rest. `Esc` puts the
+log back exactly where it was. It searches the current conversation only — the
+matches are positions in one log, so switching channels clears them rather than
+pointing at whatever sits at that position somewhere else.
 
 The mouse wheel costs the terminal's own click-drag selection, because a program
 cannot both read the wheel and leave the mouse to the terminal. **`Shift`+drag

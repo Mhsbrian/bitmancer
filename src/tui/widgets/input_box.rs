@@ -13,8 +13,54 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{App, FocusArea};
 
+/// `⌕ query          3 of 17`
+///
+/// The count is live, so a query that finds nothing says so while it is being
+/// typed rather than after Enter. It is right-aligned only when there is room:
+/// on a narrow terminal the query keeps the space and the count is dropped,
+/// because what you are typing matters more than how many it found.
+fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
+    use crate::tui::theme;
+
+    let status = app.search.status();
+    let query_style = Style::default().fg(theme::TEXT);
+    let mut spans = vec![
+        Span::styled("⌕ ", Style::default().fg(theme::CURSOR)),
+        Span::styled(app.search.query.clone(), query_style),
+        // A block where the next character lands. The real cursor is not placed
+        // here because the compose box owns it, and two cursors on one screen is
+        // worse than none.
+        Span::styled("▏", Style::default().fg(theme::CURSOR)),
+    ];
+
+    let used = 2 + app.search.query.width() + 1;
+    let room = area.width as usize;
+    if !status.is_empty() && room > used + status.width() + 1 {
+        spans.push(Span::raw(" ".repeat(room - used - status.width())));
+        spans.push(Span::styled(
+            status,
+            Style::default().fg(if app.search.hit_count() == 0 {
+                theme::ALERT
+            } else {
+                theme::FAINT
+            }),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     use crate::tui::theme;
+
+    // The search prompt takes this line while it is open. Typed text belongs
+    // where typed text always appears, and borrowing the compose line rather
+    // than opening an overlay means the log stays fully visible behind it —
+    // which is the whole point of searching it.
+    if app.search.prompt_open {
+        render_search_prompt(f, app, area);
+        return;
+    }
 
     let focused = app.focus_area == FocusArea::InputBox;
 
