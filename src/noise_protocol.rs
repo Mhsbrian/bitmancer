@@ -1371,6 +1371,73 @@ impl NoisePattern {
 
 // MARK: - Key Validation
 
+/// The seven low-order points of Curve25519, as little-endian u-coordinates
+/// with bit 255 masked off.
+///
+/// A peer offering one of these forces the shared secret to a value known in
+/// advance — the small-subgroup attack `validate_public_key` exists to refuse.
+/// No honest peer sends one: an X25519 public key comes from a random scalar,
+/// so producing a low-order point by accident does not happen, and refusing
+/// them cannot cost an interoperable handshake.
+///
+/// The list this replaces was trying to be these and was not. One entry was 31
+/// bytes long, so it could never equal a key already length-checked to 32.
+/// Another was byte-reversed — big-endian one where the encoding is
+/// little-endian. Three more were `ff`-filled where p-1, p and p+1 end in `7f`.
+///
+/// Then a second layer underneath that one: even spelled correctly, comparing
+/// raw bytes catches only one of the *two* encodings each point has, because
+/// RFC 7748 masks bit 255. `validate_public_key` masks before comparing, which
+/// is what lets this table be exactly seven entries instead of fourteen.
+///
+/// Lives at module scope so the tests can audit it directly. Two do:
+/// `low_order_table_entries_are_actually_low_order` drives each entry through a
+/// real Diffie-Hellman and requires an all-zero secret, and
+/// `every_table_entry_is_reachable_by_the_check` requires the check to reject
+/// it. Between them, an entry that is wrong and an entry that is unreachable
+/// both fail, which is the pair of mistakes this table has already made once.
+const LOW_ORDER_POINTS: [[u8; 32]; 7] = [
+    // 0 — order 1. Also caught by the all-zero check; kept so this is the
+    // complete list rather than the complete list minus one.
+    [0x00; 32],
+    // 1 — order 4.
+    [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ],
+    // order 8.
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    // order 8. Published ending `d7`; stored masked, hence `57`.
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    // p - 1.
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // p.
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // p + 1.
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+];
+
 impl NoiseHandshakeState {
     /// Validate a Curve25519 public key
     /// Checks for weak/invalid keys that could compromise security
@@ -1380,96 +1447,45 @@ impl NoiseHandshakeState {
             return Err(NoiseError::InvalidPublicKey);
         }
 
+        let received: [u8; 32] = key_data
+            .try_into()
+            .map_err(|_| NoiseError::InvalidPublicKey)?;
+
+        // Compare on the masked form, never on the bytes as they arrived.
+        //
+        // RFC 7748 has the receiver ignore bit 255 of a u-coordinate, and
+        // x25519-dalek duly masks it before doing anything with the point. So
+        // every point on this curve has *two* legal encodings that differ only
+        // in that bit, and they are the same point: the Diffie-Hellman output
+        // is identical for both.
+        //
+        // A table compared against raw bytes therefore catches at most half of
+        // what it lists. That is not hypothetical — with the table below
+        // compared raw, all seven low-order points sailed through in their
+        // high-bit-set form, including zero, which also walks past an all-zero
+        // check that runs on the unmasked bytes. Masking first collapses the
+        // two encodings into one and makes the table complete by construction
+        // rather than by remembering to list every spelling.
+        let mut canonical = received;
+        canonical[31] &= 0x7f;
+
         // Check for all-zero key (point at infinity)
-        if key_data.iter().all(|&b| b == 0) {
+        if canonical.iter().all(|&b| b == 0) {
             return Err(NoiseError::InvalidPublicKey);
         }
 
-        // The seven low-order points of Curve25519, as little-endian
-        // u-coordinates. A peer offering one of these forces the shared secret
-        // to a value known in advance, which is the small-subgroup attack this
-        // check exists to refuse.
-        //
-        // The list this replaces was trying to be these and was not. One entry
-        // was 31 bytes long, so it could never equal a key that had already been
-        // length-checked to 32. Another was byte-reversed — big-endian one rather
-        // than little-endian — so it named a point nobody would ever send. And
-        // the three at the end were `ff`-filled rather than the `7f`-terminated
-        // values p-1, p and p+1 actually are. Four of the seven got through, and
-        // every one of them drives the Diffie-Hellman output to all zeroes.
-        //
-        // No honest peer sends one. An X25519 public key comes from a random
-        // scalar, so producing a low-order point by accident is not something
-        // that happens; refusing them cannot cost an interoperable handshake.
-        //
-        // The last three of the previous list are kept. They are not low-order
-        // points and nothing legitimate produces them either, so dropping them
-        // would relax a check for no reason.
-        const LOW_ORDER_POINTS: [[u8; 32]; 10] = [
-            // 0 — order 1. Also caught by the all-zero check above; kept so this
-            // table is the complete list rather than the complete list minus one.
-            [0x00; 32],
-            // 1 — order 4.
-            [
-                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-            ],
-            // order 8.
-            [
-                0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
-                0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
-                0x5f, 0x49, 0xb8, 0x00,
-            ],
-            // order 8.
-            [
-                0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83,
-                0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd,
-                0xd0, 0x9f, 0x11, 0x57,
-            ],
-            // p - 1.
-            [
-                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0x7f,
-            ],
-            // p.
-            [
-                0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0x7f,
-            ],
-            // p + 1.
-            [
-                0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0x7f,
-            ],
-            // Kept from the previous list: non-canonical, nothing honest sends them.
-            [0xff; 32],
-            [
-                0xda, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff,
-            ],
-            [
-                0xdb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0xff, 0xff, 0xff, 0xff,
-            ],
-        ];
-        // Compared as slices: `key_data` is length-checked to 32 above, so this
-        // is an equality test rather than a prefix one.
-        if LOW_ORDER_POINTS.iter().any(|point| point == key_data) {
+        if LOW_ORDER_POINTS.contains(&canonical) {
             debug_full_println!("[NOISE] Low-order point detected");
             return Err(NoiseError::InvalidPublicKey);
         }
 
-        // Try to create the key - x25519-dalek will validate curve points internally
-        let key_array: [u8; 32] = key_data
-            .try_into()
-            .map_err(|_| NoiseError::InvalidPublicKey)?;
-        Ok(PublicKey::from(key_array))
+        // The key is built from the bytes as they arrived, not from the masked
+        // copy. Masking is how the point is *recognised*; the transcript has to
+        // keep what the peer actually sent, because the peer mixed those same
+        // bytes into its own handshake hash. For an honest key the two are
+        // identical anyway — a real u-coordinate is below p, so bit 255 is
+        // already clear and the mask is a no-op.
+        Ok(PublicKey::from(received))
     }
 }
 
@@ -1639,7 +1655,13 @@ mod adversarial_tests {
         ("order 1", "0000000000000000000000000000000000000000000000000000000000000000"),
         ("order 4", "0100000000000000000000000000000000000000000000000000000000000000"),
         ("order 8 a", "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
-        ("order 8 b", "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        // Ends d7, which is how this point is published. The table it is
+        // checked against stores 57 — the same value with bit 255 masked off —
+        // and that is correct now only because the check masks before
+        // comparing. Written the published way on purpose: a constant that
+        // matches the implementation's spelling cannot catch the
+        // implementation's spelling being wrong.
+        ("order 8 b", "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7"),
         ("p-1", "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
         ("p", "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
         ("p+1", "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
@@ -1651,6 +1673,71 @@ mod adversarial_tests {
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
             .collect();
         bytes.try_into().expect("32 bytes")
+    }
+
+    /// Every low-order point again, with bit 255 set.
+    ///
+    /// RFC 7748 has the receiver mask that bit, so each of these is the *same
+    /// point* as its counterpart above and reaches the same all-zero shared
+    /// secret. All seven were accepted while the check compared raw bytes —
+    /// including zero, whose high-bit-set form walks past an all-zero test that
+    /// runs before masking. Enumerating points cannot fix that, because the
+    /// thing being enumerated has two spellings; masking first can, and this is
+    /// the test that says so.
+    #[test]
+    fn the_other_encoding_of_every_low_order_point_is_refused_too() {
+        for (name, hex) in CANONICAL_LOW_ORDER {
+            let mut point = hex32(hex);
+            point[31] |= 0x80;
+            assert!(
+                NoiseHandshakeState::validate_public_key(&point).is_err(),
+                "{name} with bit 255 set is the same point and must be refused"
+            );
+        }
+    }
+
+    /// The table holds what it claims to hold.
+    ///
+    /// Checked by behaviour rather than by eye: each entry is driven through a
+    /// real Diffie-Hellman and has to produce an all-zero shared secret, which
+    /// is what makes a point worth refusing. Three entries inherited from the
+    /// original list did not survive this — they were `ff`-terminated values
+    /// described as "not low-order points, kept because dropping them would
+    /// relax a check," and after masking they could not have matched anything
+    /// anyway. An entry nobody can reach is indistinguishable from an entry
+    /// nobody needs, and this is the test that tells them apart.
+    #[test]
+    fn low_order_table_entries_are_actually_low_order() {
+        let secret = StaticSecret::from([9u8; 32]);
+        for (index, entry) in super::LOW_ORDER_POINTS.iter().enumerate() {
+            let shared = secret.diffie_hellman(&PublicKey::from(*entry));
+            assert!(
+                shared.as_bytes().iter().all(|&byte| byte == 0),
+                "table entry {index} does not zero the shared secret, so it is \
+                 not a low-order point and does not belong in this table"
+            );
+            assert!(
+                !shared.was_contributory(),
+                "table entry {index} is contributory, so it is not the hazard \
+                 this table exists to refuse"
+            );
+        }
+    }
+
+    /// Nothing in the table is unreachable.
+    ///
+    /// The defect that started all of this was an entry that could never equal
+    /// any input — 31 bytes long, against a key already length-checked to 32.
+    /// Every entry must be something `validate_public_key` actually rejects,
+    /// or it is decoration.
+    #[test]
+    fn every_table_entry_is_reachable_by_the_check() {
+        for (index, entry) in super::LOW_ORDER_POINTS.iter().enumerate() {
+            assert!(
+                NoiseHandshakeState::validate_public_key(entry).is_err(),
+                "table entry {index} is not refused by the check that lists it"
+            );
+        }
     }
 
     #[test]
