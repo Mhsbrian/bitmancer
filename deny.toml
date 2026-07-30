@@ -1,0 +1,52 @@
+# cargo-deny configuration.
+#
+# The gate exists because build, test and clippy were all green while the
+# lockfile carried three RUSTSEC vulnerabilities and a yanked curve25519-dalek.
+# Nothing in the other three checks looks at what we depend on.
+
+[advisories]
+# A yanked version is not a vulnerability, but on a client whose value is its
+# crypto, a yanked curve implementation pinned in the lockfile is worth failing
+# for rather than warning about.
+yanked = "deny"
+
+ignore = [
+    # paste is a build-time proc-macro with no runtime surface, and the advisory
+    # is "unmaintained" rather than a vulnerability. There is no safe upgrade —
+    # it arrives transitively and cannot be dropped without dropping the crate
+    # that pulls it in. Revisit when an upstream stops depending on it.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# bitmancer is "MIT OR Apache-2.0". These are the licences its tree actually
+# resolves to; anything new has to be added deliberately rather than absorbed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    # secp256k1 and secp256k1-sys — the Nostr signing curve. A public-domain
+    # dedication, and the same choice upstream BitChat made for the protocol
+    # this client speaks.
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are normal in a tree this size (three `rand` majors arrive
+# through btleplug, secp256k1 and our own dependency). Warn so the count is
+# visible without failing the build on someone else's dependency choice.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

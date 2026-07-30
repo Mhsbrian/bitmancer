@@ -38,3 +38,96 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  # Debug and release differ on integer overflow: debug panics, release wraps.
+  # The Noise replay window adds REPLAY_WINDOW_SIZE to an attacker-influenced
+  # nonce, and that is only in-range because the nonce is bounded to u32 by
+  # NONCE_SIZE_BYTES. A gate that only runs debug would not notice if that
+  # invariant were ever relaxed.
+  test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Test (release)
+        run: cargo test --locked --release
+
+  # This is a terminal client, and every check above runs on Linux only. The
+  # platform-specific surface is real: btleplug swaps BlueZ/D-Bus for
+  # CoreBluetooth, and crossterm's raw-mode and key handling differ. A check
+  # job catches the compile break; it does not need a radio to be useful.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  # Build, test and clippy were all green while the lockfile carried
+  # RUSTSEC-2026-0007 (bytes), RUSTSEC-2026-0009 (time), RUSTSEC-2025-0047
+  # (slab) and a yanked curve25519-dalek. None of those checks look at what we
+  # depend on. See deny.toml for what is deliberately ignored and why.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # "634 tests pass" says nothing about which lines they reach. Measured
+  # baseline at 51641be: 71.26% region, 78.93% function, 69.72% line. That
+  # total hides the spread, which is the useful part — mesh.rs 93%, but
+  # transport.rs 5.8%, nostr/client.rs 20%, noise_session.rs 43%, and main.rs
+  # 0.00% across all 2247 of its regions.
+  #
+  # The floor is set well under the baseline: it is here to catch a collapse,
+  # not to police single percentage points. Raise it as the gaps above close.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Coverage
+        run: |
+          cargo llvm-cov --locked --summary-only --fail-under-lines 65 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
