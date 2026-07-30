@@ -196,6 +196,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut geo = GeoService::new(nostr_device_seed, &mesh.nickname);
 
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
+    // From here to the end of main the terminal is ours. The guard hands it back
+    // on every path out — the `?`s below, a panic, or the ordinary quit — so no
+    // future early return can strand the user in raw mode.
+    let _terminal_guard = tui_mod::TerminalGuard::new();
     let mut app = App::new_with_nickname(mesh.nickname.clone());
     app.short_peer_id = crate::peer_id::short_display(&mesh.my_peer_id);
     app.add_popup_message(format!("You are {} ({})", mesh.nickname, mesh.my_peer_id));
@@ -1168,7 +1172,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tui_mod::restore().expect("Failed to restore terminal");
+    // No explicit restore: `_terminal_guard` does it as this scope ends, and on
+    // every path that never reaches here.
     Ok(())
 }
 
