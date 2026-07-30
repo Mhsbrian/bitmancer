@@ -6,6 +6,7 @@
 mod announce;
 mod commands;
 mod compression;
+mod courier;
 mod data_structures;
 mod discovery;
 mod file_packet;
@@ -14,6 +15,7 @@ mod fragment;
 mod gateway;
 mod geo;
 mod geohash;
+mod mailbox;
 mod media;
 mod mesh;
 mod noise_payload;
@@ -222,6 +224,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Gateway mode: off until asked, and only advertised while the relays are
     // actually answering.
     let mut carrier = gateway::Gateway::new();
+    // The shelf. Restored on the way in, minus anything that expired while we
+    // were off — a restart must not extend the promise.
+    let mut post = mailbox::Mailbox::open(courier::now_millis());
     let mut relays_up = false;
     // Relays currently answering. Held as a set rather than a count so a
     // repeated failure from one host cannot take the whole gateway down.
@@ -301,6 +306,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ) {
                                     nostr_client.publish(&geohash, event).await;
                                 }
+                            }
+                            MeshEvent::CourierDeposit {
+                                depositor,
+                                envelope,
+                            } => shelve(&mut app, &mut post, &mesh, &depositor, *envelope),
+                            MeshEvent::CourierArrived { courier, envelope } => {
+                                // We can carry and deliver but not yet open: the
+                                // ciphertext is one-way Noise to our static key,
+                                // a pattern this client does not implement. Said
+                                // plainly rather than dropped, because somebody
+                                // went to real trouble to get it here.
+                                app.add_log_message(format!(
+                                    "system: {} carried sealed mail here for you ({} bytes). Opening couriered mail is not implemented yet, so it has been left unread.",
+                                    peer_id::short_display(&courier),
+                                    envelope.ciphertext.len()
+                                ));
                             }
                             other => apply_mesh_event(&mut app, other, &mut last_notice),
                         }
@@ -542,6 +563,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // wrote to us and roughly when, in its own file
                             // beside the identity rather than inside it.
                             seen_envelopes.wipe();
+                            // Other people's mail must not outlive a wipe.
+                            post.wipe();
                             let what = if existed {
                                 "Identity destroyed."
                             } else {
@@ -657,6 +680,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(reason) => {
                             app.add_log_message(format!("system: {reason}"));
                         }
+                    }
+                }
+                CommandOutcome::SetMailbox(wanted) => {
+                    let dropped = post.set_enabled(wanted);
+                    if wanted {
+                        app.add_log_message(
+                            "system: holding mail for peers who are not here. Anyone nearby can leave sealed messages; they are opaque to you and expire within a day."
+                                .to_string(),
+                        );
+                    } else {
+                        app.add_log_message("system: no longer holding mail.".to_string());
+                        if dropped > 0 {
+                            app.add_log_message(format!(
+                                "system: discarded {dropped} item(s) that were waiting. Their senders were never told, so they may try again elsewhere."
+                            ));
+                        }
+                    }
+                }
+                CommandOutcome::ShowMailbox => {
+                    let now = courier::now_millis();
+                    let mut lines = vec![
+                        format!(
+                            "Mailbox: {}",
+                            if post.is_enabled() { "holding" } else { "off" }
+                        ),
+                        format!(
+                            "  {} item(s) waiting, {} handed over this session",
+                            post.held_count(),
+                            post.delivered
+                        ),
+                    ];
+                    let shelf = post.summary(now);
+                    if shelf.is_empty() {
+                        lines.push("  nothing on the shelf".to_string());
+                    } else {
+                        lines.push("By depositor:".to_string());
+                        lines.extend(shelf);
+                    }
+                    lines.push(String::new());
+                    lines.push(
+                        "You cannot read any of it. An envelope names its recipient".to_string(),
+                    );
+                    lines.push(
+                        "only by a tag that rotates daily, and its contents are".to_string(),
+                    );
+                    lines.push("sealed to them.".to_string());
+                    // One call per line. `add_log_message` reads the "system:"
+                    // prefix off the front, so joining pre-prefixed lines leaves
+                    // every line after the first showing it literally.
+                    for line in lines {
+                        app.add_log_message(format!("system: {line}"));
                     }
                 }
                 CommandOutcome::SetGateway(wanted) => {
@@ -924,6 +998,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for mesh_event in mesh.prune_peers() {
                 apply_mesh_event(&mut app, mesh_event, &mut last_notice);
             }
+            if post.is_enabled() {
+                post.prune(courier::now_millis());
+                // Every known peer, because an announce is what makes their mail
+                // recognisable and we may have been given some since they
+                // arrived. Cheap for a handful of peers, and mail that waited
+                // hours does not mind waiting one more second.
+                let recipients: Vec<String> = mesh.peers.keys().cloned().collect();
+                for peer_id in recipients {
+                    for frame in hand_over(&mut app, &mut post, &mesh, &peer_id) {
+                        let _ = transport.outbound.send(Outbound::All(frame)).await;
+                    }
+                }
+            }
+
             for (target, event) in geo.due_presence() {
                 nostr_client.publish(&target, event).await;
             }
@@ -982,6 +1070,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Reflected every frame rather than set at the toggle: the count climbs
         // as traffic is carried, and the band is the only place it shows.
         app.carrying = carrier.is_enabled().then_some(carried_out);
+        app.holding = post.is_enabled().then(|| post.held_count());
         if app.mesh_view_open {
             app.topology = topology::Topology::build(
                 &mesh.my_peer_id,
@@ -1207,9 +1296,11 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             let clock = chrono::Local::now().format("%H%M");
             app.add_log_message(format!("__DM__:{sender}:{clock}:{message_id}:{content}"));
         }
-        // Handled in the frame loop, where the gateway policy, the relay pool
-        // and the toggle are all in scope. Nothing routes one here.
-        MeshEvent::CarriedEvent { .. } => {}
+        // Handled in the frame loop, where the gateway policy, the relay pool,
+        // the shelf and the toggles are all in scope. Nothing routes one here.
+        MeshEvent::CarriedEvent { .. }
+        | MeshEvent::CourierDeposit { .. }
+        | MeshEvent::CourierArrived { .. } => {}
         MeshEvent::SessionUp {
             nickname,
             fingerprint,
@@ -1288,6 +1379,85 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
         }
         MeshEvent::Trace(text) => app.add_log_message(format!("system: {text}")),
     }
+}
+
+/// Takes a deposit onto the shelf, or says why not.
+///
+/// The tier is decided here rather than in the mesh layer because it rests on
+/// favourites, which are a relationship rather than a protocol fact. A peer we
+/// have never verified gets nothing: holding mail costs us, and the least we can
+/// ask is a signature we checked.
+fn shelve(
+    app: &mut App,
+    post: &mut mailbox::Mailbox,
+    mesh: &MeshService,
+    depositor: &str,
+    envelope: courier::Envelope,
+) {
+    let mutual = mesh
+        .favorites
+        .resolve(depositor)
+        .is_some_and(|(_, relationship)| relationship.mutual());
+    let signed = mesh.peers.get(depositor).is_some_and(|peer| peer.verified);
+
+    let tier = if mutual {
+        mailbox::Tier::Favourite
+    } else if signed {
+        mailbox::Tier::Verified
+    } else {
+        // No trace line: an unverified announce is already reported, and a
+        // second complaint per envelope would be the noisier half of a problem
+        // the user cannot act on.
+        return;
+    };
+
+    match post.accept(envelope, depositor, tier, courier::now_millis()) {
+        mailbox::Deposit::Accepted => app.add_log_message(format!(
+            "system: holding sealed mail for someone, left by {} ({} on the shelf)",
+            peer_id::short_display(depositor),
+            post.held_count()
+        )),
+        // Silent: a depositor retrying because it never saw an acknowledgement
+        // is the ordinary case, not an event.
+        mailbox::Deposit::AlreadyHeld => {}
+        mailbox::Deposit::Refused(why) => app.add_log_message(format!(
+            "system: turned away mail from {}: {why}",
+            peer_id::short_display(depositor)
+        )),
+    }
+}
+
+/// Hands a peer anything we are holding for them.
+///
+/// Called when they announce, because an announce carries the static key the tag
+/// is derived from — being able to recognise their mail is a consequence of them
+/// saying hello, and needs nothing else.
+fn hand_over(
+    app: &mut App,
+    post: &mut mailbox::Mailbox,
+    mesh: &MeshService,
+    peer_id: &str,
+) -> Vec<Vec<u8>> {
+    if post.held_count() == 0 {
+        return Vec::new();
+    }
+    let Some(peer) = mesh.peers.get(peer_id) else {
+        return Vec::new();
+    };
+    let tags = courier::candidate_tags(&peer.noise_public_key, courier::now_seconds());
+    let theirs = post.collect(&tags);
+    if theirs.is_empty() {
+        return Vec::new();
+    }
+    app.add_log_message(format!(
+        "system: handed {} waiting message(s) to {}",
+        theirs.len(),
+        peer.nickname
+    ));
+    theirs
+        .iter()
+        .filter_map(|envelope| mesh.courier_frame(envelope, peer_id))
+        .collect()
 }
 
 /// Seconds since the epoch, or zero if the clock is before it.

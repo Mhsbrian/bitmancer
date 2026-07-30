@@ -43,6 +43,10 @@ pub enum CommandOutcome {
     SendDirectMessage { target: String, content: String },
     /// Start or stop carrying other people's geohash traffic to the relays.
     SetGateway(bool),
+    /// Start or stop holding sealed mail for peers who are not here.
+    SetMailbox(bool),
+    /// Report what is on the shelf.
+    ShowMailbox,
     /// Show the card someone standing next to us should read.
     ShowVerificationCard,
     /// Read a card they showed us and, if it holds up, trust the fingerprint.
@@ -204,6 +208,32 @@ pub fn handle(
             format!("Type  {command} confirm  to go ahead."),
         ]),
         "/wipe" | "/panic" => CommandOutcome::WipeIdentity,
+
+        "/mailbox" | "/post" if rest.eq_ignore_ascii_case("on") => CommandOutcome::SetMailbox(true),
+        "/mailbox" | "/post" if rest.eq_ignore_ascii_case("off") => CommandOutcome::SetMailbox(false),
+        "/mailbox" | "/post" if rest.eq_ignore_ascii_case("status") => CommandOutcome::ShowMailbox,
+        "/mailbox" | "/post" => CommandOutcome::Reply(vec![
+            "A mailbox holds sealed messages for peers who are not here.".to_string(),
+            String::new(),
+            "Someone with no internet and no way to reach a friend hands you".to_string(),
+            "the message instead. You hold it. The friend walks past hours".to_string(),
+            "later and collects it. No relay, no tower, nothing but two".to_string(),
+            "radios and time.".to_string(),
+            String::new(),
+            "You cannot read any of it, and that is structural rather than".to_string(),
+            "polite: an envelope names its recipient only by a tag that".to_string(),
+            "rotates daily, and its contents are sealed to them. What you do".to_string(),
+            "learn is who left something and roughly when, because that is".to_string(),
+            "what a fair share of the shelf has to be counted against.".to_string(),
+            String::new(),
+            "What it costs you: a little disk, for at most a day per item.".to_string(),
+            "Mutual favourites get the larger share; peers you have merely".to_string(),
+            "verified get a small one, and never at a favourite's expense.".to_string(),
+            String::new(),
+            "  /mailbox on       start holding".to_string(),
+            "  /mailbox off      stop, and discard anything waiting".to_string(),
+            "  /mailbox status   what is on the shelf".to_string(),
+        ]),
 
         "/gateway" if rest.eq_ignore_ascii_case("on") => CommandOutcome::SetGateway(true),
         "/gateway" if rest.eq_ignore_ascii_case("off") => CommandOutcome::SetGateway(false),
@@ -427,6 +457,7 @@ fn help_text() -> Vec<String> {
         "                        address, so you stay reachable out of range".to_string(),
         "  /verify               Check a peer is who you think, in person".to_string(),
         "  /gateway on|off       Share your internet with nearby mesh peers".to_string(),
+        "  /mailbox on|off       Hold sealed mail for peers who are away".to_string(),
         "  /send <path>          Send a file to everyone on the mesh".to_string(),
         "  /block <nick>         Refuse everything from a peer".to_string(),
         "  /status               Link, peer and identity info".to_string(),

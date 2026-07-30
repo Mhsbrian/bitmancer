@@ -177,6 +177,11 @@ pub struct App {
     /// user's bandwidth and puts their address on relays for messages they did
     /// not write, and a mode like that should not be possible to forget.
     pub carrying: Option<usize>,
+    /// How much mail is on the shelf, and `None` when not holding any.
+    ///
+    /// On the band for the same reason as `carrying`: this one stores other
+    /// people's data on the user's disk, and that should not be forgettable.
+    pub holding: Option<usize>,
     /// The mesh graph overlay, and the picture it draws. Rebuilt from the mesh
     /// layer each frame it is open — cheap for a handful of peers, and always
     /// current, which a cached graph of a moving mesh would not be.
@@ -367,6 +372,7 @@ impl App {
             map: crate::tui::map::MapState::new(),
             joined_geohashes: std::collections::HashSet::new(),
             carrying: None,
+            holding: None,
             mesh_view_open: false,
             topology: crate::topology::Topology::default(),
             pending_geohash_join: None,

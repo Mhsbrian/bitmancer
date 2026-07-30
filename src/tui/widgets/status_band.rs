@@ -84,6 +84,13 @@ fn telemetry(app: &App) -> Vec<Span<'static>> {
         spans.push(Span::raw("  "));
     }
 
+    // Present only while holding, like the gateway field: the band should not
+    // spend width on a mode that is off, nor let one that is on go unnoticed.
+    if let Some(waiting) = app.holding {
+        spans.extend(theme::field("post", format!("✉{waiting:<3}"), theme::LIVE));
+        spans.push(Span::raw("  "));
+    }
+
     spans.extend(theme::field("up", uptime(app.started.elapsed()), theme::TEXT));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(

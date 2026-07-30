@@ -55,6 +55,23 @@ pub enum MeshEvent {
         fingerprint: String,
         notice: FavoriteNotice,
     },
+    /// Sealed mail a peer handed us to hold for somebody who is not here.
+    ///
+    /// Opaque: we cannot read it and are not meant to. The tier a depositor
+    /// gets is the caller's decision, because it depends on favourites, which
+    /// are a relationship rather than a protocol fact.
+    CourierDeposit {
+        depositor: String,
+        envelope: Box<crate::courier::Envelope>,
+    },
+    /// Mail addressed to *us*, carried here by somebody.
+    ///
+    /// Recognised by its tag matching one of ours, which is the only way to
+    /// tell a delivery from a deposit — they are the same packet.
+    CourierArrived {
+        courier: String,
+        envelope: Box<crate::courier::Envelope>,
+    },
     /// A signed Nostr event a peer handed us over Bluetooth, either asking us
     /// to publish it or passing on what a gateway published.
     ///
@@ -955,6 +972,52 @@ impl MeshService {
         }
     }
 
+    /// Sealed mail, either for us or for someone we might hold it for.
+    ///
+    /// One packet type serves both directions, and the tag decides which: if it
+    /// matches one of ours the mail is a delivery, otherwise it is a deposit.
+    /// Nothing else could distinguish them, and nothing else needs to — a
+    /// courier that could tell whose mail it holds would defeat the point.
+    fn handle_courier(&mut self, packet: &Packet, sender: &str) -> Vec<MeshEvent> {
+        let Some(envelope) = crate::courier::Envelope::decode(&packet.payload) else {
+            return vec![MeshEvent::Trace(format!(
+                "unreadable courier envelope from {}",
+                short_display(sender)
+            ))];
+        };
+        let now_seconds = crate::courier::now_seconds();
+        let ours = crate::courier::candidate_tags(&self.noise_public_key, now_seconds)
+            .contains(&envelope.recipient_tag);
+
+        if ours {
+            vec![MeshEvent::CourierArrived {
+                courier: sender.to_string(),
+                envelope: Box::new(envelope),
+            }]
+        } else {
+            vec![MeshEvent::CourierDeposit {
+                depositor: sender.to_string(),
+                envelope: Box::new(envelope),
+            }]
+        }
+    }
+
+    /// Wraps sealed mail for the air, directed at whoever it is for.
+    pub fn courier_frame(
+        &self,
+        envelope: &crate::courier::Envelope,
+        recipient: &str,
+    ) -> Option<Vec<u8>> {
+        let mut packet = Packet::new(
+            MessageType::CourierEnvelope,
+            self.sender_bytes(),
+            envelope.encode()?,
+            MESSAGE_TTL,
+        );
+        packet = packet.with_recipient(peer_id_to_bytes(recipient));
+        packet.encode()
+    }
+
     /// A carried Nostr event, from a peer asking us to publish it or from a
     /// gateway passing on what it published.
     ///
@@ -1195,6 +1258,7 @@ impl MeshService {
             Some(MessageType::Leave) => self.handle_leave(&sender),
             Some(MessageType::FileTransfer) => self.handle_file(&packet),
             Some(MessageType::NostrCarrier) => self.handle_carrier(&packet, &sender),
+            Some(MessageType::CourierEnvelope) => self.handle_courier(&packet, &sender),
             Some(MessageType::NoiseHandshake) => self.handle_noise_handshake(&packet),
             Some(MessageType::NoiseEncrypted) => self.handle_noise_encrypted(&packet),
             Some(_) => Vec::new(),
@@ -2660,6 +2724,160 @@ mod favorite_tests {
             alice.favorites.nostr_key_for(&bob_fp),
             Some("npub1bob")
         );
+    }
+}
+
+#[cfg(test)]
+mod courier_tests {
+    use super::*;
+    use crate::courier::{self, Envelope, TAG_BYTES};
+
+    fn sealed_for(recipient: &MeshService, now_seconds: u64) -> Envelope {
+        // Addressed the way a real sender would: by tag, derived from the
+        // recipient's announced static key and today's date.
+        let tag = courier::recipient_tag(&recipient.noise_public_key, courier::epoch_day(now_seconds));
+        Envelope::new(
+            tag,
+            now_seconds * 1000 + 3_600_000,
+            b"sealed to them, opaque to everyone else".to_vec(),
+            1,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mail_for_somebody_else_is_a_deposit() {
+        // The courier's whole position: it can tell the mail is not for it, and
+        // that is the only thing it can tell.
+        let depositor = MeshService::new([21; 32], [22; 32], "alice");
+        let mut post_office = MeshService::new([11; 32], [12; 32], "laptop");
+        let stranger = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        let envelope = sealed_for(&stranger, now);
+        let frame = depositor
+            .courier_frame(&envelope, &post_office.my_peer_id)
+            .expect("a directed deposit");
+
+        let events = post_office.handle_frame(&frame);
+        let deposit = events.iter().find_map(|event| match event {
+            MeshEvent::CourierDeposit {
+                depositor,
+                envelope,
+            } => Some((depositor, envelope)),
+            _ => None,
+        });
+        let (who, held) = deposit.expect("recognised as somebody else's mail");
+        assert_eq!(who, &depositor.my_peer_id);
+        assert_eq!(held.ciphertext, envelope.ciphertext, "carried unaltered");
+    }
+
+    #[test]
+    fn mail_for_us_is_a_delivery() {
+        // Same packet type, opposite meaning, and the tag is the only thing that
+        // distinguishes them — which is exactly as much as a courier should know.
+        let courier_peer = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut recipient = MeshService::new([11; 32], [12; 32], "bob");
+        let now = courier::now_seconds();
+
+        let envelope = sealed_for(&recipient, now);
+        let frame = courier_peer
+            .courier_frame(&envelope, &recipient.my_peer_id)
+            .unwrap();
+
+        let arrived = recipient.handle_frame(&frame).into_iter().any(|event| {
+            matches!(event, MeshEvent::CourierArrived { .. })
+        });
+        assert!(arrived, "our own tag must be recognised");
+    }
+
+    #[test]
+    fn mail_sealed_yesterday_still_arrives_today() {
+        // Tags rotate at midnight and clocks disagree. Checking only today would
+        // fail to deliver precisely the mail that has been waiting longest.
+        let courier_peer = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut recipient = MeshService::new([11; 32], [12; 32], "bob");
+        let now = courier::now_seconds();
+
+        let yesterday = courier::recipient_tag(
+            &recipient.noise_public_key,
+            courier::epoch_day(now) - 1,
+        );
+        let envelope =
+            Envelope::new(yesterday, now * 1000 + 3_600_000, b"waited overnight".to_vec(), 1, None)
+                .unwrap();
+        let frame = courier_peer
+            .courier_frame(&envelope, &recipient.my_peer_id)
+            .unwrap();
+
+        assert!(recipient
+            .handle_frame(&frame)
+            .into_iter()
+            .any(|event| matches!(event, MeshEvent::CourierArrived { .. })));
+    }
+
+    #[test]
+    fn a_courier_cannot_tell_whose_mail_it_holds() {
+        // Stated as a test because it is the property the whole scheme rests on:
+        // the tag is keyed on the recipient's public key, so holding an envelope
+        // reveals nothing about its destination to anyone who does not already
+        // know that key.
+        let bob = MeshService::new([11; 32], [12; 32], "bob");
+        let carol = MeshService::new([31; 32], [32; 32], "carol");
+        let now = courier::now_seconds();
+
+        let for_bob = sealed_for(&bob, now);
+        let for_carol = sealed_for(&carol, now);
+        assert_ne!(for_bob.recipient_tag, for_carol.recipient_tag);
+
+        // A courier holding Bob's mail can only recognise it as Bob's by
+        // computing his tag — which needs his announced key.
+        let tags = courier::candidate_tags(&bob.noise_public_key, now);
+        assert!(tags.contains(&for_bob.recipient_tag));
+        assert!(!tags.contains(&for_carol.recipient_tag));
+    }
+
+    #[test]
+    fn an_unreadable_envelope_is_not_fatal() {
+        let mut us = MeshService::new([11; 32], [12; 32], "us");
+        let frame = Packet::new(
+            MessageType::CourierEnvelope,
+            peer_id_to_bytes("aa11bb22cc33dd44"),
+            vec![0xFF; 20],
+            7,
+        )
+        .with_recipient(peer_id_to_bytes(&us.my_peer_id))
+        .encode()
+        .unwrap();
+        assert!(!us.handle_frame(&frame).into_iter().any(|event| matches!(
+            event,
+            MeshEvent::CourierDeposit { .. } | MeshEvent::CourierArrived { .. }
+        )));
+    }
+
+    #[test]
+    fn a_delivery_frame_round_trips_the_envelope_exactly() {
+        // A courier that altered a byte would break a seal it cannot even read,
+        // and the failure would surface at the recipient rather than here.
+        let courier_peer = MeshService::new([21; 32], [22; 32], "laptop");
+        let recipient = MeshService::new([11; 32], [12; 32], "bob");
+        let envelope = sealed_for(&recipient, courier::now_seconds());
+
+        let frame = courier_peer
+            .courier_frame(&envelope, &recipient.my_peer_id)
+            .unwrap();
+        let packet = Packet::decode(&frame).unwrap();
+        assert_eq!(Envelope::decode(&packet.payload).as_ref(), Some(&envelope));
+        assert_eq!(packet.recipient_hex().as_deref(), Some(recipient.my_peer_id.as_str()));
+    }
+
+    #[test]
+    fn every_tag_is_sixteen_bytes_whatever_the_key() {
+        for seed in [0u8, 1, 0x7f, 0xff] {
+            let tag = courier::recipient_tag(&[seed; 32], 0);
+            assert_eq!(tag.len(), TAG_BYTES);
+        }
     }
 }
 

@@ -438,6 +438,46 @@ only stored thing that costs a walk across town to rebuild, so it persists in
   that is not ours — otherwise a peer collects our signature over a claim about
   a third party.
 
+## The mailbox (`/mailbox`)
+
+The one thing in the protocol that needs **no infrastructure at all** — not a
+relay, not a tower. Alice seals a message for Bob and hands it to whoever is
+nearby. That somebody holds it. Bob walks past hours later and collects it.
+
+A courier learns nothing: the only routing information is a 16-byte tag,
+`HMAC-SHA256(recipient's noise static key, "bitchat-courier-tag-v1" ‖ epoch_day)`,
+so envelopes for the same person on different days do not correlate for anyone
+who does not already know that person's key. Delivery works because an announce
+carries that key — recognising someone's mail is a consequence of them saying
+hello, and needs nothing else.
+
+- **A deposit and a delivery are the same packet.** `courierEnvelope 0x04` in
+  both directions; the tag matching one of *ours* is the only thing that
+  distinguishes them, and nothing else needs to. A courier that could tell whose
+  mail it holds would defeat the point.
+- **Tags are checked for yesterday, today and tomorrow.** They rotate at midnight
+  and clocks disagree, so checking only today would fail to deliver precisely the
+  mail that has waited longest.
+- **A carry-only envelope omits the `copies` field** rather than writing 1, or it
+  is not byte-identical to one from a client predating spray-and-wait and the
+  same message deduplicates differently on the two ends.
+- **A stranger's deposit never displaces a favourite's mail.** When the shelf is
+  full of mail from people we know, a verified-but-unfamiliar peer is refused
+  rather than served at their cost. Upstream's judgement, worth keeping.
+- **It persists**, because a mailbox that forgets on restart is not a mailbox —
+  but a restart does not extend the promise: anything past its deadline is
+  dropped on the way in, not loaded and then swept.
+- **We hold and deliver; we do not spray.** Spraying is how a *moving* courier
+  compensates for never meeting the recipient. This client usually does not move,
+  so being reliably in one place is what it offers instead. A phone is a postal
+  van; this is the box on the corner. The copy budget is preserved and honoured,
+  never spent.
+- **Not done: opening mail addressed to us.** The ciphertext is one-way Noise to
+  our static key, a pattern this client does not implement — we have interactive
+  XX for sessions. Arrival is reported plainly rather than dropped, because
+  somebody went to real trouble to get it here. Composing an envelope needs the
+  same primitive, so both halves of "post and read" wait on it together.
+
 ## Seeing the mesh (`/mesh`)
 
 Three things this client does were invisible: it holds up to six links and showed
