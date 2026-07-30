@@ -1003,8 +1003,20 @@ impl NoiseHandshakeState {
                         &format!("Ephemeral key bytes: {:?}", &ephemeral_bytes[..8]),
                     );
 
-                    let ephemeral_key =
-                        PublicKey::from(<[u8; 32]>::try_from(ephemeral_bytes).unwrap());
+                    // Checked like the static key below, and for the same reason.
+                    // This was the larger half of the gap: the static key was
+                    // validated and the ephemeral was not, so a peer could send a
+                    // low-order point here and drive `ee` — and every later
+                    // mixing that uses it — to a shared secret of all zeroes.
+                    // Refusing before `mix_hash` matters: once these bytes are in
+                    // the transcript hash the handshake has already committed to
+                    // them.
+                    let ephemeral_key = Self::validate_public_key(ephemeral_bytes).inspect_err(|_| {
+                        log_noise_protocol_event(
+                            "READ_MESSAGE_E_ERROR",
+                            "Ephemeral key validation failed",
+                        );
+                    })?;
                     self.remote_ephemeral_public = Some(ephemeral_key);
                     self.symmetric_state.mix_hash(ephemeral_bytes);
 
@@ -1373,45 +1385,82 @@ impl NoiseHandshakeState {
             return Err(NoiseError::InvalidPublicKey);
         }
 
-        // Check for low-order points that could enable small subgroup attacks
-        // These are the known bad points for Curve25519
-        let low_order_points: [&[u8]; 8] = [
-            &[0x00; 32], // Already checked above
-            &[
+        // The seven low-order points of Curve25519, as little-endian
+        // u-coordinates. A peer offering one of these forces the shared secret
+        // to a value known in advance, which is the small-subgroup attack this
+        // check exists to refuse.
+        //
+        // The list this replaces was trying to be these and was not. One entry
+        // was 31 bytes long, so it could never equal a key that had already been
+        // length-checked to 32. Another was byte-reversed — big-endian one rather
+        // than little-endian — so it named a point nobody would ever send. And
+        // the three at the end were `ff`-filled rather than the `7f`-terminated
+        // values p-1, p and p+1 actually are. Four of the seven got through, and
+        // every one of them drives the Diffie-Hellman output to all zeroes.
+        //
+        // No honest peer sends one. An X25519 public key comes from a random
+        // scalar, so producing a low-order point by accident is not something
+        // that happens; refusing them cannot cost an interoperable handshake.
+        //
+        // The last three of the previous list are kept. They are not low-order
+        // points and nothing legitimate produces them either, so dropping them
+        // would relax a check for no reason.
+        const LOW_ORDER_POINTS: [[u8; 32]; 10] = [
+            // 0 — order 1. Also caught by the all-zero check above; kept so this
+            // table is the complete list rather than the complete list minus one.
+            [0x00; 32],
+            // 1 — order 4.
+            [
                 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x01,
-            ], // Point of order 1
-            &[
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x01,
-            ], // Another low-order point
-            &[
+                0x00, 0x00, 0x00, 0x00,
+            ],
+            // order 8.
+            [
                 0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
                 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
                 0x5f, 0x49, 0xb8, 0x00,
-            ], // Low order point
-            &[
+            ],
+            // order 8.
+            [
                 0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83,
                 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd,
                 0xd0, 0x9f, 0x11, 0x57,
-            ], // Low order point
-            &[0xff; 32], // All ones
-            &[
+            ],
+            // p - 1.
+            [
+                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+            // p.
+            [
+                0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+            // p + 1.
+            [
+                0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+            // Kept from the previous list: non-canonical, nothing honest sends them.
+            [0xff; 32],
+            [
                 0xda, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0xff, 0xff, 0xff, 0xff,
-            ], // Another bad point
-            &[
+            ],
+            [
                 0xdb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0xff, 0xff, 0xff, 0xff,
-            ], // Another bad point
+            ],
         ];
-
-        // Check against known bad points
-        if low_order_points.contains(&key_data) {
+        // Compared as slices: `key_data` is length-checked to 32 above, so this
+        // is an equality test rather than a prefix one.
+        if LOW_ORDER_POINTS.iter().any(|point| point == key_data) {
             debug_full_println!("[NOISE] Low-order point detected");
             return Err(NoiseError::InvalidPublicKey);
         }
@@ -1569,5 +1618,295 @@ mod replay_tests {
             b"before",
             "a rekey restarts the nonce space, so nonce 0 is legitimate again"
         );
+    }
+}
+
+/// The adversarial half of this file: what happens when the bytes are hostile
+/// rather than merely malformed.
+///
+/// `replay_tests` above covers the nonce window. These cover the other three
+/// places a peer's input reaches the cryptography — the public keys it offers,
+/// the ciphertext it sends, and the handshake messages it truncates.
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+
+    /// The seven low-order points of Curve25519 as little-endian u-coordinates.
+    /// Written out here independently of the table in `validate_public_key`, so
+    /// this is a check against the published values rather than against the
+    /// implementation restating itself.
+    const CANONICAL_LOW_ORDER: [(&str, &str); 7] = [
+        ("order 1", "0000000000000000000000000000000000000000000000000000000000000000"),
+        ("order 4", "0100000000000000000000000000000000000000000000000000000000000000"),
+        ("order 8 a", "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        ("order 8 b", "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        ("p-1", "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+        ("p", "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+        ("p+1", "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+    ];
+
+    fn hex32(hex: &str) -> [u8; 32] {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect();
+        bytes.try_into().expect("32 bytes")
+    }
+
+    #[test]
+    fn every_canonical_low_order_point_is_refused() {
+        // Four of these used to get through. The table meant to hold them had a
+        // 31-byte entry that could never match a length-checked key, a
+        // byte-reversed one, and three `ff`-filled values where p-1, p and p+1
+        // end in `7f`.
+        for (name, hex) in CANONICAL_LOW_ORDER {
+            let point = hex32(hex);
+            assert!(
+                NoiseHandshakeState::validate_public_key(&point).is_err(),
+                "{name} is a low-order point and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_low_order_point_would_have_made_the_shared_secret_predictable() {
+        // Why the test above matters, stated as an observation rather than an
+        // argument: each of these drives the Diffie-Hellman output to all zeroes,
+        // which is a value the other side knows before the handshake starts.
+        // Nothing in this client checks `was_contributory`, so refusing the point
+        // is the whole defence.
+        let secret = StaticSecret::from([9u8; 32]);
+        for (name, hex) in CANONICAL_LOW_ORDER {
+            let shared = secret.diffie_hellman(&PublicKey::from(hex32(hex)));
+            assert!(
+                shared.as_bytes().iter().all(|byte| *byte == 0),
+                "{name} should zero the shared secret, which is the point of refusing it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_honest_public_key_is_still_accepted() {
+        // The other half of the check above. A validator that refused everything
+        // would pass every assertion in this module and break every handshake.
+        let honest = PublicKey::from(&StaticSecret::from([3u8; 32]));
+        assert!(
+            NoiseHandshakeState::validate_public_key(honest.as_bytes()).is_ok(),
+            "a key derived from a real scalar must pass"
+        );
+    }
+
+    #[test]
+    fn a_public_key_of_the_wrong_length_is_refused() {
+        // The length is a stranger's claim, and the low-order comparison below it
+        // is only an equality test because this ran first.
+        for length in [0usize, 1, 31, 33, 64] {
+            assert!(
+                NoiseHandshakeState::validate_public_key(&vec![7u8; length]).is_err(),
+                "a {length}-byte key must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handshake_offering_a_low_order_ephemeral_is_refused() {
+        // End to end through `read_message`, which is where it would actually
+        // arrive. The ephemeral used to reach `mix_hash` with no check at all —
+        // the static key was validated and this one was not — so a peer could
+        // zero `ee` and everything mixed after it.
+        for (name, hex) in CANONICAL_LOW_ORDER {
+            let mut responder = NoiseHandshakeState::new(
+                NoiseRole::Responder,
+                NoisePattern::XX,
+                Some(StaticSecret::from([4u8; 32])),
+                None,
+            );
+            // XX message one is exactly the initiator's ephemeral.
+            let verdict = responder.read_message(&hex32(hex));
+            assert!(
+                verdict.is_err(),
+                "a handshake opening with the {name} point must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_honest_opening_handshake_message_is_still_read() {
+        // The negative control for the test above: the same path with a real
+        // ephemeral has to keep working, or the validation has simply broken
+        // handshaking.
+        let mut initiator = NoiseHandshakeState::new(
+            NoiseRole::Initiator,
+            NoisePattern::XX,
+            Some(StaticSecret::from([5u8; 32])),
+            None,
+        );
+        let mut responder = NoiseHandshakeState::new(
+            NoiseRole::Responder,
+            NoisePattern::XX,
+            Some(StaticSecret::from([6u8; 32])),
+            None,
+        );
+
+        let opening = initiator.write_message(&[]).expect("initiator writes -> e");
+        assert!(
+            responder.read_message(&opening).is_ok(),
+            "an honest opening message must still be read"
+        );
+    }
+
+    #[test]
+    fn a_tampered_tag_does_not_decrypt() {
+        // The AEAD is the only thing standing between a rewritten frame and the
+        // chat log, so a flipped bit anywhere in the ciphertext must fail rather
+        // than yield plaintext.
+        let key = ChaChaKey::clone_from_slice(&[11u8; 32]);
+        let mut sender = NoiseCipherState::new_with_key(key, true);
+        let mut receiver = NoiseCipherState::new_with_key(key, true);
+
+        let frame = sender.encrypt(b"the original words", b"").expect("encrypt");
+        assert!(receiver.decrypt(&frame, b"").is_ok(), "the untouched frame opens");
+
+        for index in NONCE_SIZE_BYTES..frame.len() {
+            let mut tampered = frame.clone();
+            tampered[index] ^= 0x01;
+            let mut fresh = NoiseCipherState::new_with_key(key, true);
+            assert!(
+                fresh.decrypt(&tampered, b"").is_err(),
+                "flipping a bit at offset {index} must not still decrypt"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wrong_associated_data_does_not_decrypt() {
+        // Associated data binds a frame to its context. If it were ignored, a
+        // frame lifted from one context would open in another.
+        let key = ChaChaKey::clone_from_slice(&[12u8; 32]);
+        let mut sender = NoiseCipherState::new_with_key(key, true);
+        let frame = sender.encrypt(b"bound to a context", b"context-one").expect("encrypt");
+
+        let mut receiver = NoiseCipherState::new_with_key(key, true);
+        assert!(
+            receiver.decrypt(&frame, b"context-two").is_err(),
+            "different associated data must not open the frame"
+        );
+
+        let mut correct = NoiseCipherState::new_with_key(key, true);
+        assert!(
+            correct.decrypt(&frame, b"context-one").is_ok(),
+            "and the right associated data still must"
+        );
+    }
+
+    #[test]
+    fn a_ciphertext_shorter_than_its_nonce_is_refused() {
+        // The nonce is read off the front before anything else looks at the
+        // buffer, so a frame shorter than that prefix has to be refused rather
+        // than sliced.
+        let key = ChaChaKey::clone_from_slice(&[13u8; 32]);
+        for length in 0..NONCE_SIZE_BYTES {
+            let mut receiver = NoiseCipherState::new_with_key(key, true);
+            assert!(
+                receiver.decrypt(&vec![0u8; length], b"").is_err(),
+                "a {length}-byte frame is shorter than the nonce and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handshake_message_truncated_anywhere_is_refused_rather_than_panicking() {
+        // `protocol.rs` carries upstream's malformed-frame cases for the outer
+        // frame; this is the same idea for the handshake reader, which does its
+        // own offset arithmetic over a message a stranger sent. The requirement
+        // is an error, never a panic and never a partial read that advances the
+        // state machine.
+        let mut initiator = NoiseHandshakeState::new(
+            NoiseRole::Initiator,
+            NoisePattern::XX,
+            Some(StaticSecret::from([7u8; 32])),
+            None,
+        );
+        let opening = initiator.write_message(&[]).expect("initiator writes -> e");
+
+        for cut in 0..opening.len() {
+            let mut responder = NoiseHandshakeState::new(
+                NoiseRole::Responder,
+                NoisePattern::XX,
+                Some(StaticSecret::from([8u8; 32])),
+                None,
+            );
+            assert!(
+                responder.read_message(&opening[..cut]).is_err(),
+                "an opening message truncated to {cut} bytes must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_ends_of_a_handshake_agree_which_cipher_is_which() {
+        // The direction is the interop-critical half of `split()`. Both sides
+        // deriving the same pair but assigning it the same way round would pass
+        // any test that drives two of *these* against each other, and fail
+        // against the phone — so this asserts the mirror rather than a
+        // round trip: what the initiator sends with is what the responder
+        // receives with, and the reverse.
+        let mut initiator = NoiseHandshakeState::new(
+            NoiseRole::Initiator,
+            NoisePattern::XX,
+            Some(StaticSecret::from([21u8; 32])),
+            None,
+        );
+        let mut responder = NoiseHandshakeState::new(
+            NoiseRole::Responder,
+            NoisePattern::XX,
+            Some(StaticSecret::from([22u8; 32])),
+            None,
+        );
+
+        // XX: -> e, <- e ee s es, -> s se
+        let one = initiator.write_message(&[]).expect("-> e");
+        responder.read_message(&one).expect("read -> e");
+        let two = responder.write_message(&[]).expect("<- e ee s es");
+        initiator.read_message(&two).expect("read <- e ee s es");
+        let three = initiator.write_message(&[]).expect("-> s se");
+        responder.read_message(&three).expect("read -> s se");
+
+        assert!(initiator.is_handshake_complete(), "initiator should be done");
+        assert!(responder.is_handshake_complete(), "responder should be done");
+
+        let (initiator_send, initiator_receive) =
+            initiator.get_transport_ciphers().expect("initiator ciphers");
+        let (responder_send, responder_receive) =
+            responder.get_transport_ciphers().expect("responder ciphers");
+
+        assert_eq!(
+            initiator_send.key.expect("initiator send key"),
+            responder_receive.key.expect("responder receive key"),
+            "what the initiator sends with must be what the responder receives with"
+        );
+        assert_eq!(
+            responder_send.key.expect("responder send key"),
+            initiator_receive.key.expect("initiator receive key"),
+            "and the other direction likewise"
+        );
+        assert_ne!(
+            initiator_send.key.expect("initiator send key"),
+            responder_send.key.expect("responder send key"),
+            "the two directions must not share one key"
+        );
+    }
+
+    #[test]
+    fn transport_ciphers_are_refused_before_the_handshake_finishes() {
+        // Asking early must be an error rather than half a key.
+        let handshake = NoiseHandshakeState::new(
+            NoiseRole::Initiator,
+            NoisePattern::XX,
+            Some(StaticSecret::from([23u8; 32])),
+            None,
+        );
+        assert!(!handshake.is_handshake_complete());
+        assert!(handshake.get_transport_ciphers().is_err());
     }
 }
