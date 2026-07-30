@@ -702,7 +702,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // arriving later can tick this exact line.
                             let id = sent.ids.first().cloned().unwrap_or_default();
                             app.add_dm_sent(who.clone(), id.clone(), content.clone());
-                            if !mesh.has_session(&target) {
+                            if !mesh.has_encrypted_channel(&target) {
                                 app.add_notice(format!(
                                     "opening an encrypted channel with {who}; the message sends once it is up."
                                 ));
