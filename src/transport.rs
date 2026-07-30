@@ -132,6 +132,14 @@ pub enum TransportEvent {
     Fatal(String),
 }
 
+/// Frames one link will hold before writes to it start being dropped.
+///
+/// Named because it is a real ceiling on how much can be handed to one peer at
+/// once, not an implementation detail: the router writes with `try_send`, which
+/// discards silently when the queue is full. Anything that produces a burst has
+/// to size itself against this — see `sync::responder::MAX_REPLIES_PER_ROUND`.
+pub const LINK_INBOX_DEPTH: usize = 64;
+
 /// Where an outbound frame should go.
 #[derive(Debug)]
 pub enum Outbound {
@@ -349,7 +357,7 @@ async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<Transpor
                 Ok(link) => {
                     failures.forget(&candidate.address);
                     announced_empty = false;
-                    let (inbox_tx, inbox_rx) = mpsc::channel::<Vec<u8>>(64);
+                    let (inbox_tx, inbox_rx) = mpsc::channel::<Vec<u8>>(LINK_INBOX_DEPTH);
                     links.insert(&candidate.address, inbox_tx);
                     let _ = events
                         .send(TransportEvent::LinkUp {

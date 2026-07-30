@@ -64,6 +64,16 @@ pub fn plan(packet: &Packet, links: &[String], ingress: &str, local_peer_id: &st
         Some(MessageType::Announce) | Some(MessageType::Leave) => {
             return Relay::Suppress("presence is not relayed")
         }
+        // A sync request is link-local. Upstream refuses this one *before* it
+        // looks at the hop count (`RelayController.decide`, whose comment says
+        // "never relay it, even when a peer crafts one with TTL headroom to
+        // turn every reachable node into a responder"), and the reason is that
+        // one crafted frame would otherwise reach every node in the mesh and
+        // make each of them dump its whole archive. The senders of both request
+        // forms upstream set ttl to 0, so nothing legitimate is refused here.
+        Some(MessageType::RequestSync) => {
+            return Relay::Suppress("a sync request does not leave its link")
+        }
         // An unknown type might carry rules we do not understand.
         None => return Relay::Suppress("unknown packet type"),
         _ => {}

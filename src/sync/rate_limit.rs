@@ -79,6 +79,18 @@ mod tests {
     const OTHER: [u8; 8] = [2; 8];
 
     #[test]
+    fn the_budget_is_the_one_upstream_ships() {
+        // Literals, for the reason given in `archive.rs`: every other test here
+        // is written relative to these and so moves with them.
+        assert_eq!(MAX_RESPONSES, 8, "upstream responseRateLimitMaxResponses");
+        assert_eq!(
+            WINDOW_MS,
+            30 * 1000,
+            "upstream responseRateLimitWindowSeconds"
+        );
+    }
+
+    #[test]
     fn a_peer_gets_its_budget_and_no_more() {
         let mut limiter = ResponseRateLimiter::default();
         for i in 0..MAX_RESPONSES {

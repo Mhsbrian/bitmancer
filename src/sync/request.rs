@@ -219,6 +219,38 @@ mod tests {
     }
 
     #[test]
+    fn the_acceptance_limits_are_the_ones_upstream_ships() {
+        assert_eq!(MAX_ACCEPT_BYTES, 1024, "upstream maxAcceptBytes");
+        assert_eq!(
+            MAX_FRAGMENT_ID_FILTER_COUNT, 60,
+            "upstream maxFragmentIdFilterCount"
+        );
+
+        // The doc comment on `MAX_FRAGMENT_ID_FILTER_COUNT` justifies 60 with
+        // arithmetic against `MAX_ACCEPT_BYTES` — sixteen hex characters plus a
+        // separator each, so `60 * 17 - 1 = 1019` fits inside 1024. The two
+        // constants can be edited independently, so the claim is checked rather
+        // than only written down.
+        let widest = MAX_FRAGMENT_ID_FILTER_COUNT * 17 - 1;
+        assert_eq!(widest, 1019);
+        assert!(
+            widest <= MAX_ACCEPT_BYTES,
+            "the widest fragment filter must survive its own decoder"
+        );
+
+        // And demonstrated, not just computed.
+        let ids: Vec<[u8; 8]> = (0..MAX_FRAGMENT_ID_FILTER_COUNT as u64)
+            .map(|i| i.to_be_bytes())
+            .collect();
+        let encoded = encode_fragment_id_filter(&ids).expect("non-empty");
+        assert_eq!(encoded.len(), widest);
+        assert_eq!(
+            decode_fragment_id_filter(Some(&encoded)).unwrap().len(),
+            MAX_FRAGMENT_ID_FILTER_COUNT
+        );
+    }
+
+    #[test]
     fn the_encoding_matches_a_hand_written_tlv() {
         // Golden bytes, laid out field by field so the length prefixes and the
         // endianness of each field are checkable by eye rather than by running

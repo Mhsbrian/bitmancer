@@ -305,6 +305,62 @@ mod tests {
     }
 
     #[test]
+    fn the_interop_constants_are_the_values_upstream_ships() {
+        // Written as literals on purpose. Every other test here says
+        // `NOW - MAX_AGE_MS - 1`, which is right for behaviour and useless for
+        // the value: change the constant and the test moves with it. These are
+        // interop numbers — a peer disagreeing with us about them is a peer we
+        // silently stop syncing with — so they get pinned to the digits.
+        //
+        // `MAX_AGE_MS` is the one to be careful with. `WHITEPAPER.md` §6.3 says
+        // six hours and the comment above upstream's own
+        // `publicMessageMaxAgeSeconds` says "much longer"; the shipped constant
+        // is 900. If someone reads either of those and "corrects" this, that is
+        // the mistake this assertion exists to stop.
+        assert_eq!(MAX_AGE_MS, 900 * 1000, "upstream publicMessageMaxAgeSeconds");
+        assert_eq!(
+            ANNOUNCE_RECORD_MAX_AGE_MS,
+            60 * 1000,
+            "upstream stalePeerTimeoutSeconds"
+        );
+        assert_eq!(MESSAGE_CAPACITY, 1000, "upstream seenCapacity");
+        assert_eq!(FRAGMENT_CAPACITY, 600, "upstream fragmentCapacity");
+        assert_eq!(FILE_CAPACITY, 200, "upstream fileTransferCapacity");
+
+        // And the relationship the two windows encode: an announce is filed on
+        // a tighter clock than it is served on. Checked at compile time, so
+        // inverting it is a build failure rather than a test failure.
+        const _: () = assert!(ANNOUNCE_RECORD_MAX_AGE_MS < MAX_AGE_MS);
+    }
+
+    #[test]
+    fn no_type_outside_the_three_we_serve_can_reach_a_store() {
+        // Swept rather than enumerated. The old test listed six types by hand
+        // and left six unlisted — including RequestSync, BoardPost,
+        // PrekeyBundle and GroupMessage, three of which the requesting half
+        // will introduce. A list cannot notice a type nobody remembered to add
+        // to it; a sweep derived from `from_u8` cannot go stale.
+        for byte in 0..=u8::MAX {
+            let Some(message_type) = MessageType::from_u8(byte) else {
+                continue;
+            };
+            let expected = matches!(
+                message_type,
+                MessageType::Message | MessageType::Fragment | MessageType::FileTransfer
+            );
+            assert_eq!(
+                Kind::of(message_type).is_some(),
+                expected,
+                "{message_type:?} ({byte:#04x}) is on the wrong side of the archive's gate"
+            );
+        }
+
+        // Announce is the exception: it is archived, but into its own map
+        // rather than a capacity-bounded store, so it has no `Kind`.
+        assert!(Kind::of(MessageType::Announce).is_none());
+    }
+
+    #[test]
     fn a_broadcast_message_is_kept_and_can_be_read_back() {
         let mut archive = Archive::new();
         assert!(archive.record(&message_at(1, NOW, b"hello"), NOW));

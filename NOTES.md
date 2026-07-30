@@ -1105,6 +1105,37 @@ and why `gateway.rs` is a policy engine rather than a crypto one.
   with it. Recording an *announce* is gated tighter, at 60s, because an announce
   is a claim about who is here now.
 
+  **A sync request never leaves the link it arrived on, and one that has
+  travelled is not answered.** Both halves are needed and neither is optional.
+  Upstream refuses to relay these *before* it looks at the hop count
+  (`RelayController.decide`, whose comment names the attack: "never relay it,
+  even when a peer crafts one with TTL headroom to turn every reachable node
+  into a responder"). We need the second half as well because we route a reply
+  down the link the request came in on, while upstream addresses the peer —
+  `sendPacket(to: peerID)` — so a relayed request would have us answering a
+  stranger while the asker got nothing. Both request forms upstream send with
+  ttl 0, so refusing anything else costs no interop.
+
+  **The fragment store holds pieces nothing has authenticated.** `fragment::parse`
+  checks only that the payload is at least 13 bytes with a sane index and total;
+  no signature, no known sender, and the pieces are filed before reassembly is
+  attempted, so a stream that never completes still occupies the store. Upstream
+  is identical here — `BLEFragmentHandler.swift` calls `trackPacketSeen` before
+  `appendFragment` and long before `isAcceptedIngressPayload` runs on the
+  reassembled packet — and the reason is structural: filing pieces late would
+  defeat the one thing fragment sync exists for, which is letting a peer whose
+  reassembly stalled fetch the pieces it is missing. The exposure is real and
+  bounded by `FRAGMENT_CAPACITY`: 600 junk frames evict every genuine piece we
+  hold. Deviating from upstream here is a deliberate decision nobody has made
+  yet; do not make it by accident.
+
+  **One round answers at most `MAX_REPLIES_PER_ROUND` packets.** The link holds
+  `transport::LINK_INBOX_DEPTH` frames and the router writes with `try_send`,
+  which discards silently, so an uncapped answer over a full archive put a
+  thousand frames into sixty-four slots and lost most of itself without a trace.
+  The cap costs nothing: the requester's filter still will not cover what was
+  held back, so the next round offers it again.
+
   We answer; we do not yet ask. The requesting half needs the `is_rsr` flag to
   actually be checked — it is parsed and encoded today and read nowhere, so
   accepting solicited responses without having asked is an injection path.

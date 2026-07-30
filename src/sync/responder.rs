@@ -14,11 +14,30 @@ use super::gcs;
 use super::packet_id::packet_id;
 use super::request::{decode_fragment_id_filter, RequestSync};
 
+/// Replies one round will produce before the rest is left for the next one.
+///
+/// The link a reply goes down holds `LINK_INBOX_DEPTH` frames and the router
+/// writes to it with `try_send`, so anything past that is discarded silently.
+/// An uncapped answer over a full archive is a thousand frames into a
+/// sixty-four-deep queue: the feature's headline case — someone walks into a
+/// room and asks for everything — was the case that lost most of its own
+/// answer with no trace of having done so.
+///
+/// Half the depth rather than all of it, because the reply shares the queue
+/// with whatever else is going to that peer.
+///
+/// Capping costs nothing in the end: the requester's filter still will not
+/// cover what we held back, so the next round offers it again, and rounds come
+/// every fifteen seconds. Sending is best-effort; converging is not.
+pub const MAX_REPLIES_PER_ROUND: usize = crate::transport::LINK_INBOX_DEPTH / 2;
+
 /// Builds the packets this request is missing.
 ///
 /// Each is a copy of what we hold with the hop count zeroed and the RSR flag
 /// set: a solicited reply is for the peer that asked, and must not be relayed
 /// onward by anyone it passes.
+///
+/// At most `MAX_REPLIES_PER_ROUND`; the remainder waits for the next round.
 pub fn respond(archive: &Archive, request: &RequestSync, now_ms: u64) -> Vec<Packet> {
     let types = request.requested_types();
     let known = gcs::decode_to_sorted_set(request.p, request.m, &request.data);
@@ -95,6 +114,7 @@ pub fn respond(archive: &Archive, request: &RequestSync, now_ms: u64) -> Vec<Pac
         }
     }
 
+    out.truncate(MAX_REPLIES_PER_ROUND);
     out
 }
 
@@ -361,6 +381,98 @@ mod tests {
             fragment_id_filter: None,
         };
         assert_eq!(respond(&archive, &request, NOW).len(), 1);
+    }
+
+    #[test]
+    fn one_round_never_outruns_the_queue_it_is_written_to() {
+        // The link holds `LINK_INBOX_DEPTH` frames and the router writes with
+        // `try_send`, which discards without a word. Before the cap, a full
+        // archive answered with a thousand frames into sixty-four slots and
+        // most of the answer disappeared — in exactly the case the feature
+        // exists for, someone arriving and asking for everything.
+        let mut archive = Archive::new();
+        for i in 0..(MAX_REPLIES_PER_ROUND * 4) {
+            archive.record(
+                &packet_at(MessageType::Message, 1, NOW, format!("m{i}").as_bytes()),
+                NOW,
+            );
+        }
+        let sent = respond(&archive, &request_holding(&[], None), NOW);
+        assert_eq!(sent.len(), MAX_REPLIES_PER_ROUND);
+        assert!(sent.len() < crate::transport::LINK_INBOX_DEPTH);
+    }
+
+    #[test]
+    fn the_round_cap_stays_under_the_queue_it_is_derived_from() {
+        // The two are meant to move together. Pinned so raising the cap without
+        // the queue, or shrinking the queue without the cap, fails here rather
+        // than by silently dropping frames on a radio.
+        assert_eq!(
+            MAX_REPLIES_PER_ROUND,
+            crate::transport::LINK_INBOX_DEPTH / 2
+        );
+        // A zero cap would answer every request with silence, which no test
+        // asserting "at most N" would notice. Compile-time, so shrinking the
+        // queue below 2 fails the build.
+        const _: () = assert!(MAX_REPLIES_PER_ROUND > 0);
+    }
+
+    #[test]
+    fn what_a_capped_round_holds_back_is_offered_again_next_round() {
+        // Capping is only acceptable because it costs nothing in the end: the
+        // requester's filter still does not cover the remainder, so the next
+        // round offers it. Without this the cap would be silent data loss with
+        // extra steps.
+        let mut archive = Archive::new();
+        let total = MAX_REPLIES_PER_ROUND + 5;
+        for i in 0..total {
+            archive.record(
+                &packet_at(MessageType::Message, 1, NOW, format!("m{i}").as_bytes()),
+                NOW,
+            );
+        }
+
+        let first = respond(&archive, &request_holding(&[], None), NOW);
+        assert_eq!(first.len(), MAX_REPLIES_PER_ROUND);
+
+        // The requester files what it got, so its next filter covers exactly
+        // that much and no more.
+        let held: Vec<&Packet> = first.iter().collect();
+        let second = respond(&archive, &request_holding(&held, None), NOW);
+        assert_eq!(second.len(), 5, "the remainder, and nothing already sent");
+
+        let first_bodies: Vec<Vec<u8>> = bodies(&first);
+        for body in bodies(&second) {
+            assert!(!first_bodies.contains(&body), "no packet is sent twice");
+        }
+    }
+
+    #[test]
+    fn a_plain_fragment_round_still_respects_the_cursor() {
+        // Every other fragment test sets a fragment-ID filter, which takes the
+        // other arm and bypasses the cursor by design — so the cursor check on
+        // the plain path was executed by nothing. Deleting it broke no test.
+        let mut archive = Archive::new();
+        let mut old_piece = vec![0x01u8; 8];
+        old_piece.extend_from_slice(b"before the cursor");
+        let mut new_piece = vec![0x02u8; 8];
+        new_piece.extend_from_slice(b"after the cursor");
+        archive.record(
+            &packet_at(MessageType::Fragment, 1, NOW - 10_000, &old_piece),
+            NOW,
+        );
+        archive.record(&packet_at(MessageType::Fragment, 1, NOW, &new_piece), NOW);
+
+        let mut request = request_holding(
+            &[],
+            Some(SyncTypeFlags::from_types(&[MessageType::Fragment])),
+        );
+        request.since_timestamp = Some(NOW - 5_000);
+        assert!(request.fragment_id_filter.is_none(), "the plain path");
+
+        let sent = respond(&archive, &request, NOW);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload, new_piece);
     }
 
     #[test]
