@@ -346,8 +346,14 @@ impl NoiseCipherState {
             let (nonce, encrypted_payload): (u64, Vec<u8>) = if self.use_extracted_nonce {
                 match self.extract_nonce_from_ciphertext_payload(ciphertext) {
                     Some((n, payload)) => {
-                        // FIXED: Only validate nonce for non-zero nonces in transport mode
-                        if n > 0 && !self.is_valid_nonce(n) {
+                        // Nonce 0 is checked like every other nonce. It used to be
+                        // exempt, which meant the first transport message of every
+                        // session — the counter starts at 0 and increments after
+                        // use — could be captured and replayed forever: the AEAD tag
+                        // is genuine, so it decrypts every time, and the window
+                        // never recorded it. Nothing downstream would have caught
+                        // it; mesh dedup only covers public broadcasts.
+                        if !self.is_valid_nonce(n) {
                             log_noise_protocol_event(
                                 "CIPHER_DECRYPT_REPLAY_DETECTED",
                                 &format!("Replay attack detected: nonce {} rejected", n),
@@ -385,10 +391,14 @@ impl NoiseCipherState {
                         ),
                     );
 
-                    if self.use_extracted_nonce && nonce > 0 {
-                        // Update replay window after successful decryption (but only for non-zero nonces)
+                    // Record the nonce only once the tag has verified, so a
+                    // forged frame cannot burn a slot in the window. Nonce 0 is
+                    // recorded like any other: exempting it here would leave the
+                    // check above unable to reject the second copy, so the two
+                    // exemptions had to be removed together.
+                    if self.use_extracted_nonce {
                         self.mark_nonce_as_seen(nonce);
-                    } else if !self.use_extracted_nonce {
+                    } else {
                         self.nonce += 1;
                     }
                     Ok(plaintext)
@@ -1405,5 +1415,153 @@ impl NoiseHandshakeState {
             .try_into()
             .map_err(|_| NoiseError::InvalidPublicKey)?;
         Ok(PublicKey::from(key_array))
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    /// Two transport ciphers over one key, which is the shape `split()` hands
+    /// out: one end encrypts, the other receives. Same key both sides so a
+    /// frame written by the first opens on the second.
+    fn transport_pair() -> (NoiseCipherState, NoiseCipherState) {
+        let material = [7u8; 32];
+        (
+            NoiseCipherState::new_with_key(ChaChaKey::clone_from_slice(&material), true),
+            NoiseCipherState::new_with_key(ChaChaKey::clone_from_slice(&material), true),
+        )
+    }
+
+    #[test]
+    fn the_first_frame_of_a_session_cannot_be_replayed() {
+        // The defect this module exists for. The send counter starts at 0 and
+        // increments after use, so every session's opening frame is nonce 0 —
+        // and nonce 0 used to skip both the replay check and the window update.
+        // Its tag is genuine, so it decrypted every time it was rewritten to the
+        // link, and no mesh-layer dedup covers private messages.
+        let (mut sender, mut receiver) = transport_pair();
+        let frame = sender.encrypt(b"first words", b"").unwrap();
+
+        assert_eq!(
+            &frame[..NONCE_SIZE_BYTES],
+            &[0, 0, 0, 0],
+            "the opening frame must be the one carrying nonce 0"
+        );
+        assert_eq!(receiver.decrypt(&frame, b"").unwrap(), b"first words");
+        assert!(
+            matches!(receiver.decrypt(&frame, b""), Err(NoiseError::ReplayDetected)),
+            "a captured opening frame must not open a second time"
+        );
+    }
+
+    #[test]
+    fn a_later_frame_cannot_be_replayed_either() {
+        // The path that always worked. Kept so removing the nonce-0 exemption
+        // cannot quietly cost us the protection that was already there.
+        let (mut sender, mut receiver) = transport_pair();
+        let first = sender.encrypt(b"one", b"").unwrap();
+        let second = sender.encrypt(b"two", b"").unwrap();
+
+        receiver.decrypt(&first, b"").unwrap();
+        receiver.decrypt(&second, b"").unwrap();
+
+        assert!(
+            matches!(
+                receiver.decrypt(&second, b""),
+                Err(NoiseError::ReplayDetected)
+            ),
+            "a nonce already in the window must be refused"
+        );
+    }
+
+    #[test]
+    fn a_frame_arriving_out_of_order_inside_the_window_still_opens() {
+        // BLE reorders. The window exists so a late frame is still accepted;
+        // rejecting anything below the high-water mark would drop real traffic.
+        let (mut sender, mut receiver) = transport_pair();
+        let first = sender.encrypt(b"one", b"").unwrap();
+        let second = sender.encrypt(b"two", b"").unwrap();
+
+        receiver.decrypt(&second, b"").unwrap();
+        assert_eq!(
+            receiver.decrypt(&first, b"").unwrap(),
+            b"one",
+            "the earlier frame must still open after the later one"
+        );
+    }
+
+    #[test]
+    fn a_frame_older_than_the_window_is_refused() {
+        // Past REPLAY_WINDOW_SIZE the window can no longer prove a nonce is
+        // unseen, so the only safe answer is no. Accepting it would reopen the
+        // replay hole for anything the attacker held on to for long enough.
+        let (mut sender, mut receiver) = transport_pair();
+        let oldest = sender.encrypt(b"oldest", b"").unwrap();
+
+        for _ in 0..=REPLAY_WINDOW_SIZE {
+            let frame = sender.encrypt(b"filler", b"").unwrap();
+            receiver.decrypt(&frame, b"").unwrap();
+        }
+
+        assert!(
+            matches!(
+                receiver.decrypt(&oldest, b""),
+                Err(NoiseError::ReplayDetected)
+            ),
+            "a nonce that has fallen out of the window must not be treated as new"
+        );
+    }
+
+    #[test]
+    fn a_forged_frame_does_not_consume_a_window_slot() {
+        // The window is updated after the tag verifies, not before. If it were
+        // the other way round, anyone in the path could burn the genuine
+        // sender's nonce by flipping a byte, and the real frame would then be
+        // rejected as a replay of the forgery.
+        let (mut sender, mut receiver) = transport_pair();
+        let mut frame = sender.encrypt(b"genuine", b"").unwrap();
+        let last = frame.len() - 1;
+
+        frame[last] ^= 0x01;
+        assert!(
+            receiver.decrypt(&frame, b"").is_err(),
+            "a tampered tag must not open"
+        );
+
+        frame[last] ^= 0x01;
+        assert_eq!(
+            receiver.decrypt(&frame, b"").unwrap(),
+            b"genuine",
+            "the forged attempt must not have spent nonce 0"
+        );
+    }
+
+    #[test]
+    fn a_rekey_admits_nonce_zero_again() {
+        // The interop case, and the reason this fix is a deletion rather than a
+        // `zero_seen` flag. `split()` builds fresh transport ciphers and clears
+        // the window, so a legitimate first frame after a re-handshake is nonce
+        // 0 on an empty window and must still open.
+        //
+        // If a peer ever resets its send counter *without* re-handshaking, its
+        // next frame arrives as nonce 0 against a window that already holds 0
+        // and we refuse it. The answer to that is to tear down and re-handshake,
+        // not to exempt the nonce again.
+        let (mut sender, mut receiver) = transport_pair();
+        let frame = sender.encrypt(b"before", b"").unwrap();
+        receiver.decrypt(&frame, b"").unwrap();
+        assert!(
+            matches!(receiver.decrypt(&frame, b""), Err(NoiseError::ReplayDetected)),
+            "the window must be holding nonce 0 before the rekey"
+        );
+
+        receiver.initialize_key(ChaChaKey::clone_from_slice(&[7u8; 32]));
+
+        assert_eq!(
+            receiver.decrypt(&frame, b"").unwrap(),
+            b"before",
+            "a rekey restarts the nonce space, so nonce 0 is legitimate again"
+        );
     }
 }
