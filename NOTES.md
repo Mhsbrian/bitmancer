@@ -469,6 +469,22 @@ Two paths through one mechanism, and the first is the one that matters:
   completion claiming them further down never saw them. Worse, the tests passed:
   they called `handle_input_events` directly, which is not a path any keystroke
   takes. They now go through `handle_key_event`.
+- **The compose box measures in grapheme clusters, not characters.** This is
+  where inserting an emoji made the cursor drift. Three separate places counted
+  characters as one cell each — the wrapper, the box height, and the cursor —
+  which is exactly right for ASCII and wrong for everything else. They now share
+  one measure (`wrap_rows`), so the drawn text and the drawn cursor cannot
+  disagree.
+  - The cursor was also handed `visual_cursor()` — a width in *cells* — and then
+    used it as a *character* count. Two mistakes that cancelled for ASCII and
+    compounded for emoji, at one cell of drift per emoji.
+  - The unit has to be the cluster because `unicode-width` can only get emoji
+    right when it sees them whole. Measured per character, `❤️` (heart plus an
+    invisible selector) comes out 1 instead of 2, and `👨‍👩‍👧‍👦` (seven characters
+    joined by ZWJs) comes out **8 instead of 2**. Measured as clusters, both are
+    2 — which is what a terminal draws.
+  - Rows therefore break between clusters and never inside one, so wrapping
+    cannot tear a family emoji into four people and a stray joiner.
 - Sending emoji was already safe: `split_into_chunks` respects char boundaries,
   so a 255-byte TLV split cannot cut a codepoint in half. It can still split a ZWJ
   sequence across chunks, which degrades to separate glyphs rather than corruption,

@@ -1044,31 +1044,30 @@ impl App {
     }
     
     pub fn get_input_box_height(&self, available_width: usize) -> usize {
-        let input_text = self.input.value();
-        if input_text.is_empty() {
+        // Measured in display cells, like the wrapping and the cursor: counting
+        // characters made an emoji-heavy line report fewer rows than it draws,
+        // so the last row was clipped.
+        let text = self.input.value();
+        if text.is_empty() {
             return 3; // Minimum height
         }
-        
-        // Calculate how many lines the input text would need
-        let chars: Vec<char> = input_text.chars().collect();
-        let mut lines_needed = 1;
-        let mut current_line_length = 0;
-        
-        for &ch in &chars {
-            if ch == '\n' {
-                lines_needed += 1;
-                current_line_length = 0;
-            } else {
-                current_line_length += 1;
-                if current_line_length >= available_width.saturating_sub(2) { // Account for borders
-                    lines_needed += 1;
-                    current_line_length = 0;
-                }
+        let usable = available_width.saturating_sub(2).max(1);
+        let mut rows = 1usize;
+        let mut width = 0usize;
+        for character in text.chars() {
+            if character == '\n' {
+                rows += 1;
+                width = 0;
+                continue;
             }
+            let cell_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if width + cell_width > usable {
+                rows += 1;
+                width = 0;
+            }
+            width += cell_width;
         }
-        
-        // Ensure minimum height and reasonable maximum
-        (lines_needed + 2).clamp(3, 10) // +2 for borders, max 10 lines
+        rows + 2
     }
 }
 
