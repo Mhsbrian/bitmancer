@@ -36,6 +36,13 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
         app.viewer.open_in(&conversation, None);
         return;
     }
+    if app.mesh_view_open {
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => app.mesh_view_open = false,
+            _ => {}
+        }
+        return;
+    }
     // The map takes the whole keyboard while it is open. This must come before
     // the connection-overlay dismissal below, which would otherwise swallow
     // every Esc while offline and leave the map with no way back out.

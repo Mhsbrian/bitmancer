@@ -25,6 +25,7 @@ mod peer_id;
 mod persistence;
 mod protocol;
 mod relay;
+mod topology;
 mod transport;
 mod tui;
 mod verification;
@@ -755,6 +756,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandOutcome::SetNickname(name) => app.pending_nickname_update = Some(name),
                 CommandOutcome::ClearConversation => app.pending_clear_conversation = true,
                 CommandOutcome::OpenMap => app.open_map(),
+                CommandOutcome::OpenMeshView => app.mesh_view_open = true,
                 CommandOutcome::OpenImage(position) => {
                     let conversation = app.active_conversation();
                     if !app.viewer.open_in(&conversation, position) {
@@ -980,6 +982,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Reflected every frame rather than set at the toggle: the count climbs
         // as traffic is carried, and the band is the only place it shows.
         app.carrying = carrier.is_enabled().then_some(carried_out);
+        if app.mesh_view_open {
+            app.topology = topology::Topology::build(
+                &mesh.my_peer_id,
+                mesh.peers.values().map(|peer| {
+                    (
+                        peer.peer_id.as_str(),
+                        peer.nickname.as_str(),
+                        peer.claims_neighbors.as_slice(),
+                    )
+                }),
+            );
+        }
 
         // 6. Draw.
         // Read receipts, sent for whatever the user is actually looking at.

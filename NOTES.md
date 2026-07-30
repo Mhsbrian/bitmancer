@@ -438,6 +438,44 @@ only stored thing that costs a walk across town to rebuild, so it persists in
   that is not ours — otherwise a peer collects our signature over a claim about
   a third party.
 
+## Seeing the mesh (`/mesh`)
+
+Three things this client does were invisible: it holds up to six links and showed
+one number, it forwards other people's packets and said nothing, and it can carry
+a channel to the internet and reported a counter. An evening went on screenshots
+and log archaeology because of it. `topology.rs` is the instrument panel.
+
+Two facts make a real graph possible and both were already true:
+
+- **Hearing an announce proves a direct link.** `relay.rs` refuses to forward
+  presence, so an announce cannot have been passed along — if we have it, it came
+  off that peer's own radio. Every peer we know is a neighbour, with no
+  bookkeeping needed to establish it.
+- **Peers gossip who they can see.** Upstream fills the announce's
+  `directNeighbors` TLV with its connected peer IDs (`BLEService.swift:2906`), up
+  to ten. We had always parsed that field and always discarded it.
+
+Because announces are never relayed, claims only ever reach us from peers we can
+already hear, so the map has a **hard depth of two** — us, our neighbours, and the
+peers they name. That is a property of the protocol, not a simplification.
+
+- **Observed and claimed edges are drawn differently** — solid for our links,
+  spaced dots for hearsay. Upstream calls gossiped neighbours advisory, and
+  drawing an assertion with the same confidence as a measurement promotes it.
+- **Bridge detection is the point.** More than one island among the peers, with
+  paths through us excluded, means we are the only thing joining them — the moment
+  holding several links stops being a statistic.
+- **The view scales to its content.** Fixed at the two-ring extent, the common
+  case of two neighbours and nothing beyond drew a small graph in a large box,
+  which reads as though something failed to load.
+- **We consume `directNeighbors` and cannot fill it.** An announce must stay under
+  the 100-byte compression threshold or the verifier re-encodes it compressed and
+  every announce we send is rejected as forged. With a full-length nickname there
+  are **2 bytes spare and one neighbour costs 10**. It costs this view nothing —
+  our own links are known locally — so the only loss is appearing in *other*
+  clients' maps. Emitting becomes possible if upstream signs the uncompressed
+  form, which is worth reading their source for rather than guessing at.
+
 ## The radio is one radio, and scanning is not free
 
 Multi-link introduced a regression that only showed up against a real phone, as

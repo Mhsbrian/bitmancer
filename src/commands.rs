@@ -19,6 +19,8 @@ pub enum CommandOutcome {
     ToggleDebug,
     /// Open the world map overlay.
     OpenMap,
+    /// Open the mesh graph overlay.
+    OpenMeshView,
     /// Open the image viewer on the nth-newest image (1 = newest).
     OpenImage(Option<usize>),
     /// Join a geohash location channel.
@@ -76,6 +78,7 @@ pub fn handle(
         "/status" => CommandOutcome::Reply(status_lines(mesh, connected)),
         "/debug" => CommandOutcome::ToggleDebug,
         "/map" => CommandOutcome::OpenMap,
+        "/mesh" | "/links" | "/topology" => CommandOutcome::OpenMeshView,
         "/img" | "/image" | "/pic" => {
             CommandOutcome::OpenImage(rest.trim().parse::<usize>().ok())
         }
@@ -414,6 +417,7 @@ fn help_text() -> Vec<String> {
         "  /help                 Show this help".to_string(),
         "  /name <nickname>      Change your nickname and re-announce".to_string(),
         "  /map                  World map of live location channels".to_string(),
+        "  /mesh                 The Bluetooth mesh around you, drawn".to_string(),
         "  /img [n]              View the newest image link (or the nth back)".to_string(),
         "  /geo #<geohash>       Join a location channel (over Nostr)".to_string(),
         "  /geo list, /geo off   List or leave location channels".to_string(),

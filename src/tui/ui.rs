@@ -68,6 +68,11 @@ pub fn render(app: &mut App, f: &mut Frame) {
     // Overlays cover everything beneath them.
     if app.viewer.open {
         app.pending_image_slot = widgets::image_panel::render(f, app, screen);
+    } else if app.mesh_view_open {
+        // Above the map in the same sense the key handler puts it above: two
+        // overlays must never be drawn at once, and the order here has to match
+        // the order the keyboard is claimed in.
+        widgets::mesh_panel::render(f, app, screen);
     } else if app.map_open {
         widgets::map_panel::render(f, app, screen);
     } else if app.popup_active {

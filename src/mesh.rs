@@ -147,6 +147,11 @@ pub struct MeshPeer {
     /// say. The two are different answers and are kept apart: "advertises
     /// nothing" is a current peer with everything off.
     pub capabilities: Option<announce::Capabilities>,
+    /// Peer IDs this peer says it is linked to, from the announce's
+    /// `directNeighbors`. Advisory — a claim, not an observation — and the only
+    /// view we get of the mesh beyond our own radio, since announces are never
+    /// relayed and so only ever reach us from a peer we can already hear.
+    pub claims_neighbors: Vec<String>,
     pub last_seen: Instant,
 }
 
@@ -1232,6 +1237,13 @@ impl MeshService {
         let nickname = announcement.nickname.clone();
         let fingerprint = fingerprint(&announcement.noise_public_key);
         let capabilities = announcement.advertised();
+        let claims_neighbors: Vec<String> = announcement
+            .direct_neighbors
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(hex::encode)
+            .collect();
         let now = Instant::now();
 
         match self.peers.get_mut(&sender) {
@@ -1247,6 +1259,10 @@ impl MeshService {
                 // way. Holding the old value would leave us depositing traffic
                 // with someone who has stopped carrying it.
                 existing.capabilities = capabilities;
+                // Replaced, not merged: the list is what they can see *now*, and
+                // keeping a peer they have since lost would draw a link that no
+                // longer exists.
+                existing.claims_neighbors = claims_neighbors;
                 existing.last_seen = now;
                 if renamed {
                     vec![MeshEvent::PeerRenamed {
@@ -1268,6 +1284,7 @@ impl MeshService {
                         fingerprint,
                         verified,
                         capabilities,
+                        claims_neighbors,
                         last_seen: now,
                     },
                 );
@@ -2086,6 +2103,7 @@ mod noise_dm_tests {
                 fingerprint: format!("{seed:02x}"),
                 verified: false,
                 capabilities: None,
+                claims_neighbors: Vec::new(),
                 last_seen: Instant::now(),
             };
             alice.peers.insert(peer.peer_id.clone(), peer);
@@ -2107,6 +2125,7 @@ mod noise_dm_tests {
             fingerprint: "aa".to_string(),
             verified: false,
             capabilities: None,
+            claims_neighbors: Vec::new(),
             last_seen: Instant::now(),
         };
         alice.peers.insert(peer.peer_id.clone(), peer);
@@ -2133,6 +2152,7 @@ mod blocking_tests {
             signing_public_key: vec![key; 32],
             verified: false,
             capabilities: None,
+            claims_neighbors: Vec::new(),
             last_seen: Instant::now(),
         };
         mesh.peers.insert(peer_id.clone(), peer);
