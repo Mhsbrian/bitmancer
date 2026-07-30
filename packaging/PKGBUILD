@@ -62,9 +62,12 @@ build() {
 check() {
 	cd "$srcdir/build"
 	export RUSTUP_TOOLCHAIN=stable
-	# test_persistent_noise_static_key reads and writes ~/.bitchat/state.json;
-	# skip it so packaging never touches the building user's identity keys.
-	cargo test --release -- --skip test_persistent_noise_static_key
+	# No --skip any more. This used to exclude test_persistent_noise_static_key,
+	# which called load_state() and so read — and, on a machine with no identity
+	# yet, minted and wrote — ~/.bitchat/state.json. The test now goes through
+	# load_state_at() with a path under /tmp, so the whole suite is safe to run
+	# against the building user's home.
+	cargo test --release
 }
 
 package() {

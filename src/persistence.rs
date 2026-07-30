@@ -118,10 +118,19 @@ fn migrate_legacy_state_if_needed() {
 
 pub fn load_state() -> AppState {
     migrate_legacy_state_if_needed();
-    let path = get_state_file_path();
-    
+    load_state_at(&get_state_file_path())
+}
+
+/// Loads the persisted identity from `path`, minting whatever is missing.
+///
+/// Takes the path for the same reason `wipe_state_at` does: this function
+/// *writes* — every absent key is generated and saved on the spot — so a test
+/// calling the real one mints an identity into the developer's home directory as
+/// a side effect of `cargo test`. It also skips the legacy migration, which is a
+/// decision about the real `~/.bitchat` and not about an arbitrary path.
+pub fn load_state_at(path: &std::path::Path) -> AppState {
     let mut state = if path.exists() {
-        match fs::read_to_string(&path) {
+        match fs::read_to_string(path) {
             Ok(contents) => {
                 match serde_json::from_str(&contents) {
                     Ok(state) => state,
@@ -145,15 +154,15 @@ pub fn load_state() -> AppState {
         let signing_key = SigningKey::generate(&mut OsRng);
         state.identity_key = Some(signing_key.to_bytes().to_vec());
         // Save immediately to persist the identity key
-        let _ = save_state(&state);
+        let _ = save_state_at(path, &state);
     }
-    
+
     // Generate persistent Noise static key if not present (matching iOS behavior)
     if state.noise_static_key.is_none() {
         let noise_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         state.noise_static_key = Some(noise_key.to_bytes().to_vec());
         // Save immediately to persist the Noise static key
-        let _ = save_state(&state);
+        let _ = save_state_at(path, &state);
     }
 
     // Seed for per-geohash Nostr identities. Rotating it makes every location
@@ -162,16 +171,24 @@ pub fn load_state() -> AppState {
         let mut seed = [0u8; 32];
         rand::Rng::fill(&mut OsRng, &mut seed);
         state.nostr_device_seed = Some(seed.to_vec());
-        let _ = save_state(&state);
+        let _ = save_state_at(path, &state);
     }
-    
+
     state
 }
 
 pub fn save_state(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
-    let path = get_state_file_path();
+    save_state_at(&get_state_file_path(), state)
+}
+
+/// Writes the identity to `path`. Paired with `load_state_at` so the two halves
+/// of a round trip can be pointed somewhere harmless together.
+pub fn save_state_at(
+    path: &std::path::Path,
+    state: &AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(state)?;
-    fs::write(&path, json)?;
+    fs::write(path, json)?;
     Ok(())
 }
 
@@ -217,19 +234,87 @@ pub fn wipe_state() -> Result<bool, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    /// Never the real state file, for the same reason `wipe_tests` says it: this
+    /// test used to call `load_state()`, which mints an identity and saves it, so
+    /// running the suite wrote an Ed25519 and an X25519 private key into the
+    /// developer's `~/.bitchat/state.json`. `packaging/PKGBUILD` had to
+    /// `--skip` it to keep a build off the building user's keys.
+    fn scratch(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("bitmancer-state-{name}-{}.json", std::process::id()));
+        path
+    }
+
     #[test]
-    fn test_persistent_noise_static_key() {
-        // Test that the same noise static key is generated and persisted
-        let state1 = load_state();
-        let state2 = load_state();
-        
-        // Both states should have the same noise static key
-        assert!(state1.noise_static_key.is_some());
-        assert!(state2.noise_static_key.is_some());
-        assert_eq!(state1.noise_static_key, state2.noise_static_key);
-        
-        // The key should be 32 bytes (X25519 private key size)
-        assert_eq!(state1.noise_static_key.unwrap().len(), 32);
+    fn an_identity_is_minted_once_and_then_reused() {
+        // The peer ID everyone on the mesh knows us by is derived from the Noise
+        // static key, so a second load handing back a different key would make
+        // us a different person on every restart.
+        let path = scratch("reused");
+        let _ = fs::remove_file(&path);
+
+        let first = load_state_at(&path);
+        let second = load_state_at(&path);
+
+        assert!(first.noise_static_key.is_some(), "the first load must mint one");
+        assert_eq!(
+            first.noise_static_key, second.noise_static_key,
+            "a second load must reuse the stored key, not mint another"
+        );
+        assert_eq!(
+            first.noise_static_key.unwrap().len(),
+            32,
+            "X25519 private keys are 32 bytes"
+        );
+        assert_eq!(
+            first.identity_key, second.identity_key,
+            "the signing identity has to persist too"
+        );
+        assert_eq!(
+            first.nostr_device_seed, second.nostr_device_seed,
+            "rotating this seed would change every location-channel identity"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn minting_an_identity_writes_it_where_it_was_asked_to() {
+        // The half that made the old test dangerous: load *writes*. Pin that it
+        // writes to the path it was given and nowhere else, because the reason
+        // this takes a path at all is that it has a side effect.
+        let path = scratch("writes");
+        let _ = fs::remove_file(&path);
+        assert!(!path.exists(), "precondition: nothing there yet");
+
+        let minted = load_state_at(&path);
+
+        assert!(path.exists(), "load_state_at must have persisted what it minted");
+        let on_disk: AppState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.noise_static_key, minted.noise_static_key,
+            "what was returned and what landed on disk must be the same key"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unparseable_state_file_does_not_take_the_client_down() {
+        // A truncated or hand-edited file is a plausible accident, and the
+        // failure mode must be a fresh identity rather than a panic on startup.
+        let path = scratch("garbage");
+        fs::write(&path, b"{ this is not json").unwrap();
+
+        let state = load_state_at(&path);
+
+        assert!(
+            state.noise_static_key.is_some(),
+            "a corrupt file must fall back to minting rather than panicking"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }
 #[cfg(test)]
