@@ -91,40 +91,6 @@ fn append_trace(path: &Path, message: &str) {
     }
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EncryptionStatus {
-    None,             // Failed or incompatible
-    NoHandshake,      // No handshake attempted yet
-    NoiseHandshaking, // Currently establishing
-    NoiseSecured,     // Established but not verified
-    NoiseVerified,    // Established and verified
-}
-
-impl EncryptionStatus {
-    #[allow(dead_code)]
-    pub fn icon(&self) -> Option<&'static str> {
-        match self {
-            EncryptionStatus::None => Some("🔒❌"),
-            EncryptionStatus::NoHandshake => None,
-            EncryptionStatus::NoiseHandshaking => Some("🔄"),
-            EncryptionStatus::NoiseSecured => Some("🔒"),
-            EncryptionStatus::NoiseVerified => Some("🔒✅"),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn description(&self) -> &'static str {
-        match self {
-            EncryptionStatus::None => "Encryption failed",
-            EncryptionStatus::NoHandshake => "Not encrypted",
-            EncryptionStatus::NoiseHandshaking => "Establishing encryption...",
-            EncryptionStatus::NoiseSecured => "Encrypted",
-            EncryptionStatus::NoiseVerified => "Encrypted & Verified",
-        }
-    }
-}
-
 // BLE identifiers (unchanged across the protocol overhaul).
 pub const BITCHAT_SERVICE_UUID: uuid::Uuid =
     uuid::Uuid::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C);

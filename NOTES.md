@@ -67,7 +67,7 @@ All of this is ported from `localPackages/BitFoundation/Sources/BitFoundation/` 
   delivery acknowledgement for a message already marked read. `DeliveryStatus`
   is ordered so the weaker one cannot walk a line backwards.
 - **The message ID is load-bearing.** Each private message carries a UUID that a read receipt or delivery acknowledgement points back at (`ReadReceipt.originalMessageID`). A receipt is itself a binary record — originalMessageID and receiptID as 16-byte UUIDs, an 8-byte reader ID, an 8-byte timestamp and a length-prefixed nickname, 49 bytes minimum — so it cannot be faked from a bare ID string.
-- **A queued DM needs a session object first.** `NoiseSessionManager::queue_message` returns `false` and discards the text when no session exists for the peer, and `initiate_handshake` is what creates one. Queue before initiating and the user's first message vanishes with only a bool to say so — `dm_frames` initiates first for exactly this reason.
+- **A DM typed before the handshake completes is held by `outbox.rs`, not by the session.** `NoiseSessionManager` used to carry its own pending-message queue, and this note used to warn that queueing before `initiate_handshake` discarded the text with only a bool to say so. That queue had no callers outside its own file and is now deleted; the outbox is the mechanism, and unlike the queue it also gives up eventually. The warning is kept in this shape on purpose — as written it read as a constraint on live code, which is the worst kind of note to leave once the code stops existing.
 - **Announces are signed TLV** (`announce.rs`). Mandatory TLVs: nickname 0x01, noise public key 0x02, signing public key 0x03. The packet carries an Ed25519 signature over the *canonical* encoding — signature cleared, TTL forced to 0, RSR flag cleared, and padded. Verification re-encodes, so the canonical bytes must be reproducible on both sides.
 - **Announce payloads must stay under 100 bytes.** Upstream compresses any payload at or above that threshold before signing, using Apple's DEFLATE, whose output we cannot reproduce byte-for-byte with flate2. Below the threshold neither side compresses and signatures match. This is why `announce::MAX_NICKNAME_BYTES` is 24 — do not raise it without solving the canonical-compression problem.
 - **Outbound frames are never compressed** (`protocol.rs`), for the same reason. Inbound compressed frames are decoded normally.
@@ -365,6 +365,46 @@ problem it exists to catch:
   without `is_empty` and a `new()` without `Default` became warnings where before
   they were invisible. `-D warnings` means the tree had to answer them rather
   than allow them.
+
+### The split cost us `dead_code`, and `pub(crate)` bought it back
+
+Worth knowing before anyone makes a module `pub` again. A `pub` item in a `pub`
+module of a library **is** public API, so `dead_code` does not fire on it no
+matter what. The crate was bin-only before the split, where `pub` items *are*
+linted; making 28 modules `pub` silently turned that lint off across the whole
+tree at the same moment it made integration tests possible.
+
+Nobody noticed for eight commits. It surfaced when deleting the unused half of
+`noise_session.rs`: removing that file's `#![allow(dead_code)]` produced exactly
+zero warnings, because the allow had stopped being what was silencing anything.
+Removing it alone would have shipped a safeguard that did nothing.
+
+The rule now is `pub(crate) mod` by default, promoted to `pub` only when
+something outside the lib actually names the module. Eight modules are
+crate-private on that basis — `announce`, `compression`, `data_structures`,
+`discovery`, `file_packet`, `fragment`, `noise_protocol`, `noise_session` — and
+`main.rs` and `tests/` never named any of them, which is the proof that `pub`
+was not expressing anything there. With the lint restored it immediately found
+a state variant nothing constructed, a struct nothing read, a callback surface
+nothing installed, and two encryption entry points superseded by four-line
+wrappers.
+
+**The trap is promoting a module to `pub` in order to test it from `tests/` and
+never putting it back.** That silences the lint for the whole module, and the
+next dead alternate accumulates with no warning at any point. Prefer inline
+`#[cfg(test)]`, which `pub(crate)` does not affect.
+
+Two things the lint still cannot tell you, both of which cost a real deletion
+here:
+
+- **A field read behind a lock counts as read.** `self.map.lock()` is a use, so a
+  `HashMap` that is only ever inserted into and removed from — never queried —
+  looks alive. `fingerprint_to_peer_id` was exactly that once its single reader
+  went, and only a call-graph check found it.
+- **"Used only by tests" and "used" are the same thing to the test build.** The
+  plain `--lib` build is the one that separates them, and it is why a handful of
+  methods here carry an individual `#[allow(dead_code)]` saying so. They are kept
+  rather than deleted because deleting them would delete the tests over them.
 
 ### UI boundary
 
