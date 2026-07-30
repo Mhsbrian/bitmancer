@@ -3,8 +3,26 @@
 use tui_input::Input;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use regex::Regex;
 use chrono;
+
+/// A chat line arriving from a channel, on its way to the log.
+///
+/// Named fields rather than a delimited string. The backend used to hand the UI
+/// `__CHANNEL__:{channel}:{sender}:{epoch}:{content}` and the UI split it on
+/// colons, which meant a remote peer's chosen nickname could shift every field
+/// after it. Adding a signal also meant editing a marker at the emit site *and* a
+/// branch in the parser, and a mismatch between the two failed silently — the
+/// line simply never appeared.
+#[derive(Debug, Clone)]
+pub struct IncomingLine {
+    /// `#public` for the mesh, `#<geohash>` for a location channel.
+    pub channel: String,
+    pub sender: String,
+    /// Send time, not arrival time. A relayed copy can arrive long after the
+    /// fact, and the log is ordered by this.
+    pub epoch: i64,
+    pub content: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -552,182 +570,153 @@ impl App {
         self.current_conv = Some((None, Some("#public".to_string())));
     }
 
-    pub fn add_log_message(&mut self, raw_message: String) {
-        let cleaned_message = String::from_utf8(strip_ansi_escapes::strip(&raw_message)).unwrap_or_default();
-        let trimmed = cleaned_message.trim();
-        
-        if trimmed.is_empty() || trimmed.starts_with('>') || trimmed.starts_with("Â»") {
-            return;
-        }
+    /// A chat line that arrived from a channel — the mesh, or a geohash relay.
+    ///
+    /// Every field is passed as itself. This used to be a `String` of the form
+    /// `__CHANNEL__:{channel}:{sender}:{epoch}:{content}` which the UI took apart
+    /// with `splitn(5, ':')`, and `sender` is chosen by whoever sent the message.
+    /// A peer calling themselves `a:0:x` therefore shifted every field along:
+    /// their nickname became `a`, their timestamp became `0`, and since `epoch`
+    /// decides where a line sits in the log, choosing a nickname chose a
+    /// permanent position in someone else's screen. The geohash side was worse,
+    /// because that nickname comes from an unauthenticated Nostr `n` tag with no
+    /// length limit at all.
+    pub fn add_channel_line(&mut self, line: IncomingLine) {
+        let IncomingLine {
+            channel,
+            sender,
+            epoch,
+            content,
+        } = line;
 
-        // Our own half of a private conversation. The wire copy is encrypted
-        // to the peer and never echoes back, so this is the only record of it.
-        if trimmed.starts_with("__DM_SENT__:") {
-            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
-            if parts.len() >= 5 {
-                let target = parts[1].to_string();
-                let raw = parts[2].to_string();
-                let message_id = parts[3].to_string();
-                let content = parts[4].to_string();
-                let timestamp = if raw.len() == 4 {
-                    format!("{}:{}", &raw[0..2], &raw[2..4])
-                } else {
-                    raw
-                };
-                let msg = Message {
-                    sender: self.nickname.clone(),
-                    timestamp,
-                    content,
-                    is_self: true,
-                    epoch: chrono::Local::now().timestamp(),
-                    message_id: (!message_id.is_empty()).then_some(message_id),
-                    delivery: None,
-                    arrived: Some(Instant::now()),
-                };
-                let admitted = self.arrival_gate.admit();
-                push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
-                self.scroll_to_bottom_current_conversation();
-                return;
+        let timestamp = chrono::DateTime::from_timestamp(epoch, 0)
+            .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
+
+        self.note_image_link(&sender, &channel, &content);
+        let msg = Message {
+            sender,
+            timestamp,
+            content,
+            is_self: false,
+            epoch,
+            message_id: None,
+            delivery: None,
+            arrived: Some(Instant::now()),
+        };
+
+        let admitted = self.arrival_gate.admit();
+        insert_in_time_order(
+            self.channel_messages.entry(channel.clone()).or_default(),
+            msg,
+            admitted,
+        );
+
+        let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
+        let in_dm = dm_target.is_some();
+        if channel == "#public" {
+            // Unread unless public is what is on screen.
+            if !self.sidebar_state.public_selected.unwrap_or(false) {
+                self.add_unread_message("#public".to_string());
             }
+        } else if channel_name.as_deref() != Some(&channel) || in_dm {
+            self.add_unread_message(channel);
         }
 
-        if trimmed.starts_with("__DM__:") {
-            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
-            if parts.len() >= 5 {
-                let sender = parts[1].to_string();
-                let timestamp_raw = parts[2].to_string();
-                let message_id = parts[3].to_string();
-                let content = parts[4].to_string();
-                
-                let timestamp = if timestamp_raw.len() == 4 { format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4]) } else { timestamp_raw };
+        self.scroll_to_bottom_current_conversation();
+    }
 
-                let sender_clone = sender.clone();
-                let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), message_id: (!message_id.is_empty()).then_some(message_id), delivery: None, arrived: Some(Instant::now()) };
+    /// A private message from a peer.
+    ///
+    /// `sent_at` is when the sender says they sent it, which is not always when
+    /// it arrived: a message that came over Nostr carries its true time inside
+    /// the sealed rumor, because the gift wrap's own timestamp is deliberately
+    /// jittered by up to a quarter of an hour. The mesh path passes arrival time,
+    /// which for a message that came off the radio is the same thing.
+    ///
+    /// It is an epoch, not a pre-formatted clock string. The old marker took
+    /// `%H%M` and the parser turned a *four character* value into `HH:MM` while
+    /// passing anything else through verbatim — so handing it an epoch by mistake
+    /// printed ten digits in the time column.
+    pub fn add_dm_received(
+        &mut self,
+        sender: String,
+        message_id: String,
+        content: String,
+        sent_at: i64,
+    ) {
+        let timestamp = chrono::DateTime::from_timestamp(sent_at, 0)
+            .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
+        let msg = Message {
+            sender: sender.clone(),
+            timestamp,
+            content,
+            is_self: false,
+            epoch: sent_at,
+            message_id: (!message_id.is_empty()).then_some(message_id),
+            delivery: None,
+            arrived: Some(Instant::now()),
+        };
 
-                let admitted = self.arrival_gate.admit();
-                push_arrival(self.dm_messages.entry(sender_clone.clone()).or_default(), msg, admitted);
-                
-                let dm_key = format!("dm:{}", sender_clone);
-                let (_, current_dm_target, _) = self.get_current_messages();
-                if current_dm_target.as_ref() != Some(&sender_clone) {
-                    self.add_unread_message(dm_key);
-                }
-                
-                self.scroll_to_bottom_current_conversation();
-                return;
+        let admitted = self.arrival_gate.admit();
+        push_arrival(self.dm_messages.entry(sender.clone()).or_default(), msg, admitted);
+
+        let (_, current_dm_target, _) = self.get_current_messages();
+        if current_dm_target.as_ref() != Some(&sender) {
+            self.add_unread_message(format!("dm:{sender}"));
+        }
+
+        self.scroll_to_bottom_current_conversation();
+    }
+
+    /// Our own half of a private conversation.
+    ///
+    /// The wire copy is encrypted to the peer and never echoes back, so this is
+    /// the only record that the message was ever sent.
+    pub fn add_dm_sent(&mut self, target: String, message_id: String, content: String) {
+        let msg = Message {
+            sender: self.nickname.clone(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            content,
+            is_self: true,
+            epoch: chrono::Local::now().timestamp(),
+            message_id: (!message_id.is_empty()).then_some(message_id),
+            delivery: None,
+            arrived: Some(Instant::now()),
+        };
+
+        let admitted = self.arrival_gate.admit();
+        push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
+        self.scroll_to_bottom_current_conversation();
+    }
+
+    /// Something the client wants to tell the user, shown wherever they are.
+    ///
+    /// Multi-line text is split and each line added separately, which the caller
+    /// used to have to do itself. The old form was a `"system: "` prefix on a
+    /// string, matched by `^system: (.+)$` — and because `.` does not cross a
+    /// newline in that dialect, a notice with more than one line never matched at
+    /// all. It fell through to a free-text branch guarded by
+    /// `if trimmed.contains(&self.nickname) { return }`, so a multi-line notice
+    /// that happened to mention the user's own nickname was silently discarded.
+    pub fn add_notice(&mut self, text: String) {
+        for line in text.split('\n') {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-        }
-
-        if trimmed.starts_with("__CHANNEL__:") {
-            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
-            if parts.len() >= 5 {
-                let channel = parts[1].to_string();
-                let sender = parts[2].to_string();
-                let epoch: i64 = parts[3].parse().unwrap_or_else(|_| chrono::Local::now().timestamp());
-                let content = parts[4].to_string();
-
-                let timestamp = chrono::DateTime::from_timestamp(epoch, 0)
-                    .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                    .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
-
-                self.note_image_link(&sender, &channel, &content);
-                let msg = Message { sender, timestamp, content, is_self: false, epoch, message_id: None, delivery: None, arrived: Some(Instant::now()) };
-
-                let admitted = self.arrival_gate.admit();
-                insert_in_time_order(
-                    self.channel_messages.entry(channel.clone()).or_default(),
-                    msg,
-                    admitted,
-                );
-                
-                let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
-                let in_dm = dm_target.is_some();
-                if channel == "#public" {
-                    // If not currently viewing public (i.e., in DM or in another channel), add unread
-                    if !self.sidebar_state.public_selected.unwrap_or(false) {
-                        self.add_unread_message("#public".to_string());
-                    }
-                } else {
-                    // For other channels, only add unread if not currently viewing that channel
-                    if channel_name.as_deref() != Some(&channel) || in_dm {
-                        self.add_unread_message(channel);
-                    }
-                }
-                
-                self.scroll_to_bottom_current_conversation();
-                return;
-            }
-        }
-
-        if let Some(captures) = Regex::new(r"(\w+) connected").unwrap().captures(trimmed) {
-            let name = captures.get(1).unwrap().as_str().to_string();
-            if !self.people.contains(&name) {
-                self.people.push(name);
-            }
-            return;
-        }
-        
-        if let Some(captures) = Regex::new(r"\[(\d{2}:\d{2})\] <(\w+)> (.*)").unwrap().captures(trimmed) {
-            let timestamp = captures.get(1).unwrap().as_str().to_string();
-            let sender = captures.get(2).unwrap().as_str().to_string();
-            let content = captures.get(3).unwrap().as_str().to_string();
-            
-            if sender == self.nickname { return; }
-            
-            let msg = Message { sender, timestamp, content, is_self: false, epoch: chrono::Local::now().timestamp(), message_id: None, delivery: None, arrived: Some(Instant::now()) };
-            let current_channel = self.get_selected_channel_name();
+            let msg = Message::now("system".to_string(), line.to_string(), false);
             let admitted = self.arrival_gate.admit();
-            push_arrival(self.channel_messages.entry(current_channel).or_default(), msg, admitted);
-            self.scroll_to_bottom_current_conversation();
-            return;
-        }
 
-        if Regex::new(r"^system: (.+)$").unwrap().is_match(trimmed) {
-            // For system messages, we need to preserve the original message with colors
-            // So we'll work with the original raw_message instead of the cleaned one
-            if let Some(captures_raw) = Regex::new(r"^system: (.+)$").unwrap().captures(&raw_message) {
-                let content = captures_raw.get(1).unwrap().as_str().to_string();
-                let lines: Vec<&str> = content.split('\n').collect();
-                
-                for line in lines {
-                    let trimmed_line = line.trim();
-                    if !trimmed_line.is_empty() {
-                        let msg = Message::now("system".to_string(), trimmed_line.to_string(), false);
-                        
-                        // Check if we're in a DM conversation or channel conversation
-                        let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
-                        if let Some(target) = dm_target {
-                            // We're in a DM, add to DM messages
-                            let admitted = self.arrival_gate.admit();
-                            push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
-                        } else if let Some(channel) = channel_name {
-                            // We're in a channel, add to channel messages
-                            let admitted = self.arrival_gate.admit();
-                            push_arrival(self.channel_messages.entry(channel).or_default(), msg, admitted);
-                        } else {
-                            // Fallback to current channel (shouldn't happen but just in case)
-                            let current_channel = self.get_selected_channel_name();
-                            let admitted = self.arrival_gate.admit();
-                            push_arrival(self.channel_messages.entry(current_channel.clone()).or_default(), msg, admitted);
-                        }
-                    }
-                }
-                self.scroll_to_bottom_current_conversation();
-                return;
-            }
-        }
-
-        if trimmed.contains(&self.nickname) { return; }
-        
-        let lines: Vec<&str> = trimmed.split('\n').collect();
-        let current_channel = self.get_selected_channel_name();
-        
-        for line in lines {
-            let trimmed_line = line.trim();
-            if !trimmed_line.is_empty() {
-                let msg = Message::now("system".to_string(), trimmed_line.to_string(), false);
-                let admitted = self.arrival_gate.admit();
-                push_arrival(self.channel_messages.entry(current_channel.clone()).or_default(), msg, admitted);
+            let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
+            if let Some(target) = dm_target {
+                push_arrival(self.dm_messages.entry(target).or_default(), msg, admitted);
+            } else if let Some(channel) = channel_name {
+                push_arrival(self.channel_messages.entry(channel).or_default(), msg, admitted);
+            } else {
+                let current = self.get_selected_channel_name();
+                push_arrival(self.channel_messages.entry(current).or_default(), msg, admitted);
             }
         }
         self.scroll_to_bottom_current_conversation();
@@ -1221,8 +1210,13 @@ mod push_arrival_tests {
 mod inbound_arrival_tests {
     use super::*;
 
-    fn channel_line(sender: &str, epoch: i64, content: &str) -> String {
-        format!("__CHANNEL__:#9q:{sender}:{epoch}:{content}")
+    fn channel_line(sender: &str, epoch: i64, content: &str) -> IncomingLine {
+        IncomingLine {
+            channel: "#9q".to_string(),
+            sender: sender.to_string(),
+            epoch,
+            content: content.to_string(),
+        }
     }
 
     fn lines(app: &App) -> &Vec<Message> {
@@ -1233,7 +1227,7 @@ mod inbound_arrival_tests {
     fn a_live_message_into_a_quiet_channel_animates() {
         let mut app = App::new_with_nickname("me".into());
         let now = chrono::Local::now().timestamp();
-        app.add_log_message(channel_line("alice", now, "hello"));
+        app.add_channel_line(channel_line("alice", now, "hello"));
         assert!(lines(&app)[0].arrived.is_some());
     }
 
@@ -1241,8 +1235,8 @@ mod inbound_arrival_tests {
     fn hour_old_backlog_does_not_animate() {
         let mut app = App::new_with_nickname("me".into());
         let now = chrono::Local::now().timestamp();
-        app.add_log_message(channel_line("alice", now, "recent"));
-        app.add_log_message(channel_line("bob", now - 3600, "ancient"));
+        app.add_channel_line(channel_line("alice", now, "recent"));
+        app.add_channel_line(channel_line("bob", now - 3600, "ancient"));
         let ancient = lines(&app).iter().find(|m| m.content == "ancient").unwrap();
         assert!(ancient.arrived.is_none(), "replayed history must stay dark");
     }
@@ -1255,8 +1249,8 @@ mod inbound_arrival_tests {
         // sorts *behind* the divider and so never counted as new.
         let mut app = App::new_with_nickname("me".into());
         let now = chrono::Local::now().timestamp();
-        app.add_log_message(channel_line("system", now, "─── live ───"));
-        app.add_log_message(channel_line("alice", now - 5, "hello"));
+        app.add_channel_line(channel_line("system", now, "─── live ───"));
+        app.add_channel_line(channel_line("alice", now - 5, "hello"));
         let hello = lines(&app).iter().find(|m| m.content == "hello").unwrap();
         assert!(
             hello.arrived.is_some(),
@@ -1268,10 +1262,88 @@ mod inbound_arrival_tests {
     fn clock_skew_between_two_speakers_does_not_mute_the_second() {
         let mut app = App::new_with_nickname("me".into());
         let now = chrono::Local::now().timestamp();
-        app.add_log_message(channel_line("alice", now, "first"));
-        app.add_log_message(channel_line("bob", now - 3, "second"));
+        app.add_channel_line(channel_line("alice", now, "first"));
+        app.add_channel_line(channel_line("bob", now - 3, "second"));
         let second = lines(&app).iter().find(|m| m.content == "second").unwrap();
         assert!(second.arrived.is_some(), "a slightly-behind clock is still live");
+    }
+
+    #[test]
+    fn a_nickname_full_of_colons_cannot_choose_its_own_place_in_the_log() {
+        // The old boundary handed the UI
+        // `__CHANNEL__:{channel}:{sender}:{epoch}:{content}` and split it on
+        // colons, so a peer calling themselves `a:0:x` shifted every field along
+        // and got to pick its own epoch — and epoch decides position, so it could
+        // pin itself to the top of someone else's log for good. Nicknames come
+        // off the wire; on the geohash side they come from an unauthenticated
+        // Nostr `n` tag with no length limit.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+
+        app.add_channel_line(channel_line("honest", now, "first"));
+        app.add_channel_line(channel_line("a:0:x", now, "second"));
+
+        let hostile = lines(&app)
+            .iter()
+            .find(|message| message.content == "second")
+            .expect("the line is present");
+        assert_eq!(
+            hostile.sender, "a:0:x",
+            "the whole nickname is the nickname, colons and all"
+        );
+        assert_eq!(
+            hostile.epoch, now,
+            "the sender does not get to choose where it sits"
+        );
+    }
+
+    #[test]
+    fn a_nickname_cannot_forge_a_notice() {
+        // `system:` used to be a prefix on the same channel as chat, so the
+        // question of whether a peer could open a line with it was a real one.
+        // Notices now arrive by a different method entirely and content is never
+        // re-parsed.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+
+        app.add_channel_line(channel_line("mallory", now, "system: the mesh is down"));
+
+        let line = &lines(&app)[0];
+        assert_eq!(line.sender, "mallory", "still attributed to who said it");
+        assert_eq!(
+            line.content, "system: the mesh is down",
+            "content is shown, never interpreted"
+        );
+    }
+
+    #[test]
+    fn a_notice_of_several_lines_survives_the_users_own_nickname() {
+        // The old path matched `^system: (.+)$`, and `.` does not cross a
+        // newline, so a multi-line notice never matched. It fell through to a
+        // free-text branch that began `if trimmed.contains(&self.nickname) {
+        // return }` — so a notice mentioning the user was thrown away.
+        let mut app = App::new_with_nickname("me".into());
+
+        // Straight into the default conversation — a fresh App is on #public and
+        // `switch_to_channel` only moves to a channel already in the sidebar.
+        app.add_notice("me: first line\nand a second line".to_string());
+
+        let public = app
+            .channel_messages
+            .get("#public")
+            .expect("#public exists on a fresh app");
+        let contents: Vec<&str> = public
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"me: first line"),
+            "the line naming the user must survive: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"and a second line"),
+            "and so must the rest: {contents:?}"
+        );
     }
 }
 
@@ -1282,8 +1354,26 @@ mod wipe_tests {
     #[test]
     fn a_wipe_leaves_no_conversation_peer_or_image_behind() {
         let mut app = App::new_with_nickname("me".into());
-        app.add_log_message("__CHANNEL__:#public:alice:1700000000:hello".to_string());
-        app.add_log_message("__DM__:bob:1200:private words".to_string());
+        app.add_channel_line(IncomingLine {
+            channel: "#public".to_string(),
+            sender: "alice".to_string(),
+            epoch: 1_700_000_000,
+            content: "hello".to_string(),
+        });
+        // Previously written as the string `__DM__:bob:1200:private words`, which
+        // had four colon-separated fields where the parser wanted five. It was
+        // never filed as a DM at all, so the assertion below that private history
+        // does not survive a wipe was passing without a private message present.
+        app.add_dm_received(
+            "bob".to_string(),
+            "id-1".to_string(),
+            "private words".to_string(),
+            1_700_000_000,
+        );
+        assert!(
+            !app.dm_messages.is_empty(),
+            "the fixture must actually create a private message"
+        );
         app.people = vec!["alice".into(), "bob".into()];
         app.blocked = vec!["carol".into()];
         app.joined_geohashes.insert("9q".into());

@@ -18,7 +18,7 @@ use bitmancer::mesh::{DeliveryStatus, MeshEvent, MeshService};
 use bitmancer::noise_payload::{NoisePayloadType, PrivateMessagePacket};
 use bitmancer::nostr::{self, client::GeoEvent, health::Notice};
 use bitmancer::transport::{self, Outbound, TransportEvent};
-use bitmancer::tui::{self, app::App, app::TuiPhase, event, tui as tui_mod, ui};
+use bitmancer::tui::{self, app::App, app::IncomingLine, app::TuiPhase, event, tui as tui_mod, ui};
 use bitmancer::{
     courier, favorites, gateway, geohash, mailbox, media, outbox, peer_id, persistence, protocol,
     relay, topology, verification,
@@ -231,7 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match transport_event {
                 TransportEvent::Status(text) => {
                     if matches!(app.phase, TuiPhase::Connected) {
-                        app.add_log_message(format!("system: {text}"));
+                        app.add_notice(text.to_string());
                     } else {
                         app.add_popup_message(text);
                     }
@@ -242,10 +242,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     offline_since = None;
                     if held == 1 {
                         app.transition_to_connected();
-                        app.add_log_message("system: Connected to the mesh.".to_string());
+                        app.add_notice("Connected to the mesh.".to_string());
                     } else {
-                        app.add_log_message(format!(
-                            "system: linked to {label} ({held} peers linked)"
+                        app.add_notice(format!(
+                            "linked to {label} ({held} peers linked)"
                         ));
                     }
                     // Announce down the new link so the peer behind it sees us.
@@ -316,13 +316,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .unwrap_or_else(|| {
                                             peer_id::short_display(&sender_fingerprint)
                                         });
-                                    let clock = chrono::Local::now().format("%H%M");
-                                    app.add_log_message(format!(
-                                        "__DM__:{sender}:{clock}:{}:{}",
-                                        record.message_id, record.content
-                                    ));
-                                    app.add_log_message(format!(
-                                        "system: that message was carried here by {} while {sender} was away.",
+                                    // A courier's copy carries no send time —
+                                    // PrivateMessagePacket is message id and
+                                    // content and nothing else — so arrival is
+                                    // the only honest value, even though this one
+                                    // may have been sealed a day ago. The notice
+                                    // below is what says so.
+                                    app.add_dm_received(
+                                        sender.clone(),
+                                        record.message_id.clone(),
+                                        record.content.clone(),
+                                        chrono::Local::now().timestamp(),
+                                    );
+                                    app.add_notice(format!(
+                                        "that message was carried here by {} while {sender} was away.",
                                         peer_id::short_display(&courier)
                                     ));
                                 }
@@ -352,10 +359,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // maintenance tick decides, once the grace period has
                         // had a chance to be wrong.
                         offline_since.get_or_insert_with(Instant::now);
-                        app.add_log_message(format!("system: link lost ({reason})"));
+                        app.add_notice(format!("link lost ({reason})"));
                     } else {
-                        app.add_log_message(format!(
-                            "system: a link ended ({reason}); {held} still up"
+                        app.add_notice(format!(
+                            "a link ended ({reason}); {held} still up"
                         ));
                     }
                 }
@@ -388,8 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 3. Requests raised by the UI.
         app.pending_channel_switch.take();
         if let Some((target, _)) = app.pending_dm_switch.take() {
-            app.add_log_message(format!(
-                "system: DMs with {target} are not available yet - the Noise session layer is still being ported."
+            app.add_notice(format!(
+                "DMs with {target} are not available yet - the Noise session layer is still being ported."
             ));
         }
         if let Some(new_nickname) = app.pending_nickname_update.take() {
@@ -398,15 +405,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.nickname = mesh.nickname.clone();
             state.nickname = Some(mesh.nickname.clone());
             if let Err(error) = persistence::save_state(&state) {
-                app.add_log_message(format!("system: Could not save nickname: {error}"));
+                app.add_notice(format!("Could not save nickname: {error}"));
             }
             if new_nickname != mesh.nickname {
-                app.add_log_message(format!(
-                    "system: Nickname shortened to {} (announces stay under the compression threshold).",
+                app.add_notice(format!(
+                    "Nickname shortened to {} (announces stay under the compression threshold).",
                     mesh.nickname
                 ));
             }
-            app.add_log_message(format!("system: You are now {}.", mesh.nickname));
+            app.add_notice(format!("You are now {}.", mesh.nickname));
             if app.connected {
                 if let Some(frame) = mesh.announce_frame() {
                     let _ = transport.outbound.send(Outbound::All(frame)).await;
@@ -449,9 +456,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Hand off to the desktop rather than shelling out to a guessed
                 // browser; failure is reported instead of being swallowed.
                 match std::process::Command::new("xdg-open").arg(&url).spawn() {
-                    Ok(_) => app.add_log_message(format!("system: opened {url}")),
+                    Ok(_) => app.add_notice(format!("opened {url}")),
                     Err(error) => {
-                        app.add_log_message(format!("system: could not open it: {error}"))
+                        app.add_notice(format!("could not open it: {error}"))
                     }
                 }
             }
@@ -478,8 +485,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(relays) => {
                     nostr_client.subscribe(&target, relays.clone()).await;
                     app.join_channel(geo::channel_name(&target));
-                    app.add_log_message(format!(
-                        "system: Joined #{target} via {} relays.",
+                    app.add_notice(format!(
+                        "Joined #{target} via {} relays.",
                         relays.len()
                     ));
                 }
@@ -502,7 +509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 CommandOutcome::Reply(lines) => {
                     for text in lines {
-                        app.add_log_message(format!("system: {text}"));
+                        app.add_notice(text.to_string());
                     }
                 }
                 CommandOutcome::SetFavorite { target, favorite } => {
@@ -518,12 +525,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|peer| peer.nickname.clone())
                                 .unwrap_or_else(|| target.clone());
                             let verb = if favorite { "favourited" } else { "unfavourited" };
-                            app.add_log_message(format!(
-                                "system: {verb} {who}; they now have your Nostr address."
+                            app.add_notice(format!(
+                                "{verb} {who}; they now have your Nostr address."
                             ));
                             save_favorites(&mut state, &mesh, &mut app);
                         }
-                        Err(reason) => app.add_log_message(format!("system: {reason}")),
+                        Err(reason) => app.add_notice(reason.to_string()),
                     }
                 }
                 CommandOutcome::SendFile(path) => {
@@ -535,22 +542,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Say the cost before spending it: a
                                     // megabyte is thousands of BLE writes and
                                     // the pane would otherwise sit silent.
-                                    app.add_log_message(format!(
-                                        "system: sending {name} ({:.0} KiB) as {} fragments...",
+                                    app.add_notice(format!(
+                                        "sending {name} ({:.0} KiB) as {} fragments...",
                                         size as f64 / 1024.0,
                                         frames.len()
                                     ));
                                     for frame in frames {
                                         let _ = transport.outbound.send(Outbound::All(frame)).await;
                                     }
-                                    app.add_log_message(format!("system: {name} sent."));
+                                    app.add_notice(format!("{name} sent."));
                                 }
                                 Err(reason) => {
-                                    app.add_log_message(format!("system: {reason}"))
+                                    app.add_notice(reason.to_string())
                                 }
                             }
                         }
-                        Err(reason) => app.add_log_message(format!("system: {reason}")),
+                        Err(reason) => app.add_notice(reason.to_string()),
                     }
                 }
                 CommandOutcome::WipeIdentity => {
@@ -574,17 +581,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 "Nothing was stored; memory cleared."
                             };
-                            app.add_log_message(format!("system: {what} Quitting."));
+                            app.add_notice(format!("{what} Quitting."));
                         }
                         Err(error) => {
                             // Do not quit on a failed wipe: exiting here would
                             // look identical to success while leaving the keys
                             // on disk.
-                            app.add_log_message(format!(
-                                "system: could not destroy the stored identity: {error}"
+                            app.add_notice(format!(
+                                "could not destroy the stored identity: {error}"
                             ));
-                            app.add_log_message(
-                                "system: your keys are still on disk. Nothing was cleared."
+                            app.add_notice(
+                                "your keys are still on disk. Nothing was cleared."
                                     .to_string(),
                             );
                             continue;
@@ -596,32 +603,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(nickname) => {
                         state.blocked_peers = mesh.blocked_fingerprints();
                         if let Err(error) = persistence::save_state(&state) {
-                            app.add_log_message(format!(
-                                "system: blocked {nickname}, but could not save: {error}"
+                            app.add_notice(format!(
+                                "blocked {nickname}, but could not save: {error}"
                             ));
                         } else {
-                            app.add_log_message(format!(
-                                "system: blocked {nickname}. Their traffic is dropped."
+                            app.add_notice(format!(
+                                "blocked {nickname}. Their traffic is dropped."
                             ));
                         }
                         app.update_blocked_list(mesh.blocked_labels());
                         sync_people(&mut app, &mesh, &geo);
                     }
-                    Err(reason) => app.add_log_message(format!("system: {reason}")),
+                    Err(reason) => app.add_notice(reason.to_string()),
                 },
                 CommandOutcome::UnblockPeer(needle) => match mesh.unblock(&needle) {
                     Ok(label) => {
                         state.blocked_peers = mesh.blocked_fingerprints();
                         if let Err(error) = persistence::save_state(&state) {
-                            app.add_log_message(format!(
-                                "system: unblocked {label}, but could not save: {error}"
+                            app.add_notice(format!(
+                                "unblocked {label}, but could not save: {error}"
                             ));
                         } else {
-                            app.add_log_message(format!("system: unblocked {label}."));
+                            app.add_notice(format!("unblocked {label}."));
                         }
                         app.update_blocked_list(mesh.blocked_labels());
                     }
-                    Err(reason) => app.add_log_message(format!("system: {reason}")),
+                    Err(reason) => app.add_notice(reason.to_string()),
                 },
                 CommandOutcome::SendDirectMessage { target, content } => {
                     // Which way to send. A peer we can currently see takes the
@@ -647,22 +654,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match send_over_nostr(&mut geo, &mesh, &address, &target, &content) {
                             Some((event, message_id)) => {
                                 nostr_client.publish_direct(event).await;
-                                let clock = chrono::Local::now().format("%H%M");
                                 let who = mesh
                                     .favorites
                                     .resolve(&target)
                                     .map(|(_, entry)| entry.nickname.clone())
                                     .filter(|nickname| !nickname.is_empty())
                                     .unwrap_or_else(|| target.clone());
-                                app.add_log_message(format!(
-                                    "__DM_SENT__:{who}:{clock}:{message_id}:{content}"
-                                ));
-                                app.add_log_message(format!(
-                                    "system: {who} is out of range; sent over the internet."
+                                app.add_dm_sent(who.clone(), message_id.clone(), content.clone());
+                                app.add_notice(format!(
+                                    "{who} is out of range; sent over the internet."
                                 ));
                             }
-                            None => app.add_log_message(
-                                "system: could not address that peer over the internet; their stored address is unreadable.".to_string(),
+                            None => app.add_notice(
+                                "could not address that peer over the internet; their stored address is unreadable.".to_string(),
                             ),
                         }
                         continue;
@@ -675,7 +679,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Echo locally straight away. The wire copy is
                             // encrypted to the peer and never comes back to us,
                             // so nothing else would show what we said.
-                            let clock = chrono::Local::now().format("%H%M");
                             let who = mesh
                                 .peers
                                 .get(&target)
@@ -684,32 +687,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // The id travels with the echo so a receipt
                             // arriving later can tick this exact line.
                             let id = sent.ids.first().cloned().unwrap_or_default();
-                            app.add_log_message(format!(
-                                "__DM_SENT__:{who}:{clock}:{id}:{content}"
-                            ));
+                            app.add_dm_sent(who.clone(), id.clone(), content.clone());
                             if !mesh.has_session(&target) {
-                                app.add_log_message(format!(
-                                    "system: opening an encrypted channel with {who}; the message sends once it is up."
+                                app.add_notice(format!(
+                                    "opening an encrypted channel with {who}; the message sends once it is up."
                                 ));
                             }
                         }
                         Err(reason) => {
-                            app.add_log_message(format!("system: {reason}"));
+                            app.add_notice(reason.to_string());
                         }
                     }
                 }
                 CommandOutcome::SetMailbox(wanted) => {
                     let dropped = post.set_enabled(wanted);
                     if wanted {
-                        app.add_log_message(
-                            "system: holding mail for peers who are not here. Anyone nearby can leave sealed messages; they are opaque to you and expire within a day."
+                        app.add_notice(
+                            "holding mail for peers who are not here. Anyone nearby can leave sealed messages; they are opaque to you and expire within a day."
                                 .to_string(),
                         );
                     } else {
-                        app.add_log_message("system: no longer holding mail.".to_string());
+                        app.add_notice("no longer holding mail.".to_string());
                         if dropped > 0 {
-                            app.add_log_message(format!(
-                                "system: discarded {dropped} item(s) that were waiting. Their senders were never told, so they may try again elsewhere."
+                            app.add_notice(format!(
+                                "discarded {dropped} item(s) that were waiting. Their senders were never told, so they may try again elsewhere."
                             ));
                         }
                     }
@@ -742,12 +743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "only by a tag that rotates daily, and its contents are".to_string(),
                     );
                     lines.push("sealed to them.".to_string());
-                    // One call per line. `add_log_message` reads the "system:"
-                    // prefix off the front, so joining pre-prefixed lines leaves
-                    // every line after the first showing it literally.
-                    for line in lines {
-                        app.add_log_message(format!("system: {line}"));
-                    }
+                    app.add_notice(lines.join("\n"));
                 }
                 CommandOutcome::SetGateway(wanted) => {
                     let dropped = carrier.set_enabled(wanted);
@@ -763,16 +759,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = transport.outbound.send(Outbound::All(frame)).await;
                     }
                     if wanted {
-                        app.add_log_message(if relays_up {
-                            "system: carrying mesh traffic to the relays. Nearby peers with no data can now use your connection.".to_string()
+                        app.add_notice(if relays_up {
+                            "carrying mesh traffic to the relays. Nearby peers with no data can now use your connection.".to_string()
                         } else {
-                            "system: gateway mode is on, but no relay is answering yet — the offer is not advertised until one does.".to_string()
+                            "gateway mode is on, but no relay is answering yet — the offer is not advertised until one does.".to_string()
                         });
                     } else {
-                        app.add_log_message("system: no longer carrying mesh traffic.".to_string());
+                        app.add_notice("no longer carrying mesh traffic.".to_string());
                         if dropped > 0 {
-                            app.add_log_message(format!(
-                                "system: dropped {dropped} message(s) that were waiting; their senders were told nothing, so they will retry."
+                            app.add_notice(format!(
+                                "dropped {dropped} message(s) that were waiting; their senders were told nothing, so they will retry."
                             ));
                         }
                     }
@@ -784,13 +780,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         now,
                         rand::random(),
                     );
-                    app.add_log_message(format!(
-                        "system: your card, good for {} minutes:",
+                    app.add_notice(format!(
+                        "your card, good for {} minutes:",
                         verification::MAX_AGE_SECONDS / 60
                     ));
-                    app.add_log_message(format!("system: {}", card.to_url()));
-                    app.add_log_message(
-                        "system: they run /verify <that line>. It is only worth anything if they read it from your screen."
+                    app.add_notice(card.to_url());
+                    app.add_notice(
+                        "they run /verify <that line>. It is only worth anything if they read it from your screen."
                             .to_string(),
                     );
                 }
@@ -805,40 +801,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // met, which is exactly the list that has to stay
                             // trustworthy at a glance.
                             Ok(fingerprint) if fingerprint == mesh.my_fingerprint() => {
-                                app.add_log_message(
-                                    "system: that is your own card.".to_string(),
+                                app.add_notice(
+                                    "that is your own card.".to_string(),
                                 );
                             }
                             Ok(fingerprint) => {
                                 mesh.mark_verified(&fingerprint);
                                 state.verified_fingerprints = mesh.verified_fingerprints();
                                 let saved = persistence::save_state(&state).is_ok();
-                                app.add_log_message(format!(
-                                    "system: verified {} ({})",
+                                app.add_notice(format!(
+                                    "verified {} ({})",
                                     card.nickname,
                                     card.peer_id().unwrap_or_default()
                                 ));
                                 if !saved {
-                                    app.add_log_message(
-                                        "system: could not write that to disk; it will be forgotten on exit."
+                                    app.add_notice(
+                                        "could not write that to disk; it will be forgotten on exit."
                                             .to_string(),
                                     );
                                 }
                             }
-                            Err(_) => app.add_log_message(
-                                "system: that card's key is malformed.".to_string(),
+                            Err(_) => app.add_notice(
+                                "that card's key is malformed.".to_string(),
                             ),
                         },
-                        Err(verification::VerifyError::Malformed) => app.add_log_message(
-                            "system: that is not a verification card. Expected a bitchat://verify line."
+                        Err(verification::VerifyError::Malformed) => app.add_notice(
+                            "that is not a verification card. Expected a bitchat://verify line."
                                 .to_string(),
                         ),
-                        Err(verification::VerifyError::Stale) => app.add_log_message(format!(
-                            "system: that card has expired; cards are good for {} minutes. Ask them for a fresh one.",
+                        Err(verification::VerifyError::Stale) => app.add_notice(format!(
+                            "that card has expired; cards are good for {} minutes. Ask them for a fresh one.",
                             verification::MAX_AGE_SECONDS / 60
                         )),
-                        Err(verification::VerifyError::BadSignature) => app.add_log_message(
-                            "system: that card's signature does not match its keys. Do not trust it."
+                        Err(verification::VerifyError::BadSignature) => app.add_notice(
+                            "that card's signature does not match its keys. Do not trust it."
                                 .to_string(),
                         ),
                     }
@@ -850,15 +846,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandOutcome::OpenImage(position) => {
                     let conversation = app.active_conversation();
                     if !app.viewer.open_in(&conversation, position) {
-                        app.add_log_message(
-                            "system: no image links in this conversation yet.".to_string(),
+                        app.add_notice(
+                            "no image links in this conversation yet.".to_string(),
                         );
                     }
                 }
                 CommandOutcome::ToggleDebug => {
                     mesh.debug = !mesh.debug;
-                    app.add_log_message(format!(
-                        "system: packet tracing {}",
+                    app.add_notice(format!(
+                        "packet tracing {}",
                         if mesh.debug { "on" } else { "off" }
                     ));
                 }
@@ -867,14 +863,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(relays) => {
                             nostr_client.subscribe(&target, relays.clone()).await;
                             app.join_channel(geo::channel_name(&target));
-                            app.add_log_message(format!(
-                                "system: Joined #{target} via {} relays. This channel rides Nostr, not Bluetooth.",
+                            app.add_notice(format!(
+                                "Joined #{target} via {} relays. This channel rides Nostr, not Bluetooth.",
                                 relays.len()
                             ));
                         }
                         None => {
                             app.switch_to_channel(geo::channel_name(&target));
-                            app.add_log_message(format!("system: Already in #{target}."));
+                            app.add_notice(format!("Already in #{target}."));
                         }
                     }
                     app.joined_geohashes = geo.joined().into_iter().collect();
@@ -892,13 +888,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             app.channels.retain(|name| *name != geo::channel_name(&target));
                             app.switch_to_public();
                             app.joined_geohashes = geo.joined().into_iter().collect();
-                            app.add_log_message(format!("system: Left #{target}."));
+                            app.add_notice(format!("Left #{target}."));
                         }
                         Some(target) => {
-                            app.add_log_message(format!("system: Not in #{target}."));
+                            app.add_notice(format!("Not in #{target}."));
                         }
-                        None => app.add_log_message(
-                            "system: No location channel is active. Use /geo #<geohash>."
+                        None => app.add_notice(
+                            "No location channel is active. Use /geo #<geohash>."
                                 .to_string(),
                         ),
                     }
@@ -916,19 +912,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let event = geo.message_event(&target, &line);
                             nostr_client.publish(&target, event).await;
                         }
-                        None if !app.connected => app.add_log_message(
-                            "system: Not connected to the mesh - message not sent.".to_string(),
+                        None if !app.connected => app.add_notice(
+                            "Not connected to the mesh - message not sent.".to_string(),
                         ),
                         None => {
                             let frames = mesh.public_message_frames(&line);
                             if frames.is_empty() {
-                                app.add_log_message(
-                                    "system: Could not encode that message.".to_string(),
+                                app.add_notice(
+                                    "Could not encode that message.".to_string(),
                                 );
                             } else {
                                 if frames.len() > 1 {
-                                    app.add_log_message(format!(
-                                        "system: Sent in {} parts (each must stay under 100 bytes to be signable).",
+                                    app.add_notice(format!(
+                                        "Sent in {} parts (each must stay under 100 bytes to be signable).",
                                         frames.len()
                                     ));
                                 }
@@ -1057,18 +1053,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(frame) = mesh.announce_frame() {
                     let _ = transport.outbound.send(Outbound::All(frame)).await;
                 }
-                app.add_log_message(if offering {
-                    "system: relays are answering; now advertising as a gateway.".to_string()
+                app.add_notice(if offering {
+                    "relays are answering; now advertising as a gateway.".to_string()
                 } else {
-                    "system: no relay is answering; withdrew the gateway offer.".to_string()
+                    "no relay is answering; withdrew the gateway offer.".to_string()
                 });
             }
             // Mail held through an outage. Sent now rather than dropped: the
             // depositor was told we would carry it.
             if offering && carrier.held_count() > 0 {
                 let waiting = carrier.take_held();
-                app.add_log_message(format!(
-                    "system: relays are back; sending {} held message(s).",
+                app.add_notice(format!(
+                    "relays are back; sending {} held message(s).",
                     waiting.len()
                 ));
                 for held in waiting {
@@ -1234,7 +1230,7 @@ fn save_favorites(state: &mut persistence::AppState, mesh: &MeshService, app: &m
         }
     }
     if let Err(error) = persistence::save_state(state) {
-        app.add_log_message(format!("system: could not save favourites: {error}"));
+        app.add_notice(format!("could not save favourites: {error}"));
     }
 }
 
@@ -1303,7 +1299,7 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             } else {
                 ""
             };
-            app.add_log_message(format!("system: {nickname} {what}.{reach}"));
+            app.add_notice(format!("{nickname} {what}.{reach}"));
         }
         MeshEvent::DeliveryUpdate { message_id, status } => {
             app.mark_delivery(&message_id, status);
@@ -1314,12 +1310,8 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             message_id,
             ..
         } => {
-            // The DM marker takes HHMM, not an epoch: the parser only splits a
-            // four-character value into a clock time and passes anything else
-            // through verbatim, so an epoch renders as ten digits in the time
-            // column.
-            let clock = chrono::Local::now().format("%H%M");
-            app.add_log_message(format!("__DM__:{sender}:{clock}:{message_id}:{content}"));
+            // Straight off the radio, so arrival is the send time.
+            app.add_dm_received(sender, message_id, content, chrono::Local::now().timestamp());
         }
         // Handled in the frame loop, where the gateway policy, the relay pool,
         // the shelf and the toggles are all in scope. Nothing routes one here.
@@ -1332,18 +1324,18 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             ..
         } => {
             let short: String = fingerprint.chars().take(16).collect();
-            app.add_log_message(format!(
-                "system: encrypted channel with {nickname} is up ({short})"
+            app.add_notice(format!(
+                "encrypted channel with {nickname} is up ({short})"
             ));
         }
         MeshEvent::PeerAppeared { nickname, .. } => {
-            app.add_log_message(format!("system: {nickname} connected"));
+            app.add_notice(format!("{nickname} connected"));
         }
         MeshEvent::PeerRenamed { nickname, .. } => {
-            app.add_log_message(format!("system: a peer is now known as {nickname}"));
+            app.add_notice(format!("a peer is now known as {nickname}"));
         }
         MeshEvent::PeerLeft { nickname, .. } => {
-            app.add_log_message(format!("system: {nickname} disconnected"));
+            app.add_notice(format!("{nickname} disconnected"));
         }
         MeshEvent::PublicMessage {
             sender,
@@ -1354,7 +1346,12 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             // Send time, not arrival time: a relayed copy can arrive long after
             // the fact, and the UI orders by this value.
             let epoch = (timestamp_ms / 1000) as i64;
-            app.add_log_message(format!("__CHANNEL__:#public:{sender}:{epoch}:{content}"));
+            app.add_channel_line(IncomingLine {
+                channel: "#public".to_string(),
+                sender,
+                epoch,
+                content,
+            });
         }
         MeshEvent::FileReceived {
             sender,
@@ -1366,8 +1363,8 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
         } => {
             let size = format!("{:.0} KiB", bytes.len() as f64 / 1024.0);
             if !is_image {
-                app.add_log_message(format!(
-                    "system: {sender} sent {name} ({size}) over the mesh - only images can be shown."
+                app.add_notice(format!(
+                    "{sender} sent {name} ({size}) over the mesh - only images can be shown."
                 ));
                 return;
             }
@@ -1385,13 +1382,15 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
                         sender: sender.clone(),
                         conversation,
                     });
-                    app.add_log_message(format!(
-                        "__CHANNEL__:#public:{sender}:{}:▣ sent {name} ({size}) - /img to view",
-                        chrono::Local::now().timestamp()
-                    ));
+                    app.add_channel_line(IncomingLine {
+                        channel: "#public".to_string(),
+                        sender: sender.clone(),
+                        epoch: chrono::Local::now().timestamp(),
+                        content: format!("▣ sent {name} ({size}) - /img to view"),
+                    });
                 }
-                Err(error) => app.add_log_message(format!(
-                    "system: {sender} sent {name} but it would not decode: {error}"
+                Err(error) => app.add_notice(format!(
+                    "{sender} sent {name} but it would not decode: {error}"
                 )),
             }
         }
@@ -1399,10 +1398,10 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
             // Protocol diagnostics repeat a lot; only surface transitions.
             if *last_notice != text {
                 *last_notice = text.clone();
-                app.add_log_message(format!("system: {text}"));
+                app.add_notice(text.to_string());
             }
         }
-        MeshEvent::Trace(text) => app.add_log_message(format!("system: {text}")),
+        MeshEvent::Trace(text) => app.add_notice(text.to_string()),
     }
 }
 
@@ -1459,10 +1458,9 @@ fn post_to_couriers(
         return None;
     }
 
-    let clock = chrono::Local::now().format("%H%M");
-    app.add_log_message(format!("__DM_SENT__:{nickname}:{clock}:{message_id}:{content}"));
-    app.add_log_message(format!(
-        "system: {nickname} is not here and has no internet address. Left with {} nearby peer(s) to carry — it reaches them only if one of them sees them within a day, and nothing will tell you either way.",
+    app.add_dm_sent(nickname.to_string(), message_id.to_string(), content.to_string());
+    app.add_notice(format!(
+        "{nickname} is not here and has no internet address. Left with {} nearby peer(s) to carry — it reaches them only if one of them sees them within a day, and nothing will tell you either way.",
         frames.len()
     ));
     Some(frames)
@@ -1499,16 +1497,16 @@ fn shelve(
     };
 
     match post.accept(envelope, depositor, tier, courier::now_millis()) {
-        mailbox::Deposit::Accepted => app.add_log_message(format!(
-            "system: holding sealed mail for someone, left by {} ({} on the shelf)",
+        mailbox::Deposit::Accepted => app.add_notice(format!(
+            "holding sealed mail for someone, left by {} ({} on the shelf)",
             peer_id::short_display(depositor),
             post.held_count()
         )),
         // Silent: a depositor retrying because it never saw an acknowledgement
         // is the ordinary case, not an event.
         mailbox::Deposit::AlreadyHeld => {}
-        mailbox::Deposit::Refused(why) => app.add_log_message(format!(
-            "system: turned away mail from {}: {why}",
+        mailbox::Deposit::Refused(why) => app.add_notice(format!(
+            "turned away mail from {}: {why}",
             peer_id::short_display(depositor)
         )),
     }
@@ -1536,8 +1534,8 @@ fn hand_over(
     if theirs.is_empty() {
         return Vec::new();
     }
-    app.add_log_message(format!(
-        "system: handed {} waiting message(s) to {}",
+    app.add_notice(format!(
+        "handed {} waiting message(s) to {}",
         theirs.len(),
         peer.nickname
     ));
@@ -1580,8 +1578,8 @@ fn uplink(
         // Worth a line: a neighbour handing us unverifiable events is either
         // broken or trying something, and either way we are the only one who
         // can see it happening.
-        app.add_log_message(format!(
-            "system: refused an unsigned carried event from {}",
+        app.add_notice(format!(
+            "refused an unsigned carried event from {}",
             peer_id::short_display(depositor)
         ));
         return None;
@@ -1610,8 +1608,8 @@ fn uplink(
                 // Held until the relays answer. Said out loud because the
                 // depositor cannot tell the difference between waiting and lost.
                 gateway::Uplink::Queued => {
-                    app.add_log_message(format!(
-                        "system: holding a message for #{geohash} until the relays answer ({} waiting)",
+                    app.add_notice(format!(
+                        "holding a message for #{geohash} until the relays answer ({} waiting)",
                         carrier.held_count()
                     ));
                     None
@@ -1725,15 +1723,14 @@ fn open_private_envelope(
     match payload.kind {
         NoisePayloadType::PrivateMessage => {
             let record = PrivateMessagePacket::decode(&payload.body)?;
-            // Send time from inside the envelope. The wrap's own timestamp is
-            // randomised by up to a quarter of an hour to blur it.
-            let clock = chrono::DateTime::from_timestamp(opened.created_at, 0)
-                .map(|sent| sent.with_timezone(&chrono::Local).format("%H%M").to_string())
-                .unwrap_or_else(|| chrono::Local::now().format("%H%M").to_string());
-            app.add_log_message(format!(
-                "__DM__:{display}:{clock}:{}:{}",
-                record.message_id, record.content
-            ));
+            // Send time from inside the envelope, not the wrap's own timestamp,
+            // which is randomised by up to a quarter of an hour to blur it.
+            app.add_dm_received(
+                display.clone(),
+                record.message_id.clone(),
+                record.content.clone(),
+                opened.created_at,
+            );
 
             // Acknowledge over the transport it arrived on. The sender is out
             // of radio range by construction — that is why this path exists —
@@ -1831,7 +1828,7 @@ fn apply_geo_event(
         // relays behind an ordinary join.
         GeoEvent::RelayConnected { relay, .. } => {
             if health.recovered(&relay) == Notice::BackUp {
-                app.add_log_message(format!("system: {relay} is answering again."));
+                app.add_notice(format!("{relay} is answering again."));
             }
         }
         // No channel in the message: the host is down for every subscription at
@@ -1839,11 +1836,11 @@ fn apply_geo_event(
         // fact once per channel and once more for the map sampler.
         GeoEvent::RelayFailed { relay, reason, .. } => match health.fell_over(&relay) {
             Notice::Down => {
-                app.add_log_message(format!("system: {relay} unreachable ({reason})"));
+                app.add_notice(format!("{relay} unreachable ({reason})"));
             }
             Notice::Unstable => {
-                app.add_log_message(format!(
-                    "system: {relay} keeps dropping; no longer reporting it."
+                app.add_notice(format!(
+                    "{relay} keeps dropping; no longer reporting it."
                 ));
             }
             Notice::Silent | Notice::BackUp => {}
@@ -1867,7 +1864,12 @@ fn apply_geo_event(
                 sender
             };
             let channel = geo::channel_name(&geohash);
-            app.add_log_message(format!("__CHANNEL__:{channel}:{sender}:{created_at}:{content}"));
+            app.add_channel_line(IncomingLine {
+                channel: channel.clone(),
+                sender: sender.clone(),
+                epoch: created_at,
+                content: content.clone(),
+            });
         }
         GeoEvent::Presence {
             geohash, pubkey, ..
@@ -1877,9 +1879,12 @@ fn apply_geo_event(
         GeoEvent::HistoryEnd { geohash } => {
             let channel = geo::channel_name(&geohash);
             let epoch = chrono::Local::now().timestamp();
-            app.add_log_message(format!(
-                "__CHANNEL__:{channel}:system:{epoch}:─── live ───"
-            ));
+            app.add_channel_line(IncomingLine {
+                channel: channel.clone(),
+                sender: "system".to_string(),
+                epoch,
+                content: "─── live ───".to_string(),
+            });
         }
         // Cells the map is watching but we have not joined.
         GeoEvent::Activity {
