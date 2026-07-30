@@ -24,6 +24,13 @@ use super::packet_id::PACKET_ID_LEN;
 /// end into garbage, so upstream refuses rather than decoding nonsense.
 pub const MAX_P: u32 = 32;
 
+// The *building* half of this codec is on no path the responder takes: it only
+// ever reads filters that peers send. It is annotated rather than deleted for
+// the same reason `compression::compress` is — it is the inverse of the half
+// that ships, it is what the tests need to construct a request at all, and
+// without it the decoder would have nothing independent to be checked against.
+// The requesting half will call it.
+
 /// A built filter, plus how much of the input it actually covers.
 ///
 /// `included_count` can be below the number of IDs handed in: when the encoding
@@ -32,6 +39,7 @@ pub const MAX_P: u32 = 32;
 /// arbitrary hash-ordered subset. That is precisely what lets a caller derive an
 /// exact since-cursor from the result.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct Params {
     pub p: u32,
     pub m: u32,
@@ -43,6 +51,7 @@ pub struct Params {
 ///
 /// The clamp is upstream's: below 1e-6 the parameter stops being useful and
 /// above 0.25 the filter stops being a filter.
+#[allow(dead_code)]
 pub fn derive_p(target_fpr: f64) -> u32 {
     let f = target_fpr.clamp(0.000_001, 0.25);
     let p = (1.0f64 / f).log2().ceil() as i64;
@@ -53,6 +62,7 @@ pub fn derive_p(target_fpr: f64) -> u32 {
 ///
 /// `P + 2` bits per element is the standard Golomb-Rice estimate: `P` for the
 /// remainder plus about two for the unary quotient.
+#[allow(dead_code)]
 pub fn estimate_max_elements(size_bytes: usize, p: u32) -> usize {
     let bits = (size_bytes * 8).max(8);
     let per = (p as usize + 2).max(3);
@@ -64,6 +74,7 @@ pub fn estimate_max_elements(size_bytes: usize, p: u32) -> usize {
 /// This is the modulus the hashes are folded into. Making it proportional to the
 /// element count is what holds the false-positive rate at `1/2^P` regardless of
 /// how many elements there are.
+#[allow(dead_code)]
 fn hash_range(count: usize, p: u32) -> u32 {
     if count == 0 {
         return 1;
@@ -107,6 +118,7 @@ fn map_hash(hash: u64, modulo: u64) -> u64 {
 
 /// Clamps into range and drops duplicates, keeping the sequence strictly
 /// increasing so every delta is at least 1.
+#[allow(dead_code)]
 fn normalize_mapped_values(values: &[u64], modulo: u64) -> Vec<u64> {
     if modulo <= 1 {
         return Vec::new();
@@ -134,6 +146,7 @@ pub fn bucket(id: &[u8; PACKET_ID_LEN], m: u32) -> u64 {
 }
 
 /// Builds a filter over `ids`, which must be ordered **newest first**.
+#[allow(dead_code)]
 pub fn build_filter(ids: &[[u8; PACKET_ID_LEN]], max_bytes: usize, target_fpr: f64) -> Params {
     let p = derive_p(target_fpr);
     if ids.is_empty() {
@@ -195,6 +208,7 @@ pub fn build_filter(ids: &[[u8; PACKET_ID_LEN]], max_bytes: usize, target_fpr: f
 ///
 /// For each delta `x`: `q = (x - 1) >> p` in unary (that many one-bits then a
 /// zero), followed by the `p`-bit remainder `r = (x - 1) & (2^p - 1)`.
+#[allow(dead_code)]
 fn encode_sorted(sorted: &[u64], p: u32) -> Vec<u8> {
     let mut writer = BitWriter::default();
     let mask: u64 = if p >= 64 { u64::MAX } else { (1u64 << p) - 1 };
@@ -256,6 +270,7 @@ pub fn contains(sorted_values: &[u64], candidate: u64) -> bool {
 
 /// MSB-first bit writer. The first bit written lands in bit 7 of byte 0.
 #[derive(Default)]
+#[allow(dead_code)]
 struct BitWriter {
     buf: Vec<u8>,
     cur: u8,

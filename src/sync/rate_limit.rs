@@ -64,6 +64,7 @@ impl ResponseRateLimiter {
         });
     }
 
+    #[cfg(test)]
     pub fn tracked_peers(&self) -> usize {
         self.history.len()
     }
