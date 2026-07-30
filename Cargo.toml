@@ -5,13 +5,23 @@ edition = "2021"
 description = "A terminal client for the BitChat mesh and its geohash location channels."
 license = "MIT OR Apache-2.0"
 
+# Everything but the UI loop, so `tests/` can reach it. Without this the crate
+# was bin-only and nothing outside `src/` could `use bitmancer::…`.
+[lib]
+name = "bitmancer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bitmancer"
 path = "src/main.rs"
 
 [dependencies]
 # Dependencies for all platforms
-ratatui = { version = "0.26.2", features = ["all-widgets"] }
+#
+# Not `all-widgets`. That feature is exactly `widget-calendar`, which is exactly
+# `dep:time`, and `time` was the crate's only path to RUSTSEC-2026-0009 — a
+# calendar widget this client never draws. The default features are what we use.
+ratatui = { version = "0.26.2" }
 crossterm = "0.27.0"
 tui-input = "0.8.0"
 futures-util = "0.3.30"

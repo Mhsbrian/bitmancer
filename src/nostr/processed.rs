@@ -96,6 +96,13 @@ impl ProcessedEvents {
         self.order.len()
     }
 
+    /// Paired with `len` so the public surface reads consistently. Both are
+    /// test-only; the record's real question is `contains`.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
     /// Forgets everything, on disk as well as in memory.
     pub fn wipe(&mut self) {
         self.seen.clear();

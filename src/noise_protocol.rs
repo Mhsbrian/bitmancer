@@ -147,6 +147,12 @@ pub struct NoiseCipherState {
     pub highest_received_nonce: u64,
 }
 
+impl Default for NoiseCipherState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NoiseCipherState {
     pub fn new() -> Self {
         Self {

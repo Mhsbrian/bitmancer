@@ -60,6 +60,12 @@ pub struct SidebarMenuState {
     pub blocked_selected: Option<usize>,
 }
 
+impl Default for SidebarMenuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SidebarMenuState {
     pub fn new() -> Self {
         Self {
@@ -302,6 +308,14 @@ fn apply_admission(messages: &mut [Message], message: &mut Message, admitted: Op
             break;
         }
         earlier.arrived = None;
+    }
+}
+
+impl Default for App {
+    /// The anonymous nickname, same as `App::new()`. Both exist for tests; the
+    /// binary always goes through `new_with_nickname` with the persisted one.
+    fn default() -> Self {
+        Self::new()
     }
 }
 

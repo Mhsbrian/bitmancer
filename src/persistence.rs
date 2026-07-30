@@ -50,6 +50,12 @@ pub struct AppState {
     pub nostr_device_seed: Option<Vec<u8>>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {

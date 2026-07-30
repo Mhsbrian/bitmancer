@@ -40,6 +40,20 @@ use crate::discovery::{self, Candidate, FailureLog};
 /// over the same antenna, so each additional peer costs airtime for all of
 /// them. Six is where upstream settled and there is no reason to differ.
 pub const MAX_LINKS: usize = 6;
+/// How long every link may be gone before the client calls itself offline.
+///
+/// A phone rotates its BLE address every few minutes, so the last link dropping
+/// and another replacing it seconds later is routine. Declaring an outage
+/// immediately covered the screen with a popup, cleared the peer list and made
+/// everyone re-announce — turning a blip into the churn it looked like.
+///
+/// Lives here rather than in the UI loop because every timing it has to stay
+/// longer than is in this file, and so is the test pinning that relationship.
+/// It used to sit in `main.rs` and be reached from those tests as
+/// `crate::OFFLINE_GRACE`, which only compiled while the crate was one binary
+/// with no library — a leak from a library module up into the executable that
+/// splitting the two made visible.
+pub const OFFLINE_GRACE: Duration = Duration::from_secs(12);
 /// Minimum gap between connection attempts, matching upstream's
 /// `bleConnectRateLimitInterval`. Dialling several peers back to back tends to
 /// make BlueZ fail all of them.
@@ -788,9 +802,9 @@ mod tests {
         // from, covering the screen and clearing the peer list on a blip.
         let fastest_reconnect = SETTLE_AFTER_LINK_LOSS + CONNECT_TIMEOUT;
         assert!(
-            crate::OFFLINE_GRACE > fastest_reconnect,
+            OFFLINE_GRACE > fastest_reconnect,
             "grace is {:?}, a reconnect needs at least {fastest_reconnect:?}",
-            crate::OFFLINE_GRACE
+            OFFLINE_GRACE
         );
     }
 
@@ -801,9 +815,9 @@ mod tests {
         // halves of this end up disagreeing about what is happening.
         let worst_pass = CONNECT_TIMEOUT * MAX_ATTEMPTS_PER_PASS as u32;
         assert!(
-            worst_pass <= crate::OFFLINE_GRACE * 3,
+            worst_pass <= OFFLINE_GRACE * 3,
             "a failing pass takes {worst_pass:?}, which is far past the {:?} grace",
-            crate::OFFLINE_GRACE
+            OFFLINE_GRACE
         );
     }
 
