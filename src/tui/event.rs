@@ -1,12 +1,91 @@
 // src/tui/event.rs
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
+};
 use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::tui::app::{App, FocusArea};
 use crate::tui::map::MapFocus;
 use crate::tui::widgets::sidebar::sidebar_visible_items;
+
+/// Lines the wheel moves per notch.
+///
+/// Three rather than one: a terminal reports a notch per physical click of the
+/// wheel, and one line each makes a long log feel stuck. Three is what most
+/// terminals and pagers settle on.
+const WHEEL_LINES: usize = 3;
+
+/// The wheel scrolls the log, wherever the keyboard focus happens to be.
+///
+/// Mouse capture was enabled from the very first commit of this TUI and no
+/// handler ever read a `Mouse` event, so the capture only ever took the
+/// terminal's own click-drag selection away and gave nothing back. This is the
+/// half that gives something back.
+///
+/// Deliberately not focus-dependent. A wheel over a log is a scroll in every
+/// other application, and requiring `Tab` to the log pane first would be a
+/// surprise with no upside. The other panes have nothing scrollable in them.
+pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
+    // The overlays own the screen while they are up, and none of them scrolls.
+    if app.popup_active || app.viewer.open || app.map_open || app.mesh_view_open {
+        return;
+    }
+
+    let (messages, _, _) = app.get_current_messages();
+    let max_scroll = messages.len().saturating_sub(app.message_viewport_height);
+
+    match mouse_event.kind {
+        // Up means back through history, matching the Up key above.
+        MouseEventKind::ScrollUp => {
+            app.msg_scroll = (app.msg_scroll + WHEEL_LINES).min(max_scroll);
+        }
+        MouseEventKind::ScrollDown => {
+            app.msg_scroll = app.msg_scroll.saturating_sub(WHEEL_LINES);
+        }
+        _ => {}
+    }
+}
+
+/// Pasted text goes into the compose box and is not sent.
+///
+/// Without bracketed paste a multi-line paste arrives as individual keystrokes
+/// and each embedded return fires `Enter`, sending half a message and then the
+/// next half. On a network where nothing can be unsent, that is the kind of
+/// mistake the client should make impossible rather than merely unlikely.
+///
+/// Newlines are folded to spaces rather than kept: a chat line is one line, the
+/// compose box draws one logical entry, and the wire format has no notion of a
+/// multi-line message. Folding preserves the words; keeping them would send the
+/// first line alone the moment `Enter` was pressed.
+pub fn handle_paste_event(app: &mut App, pasted: &str) {
+    if app.popup_active || app.viewer.open || app.map_open || app.mesh_view_open {
+        return;
+    }
+    // Focus follows the paste: text arriving means the user means to type.
+    app.focus_area = FocusArea::InputBox;
+
+    let folded: String = pasted
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    // Emptiness is judged after trimming but the text is inserted untrimmed: a
+    // paste of nothing but newlines folds to blanks and is worth dropping, while
+    // a deliberate leading space in real text is the user's business. Checking
+    // `folded.is_empty()` alone would insert those blanks, because the fold to
+    // spaces happens before the control-character filter can see them.
+    if folded.trim().is_empty() {
+        return;
+    }
+
+    let mut value = app.input.value().to_string();
+    value.push_str(&folded);
+    let cursor = value.chars().count();
+    app.input = tui_input::Input::new(value).with_cursor(cursor);
+}
 
 pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
     if key_event.kind != KeyEventKind::Press {
@@ -669,5 +748,137 @@ mod tests {
         app.switch_to_channel("#9q8yy".to_string());
         app.open_map();
         assert_eq!(app.map.selected_geohash(), "9q8yy");
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A log longer than its viewport, so there is somewhere to scroll to.
+    fn app_with_backlog() -> App {
+        let mut app = App::new_with_nickname("tui".into());
+        app.message_viewport_height = 10;
+        let now = chrono::Local::now().timestamp();
+        for index in 0..40 {
+            app.add_channel_line(crate::tui::app::IncomingLine {
+                channel: "#public".to_string(),
+                sender: "alice".to_string(),
+                epoch: now - (40 - index),
+                content: format!("line {index}"),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn the_wheel_scrolls_back_through_the_log_and_forward_again() {
+        let mut app = app_with_backlog();
+        assert_eq!(app.msg_scroll, 0, "starts at the newest line");
+
+        handle_mouse_event(&mut app, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.msg_scroll, WHEEL_LINES, "up goes back through history");
+
+        handle_mouse_event(&mut app, wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.msg_scroll, 0, "down comes back to the present");
+    }
+
+    #[test]
+    fn the_wheel_cannot_scroll_past_either_end() {
+        let mut app = app_with_backlog();
+
+        // Far more notches than there are lines.
+        for _ in 0..100 {
+            handle_mouse_event(&mut app, wheel(MouseEventKind::ScrollUp));
+        }
+        let ceiling = 40usize.saturating_sub(app.message_viewport_height);
+        assert_eq!(app.msg_scroll, ceiling, "clamped to the oldest line");
+
+        for _ in 0..100 {
+            handle_mouse_event(&mut app, wheel(MouseEventKind::ScrollDown));
+        }
+        assert_eq!(app.msg_scroll, 0, "and saturates at the newest, not below");
+    }
+
+    #[test]
+    fn the_wheel_does_nothing_while_an_overlay_owns_the_screen() {
+        // The map and the viewer cover the log. Scrolling something the user
+        // cannot see, so that it has moved when they close the overlay, is worse
+        // than ignoring the wheel.
+        let mut app = app_with_backlog();
+        app.open_map();
+
+        handle_mouse_event(&mut app, wheel(MouseEventKind::ScrollUp));
+
+        assert_eq!(app.msg_scroll, 0, "the log did not move behind the map");
+    }
+
+    #[test]
+    fn a_pasted_newline_does_not_send_anything() {
+        // The whole point. Without bracketed paste this arrived as keystrokes and
+        // the embedded return fired Enter, sending "first" on its own.
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let mut app = App::new_with_nickname("tui".into());
+
+        handle_paste_event(&mut app, "first\nsecond");
+
+        assert_eq!(
+            app.input.value(),
+            "first second",
+            "both halves are in the box, newline folded to a space"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing was sent — a paste is composition, not a send"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn a_paste_appends_to_what_is_already_typed() {
+        let mut app = App::new_with_nickname("tui".into());
+        app.input = tui_input::Input::new("look at ".to_string()).with_cursor(8);
+
+        handle_paste_event(&mut app, "https://example.invalid/x.png");
+
+        assert_eq!(app.input.value(), "look at https://example.invalid/x.png");
+    }
+
+    #[test]
+    fn a_paste_takes_the_focus_to_the_compose_box() {
+        // Text arriving means the user means to type, wherever Tab left them.
+        let mut app = App::new_with_nickname("tui".into());
+        app.focus_area = FocusArea::Sidebar;
+
+        handle_paste_event(&mut app, "words");
+
+        assert_eq!(app.focus_area, FocusArea::InputBox);
+    }
+
+    #[test]
+    fn a_paste_of_nothing_but_control_characters_is_dropped() {
+        let mut app = App::new_with_nickname("tui".into());
+
+        handle_paste_event(&mut app, "\r\n\t\u{7}");
+
+        assert!(
+            app.input.value().is_empty(),
+            "got {:?}",
+            app.input.value()
+        );
+    }
+
+    #[test]
+    fn a_paste_is_ignored_while_an_overlay_owns_the_screen() {
+        let mut app = App::new_with_nickname("tui".into());
+        app.open_map();
+
+        handle_paste_event(&mut app, "words");
+
+        assert!(app.input.value().is_empty(), "the map has the keyboard");
     }
 }

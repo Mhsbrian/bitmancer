@@ -386,8 +386,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .saturating_sub(last_tick.elapsed())
             .max(ESC_RESOLVE_WINDOW);
         if crossterm_event::poll(poll_timeout).unwrap_or(false) {
-            if let Ok(CrosstermEvent::Key(key_event)) = crossterm_event::read() {
-                event::handle_key_event(&mut app, key_event, &input_tx);
+            // Every event kind is dispatched, not only keys. Reading `Key` alone
+            // and dropping the rest is what left mouse capture enabled with no
+            // wheel behind it, and what turned a pasted newline into a sent
+            // half-message. `Resize` needs no arm: the loop redraws every tick
+            // and ratatui re-measures from the backend as it goes.
+            match crossterm_event::read() {
+                Ok(CrosstermEvent::Key(key_event)) => {
+                    event::handle_key_event(&mut app, key_event, &input_tx);
+                }
+                Ok(CrosstermEvent::Mouse(mouse_event)) => {
+                    event::handle_mouse_event(&mut app, mouse_event);
+                }
+                Ok(CrosstermEvent::Paste(pasted)) => {
+                    event::handle_paste_event(&mut app, &pasted);
+                }
+                _ => {}
             }
         }
         last_tick = Instant::now();

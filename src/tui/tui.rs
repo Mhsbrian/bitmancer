@@ -2,7 +2,9 @@
 // src/tui/tui.rs
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,8 +15,25 @@ use std::io::{self, stdout, Stdout};
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Initializes the terminal for TUI rendering.
+///
+/// Mouse capture is on so the wheel can scroll the log. It costs the terminal's
+/// own click-drag selection, which is a real trade — but in an alternate-screen
+/// application there is no scrollback to select *from*, so what it costs is
+/// selection over one visible frame and what it buys is a wheel that works.
+/// `Shift`+drag reaches the terminal's selection underneath the capture in most
+/// terminals; the README says so, because it is a terminal feature rather than
+/// something this client can promise.
+///
+/// Bracketed paste is on so a pasted newline stays a newline. Without it a
+/// multi-line paste arrives as individual keystrokes and every embedded return
+/// sends the line — on a network where nothing can be unsent.
 pub fn init() -> io::Result<Tui> {
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     enable_raw_mode()?;
     Terminal::new(CrosstermBackend::new(stdout()))
 }
@@ -23,8 +42,17 @@ pub fn init() -> io::Result<Tui> {
 ///
 /// Safe to call more than once, which the guard below depends on: a panic
 /// restores from the hook and then again as the guard unwinds past.
+///
+/// Undoes each mode set by `init`. Leaving bracketed paste on would outlive the
+/// process and make the next program's pastes arrive wrapped in escape
+/// sequences, which is the same class of discourtesy as leaving raw mode on.
 pub fn restore() -> io::Result<()> {
-    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     disable_raw_mode()?;
     Ok(())
 }
