@@ -29,6 +29,8 @@
 // control keeps it honest: libtest's own hook restores no terminals, which is why
 // `panic_unguarded` still fails the way the real bug did.
 
+mod common;
+use common::private_modes;
 use std::process::Command;
 
 const MODE_VAR: &str = "BITMANCER_PTY_MODE";
@@ -324,44 +326,10 @@ fn two_concurrent_runs_on_one_mode_both_survive() {
 ///
 /// The check derives the modes from the transcript rather than naming them, so
 /// it cannot go stale: whatever `init` asks for is what `restore` is held to.
-/// That matters more than it looks, because `EnableMouseCapture` is not one mode
-/// — crossterm expands it to five (1000, 1002, 1003, 1006, 1015), and the
-/// assertions elsewhere in this suite name only 1006.
-fn private_modes(transcript: &str) -> (Vec<String>, Vec<String>) {
-    let chars: Vec<char> = transcript.chars().collect();
-    let (mut set, mut unset) = (Vec::new(), Vec::new());
-    let mut index = 0;
-    while index < chars.len() {
-        // A private mode is ESC [ ? <digits> then 'h' to set or 'l' to reset.
-        if chars[index] == '\x1b'
-            && index + 2 < chars.len()
-            && chars[index + 1] == '['
-            && chars[index + 2] == '?'
-        {
-            let mut cursor = index + 3;
-            let mut digits = String::new();
-            while cursor < chars.len() && chars[cursor].is_ascii_digit() {
-                digits.push(chars[cursor]);
-                cursor += 1;
-            }
-            if cursor < chars.len() && !digits.is_empty() {
-                match chars[cursor] {
-                    'h' => set.push(digits),
-                    'l' => unset.push(digits),
-                    _ => {}
-                }
-            }
-            index = cursor;
-        } else {
-            index += 1;
-        }
-    }
-    set.sort();
-    set.dedup();
-    unset.sort();
-    unset.dedup();
-    (set, unset)
-}
+/// The parser lives in `tests/common` because `terminal_events.rs` needs the
+/// same reading — a second copy of a helper that decides what the terminal was
+/// asked for is how the two drift apart.
+
 
 #[test]
 fn every_mode_the_client_turns_on_is_turned_back_off() {

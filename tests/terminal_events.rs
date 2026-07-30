@@ -20,6 +20,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+mod common;
+use common::private_modes;
+
 const CHILD_VAR: &str = "BITMANCER_EVENT_CHILD";
 
 /// SGR mouse encoding, which is what crossterm asks the terminal for when mouse
@@ -305,22 +308,49 @@ fn mouse_capture_false_does_not_ask_the_terminal_for_the_mouse() {
         return;
     }
 
-    let transcript = drive("nocapture", WHEEL_UP);
-    assert!(
-        !transcript.contains(REQUEST_SGR_MOUSE),
-        "mouse_capture = false must not ask the terminal for SGR mouse \
-         reporting, or the selection it exists to hand back is still \
-         taken.\n{transcript}"
+    // Derived rather than named, and the first version of this test was wrong
+    // for exactly the reason `terminal_restore.rs` turned up: it asserted only
+    // that 1006 was absent. `EnableMouseCapture` is five modes, and 1006 is the
+    // SGR *encoding* — the ones that actually take click-drag selection are
+    // 1000, 1002 and 1003. Checking the encoding while claiming to check the
+    // capture would have passed against an `init_with` that dropped 1006 alone
+    // and left the selection just as gone, which is the entire thing the setting
+    // exists to give back.
+    let (off_modes, _) = private_modes(&drive("nocapture", WHEEL_UP));
+    let enabled = drive("wheel", WHEEL_UP);
+    let (on_modes, _) = private_modes(&enabled);
+
+    // The whole set, not a difference. The first version of this asserted that
+    // nothing in `on_modes - off_modes` appeared in `off_modes`, which is
+    // impossible by construction — a set difference never intersects the set it
+    // was subtracted from — so it could not fail and a mutation proved it: an
+    // `init_with` that dropped 1006 alone while still asking for 1000, 1002,
+    // 1003 and 1015 passed, with the selection just as gone.
+    //
+    // 1049 and 2004 are named rather than derived because they are what `init`
+    // is *defined by* — the alternate screen and bracketed paste, neither of
+    // which has anything to do with the mouse. Everything else is the mouse, and
+    // this says there is none of it, without needing to know how many modes
+    // crossterm expands `EnableMouseCapture` into.
+    assert_eq!(
+        off_modes,
+        vec!["1049".to_string(), "2004".to_string()],
+        "mouse_capture = false must ask for the alternate screen and bracketed \
+         paste and nothing else; anything extra here is a mouse mode, and the \
+         selection this setting exists to hand back is still taken"
     );
 
-    // The control. Same bytes, same child, capture on — so a transcript that
-    // simply never contains the sequence, for any reason, cannot pass the
-    // assertion above.
-    let enabled = drive("wheel", WHEEL_UP);
+    // The control. Capture on must ask for strictly more, or the assertion above
+    // would be satisfied by an `init_with` that never enabled the mouse at all
+    // and the setting would be indistinguishable from doing nothing.
+    let capture_adds: Vec<&String> = on_modes
+        .iter()
+        .filter(|mode| !off_modes.contains(mode))
+        .collect();
     assert!(
-        enabled.contains(REQUEST_SGR_MOUSE),
-        "with capture on the sequence must be there, or the check above is \
-         measuring nothing.\n{enabled}"
+        !capture_adds.is_empty(),
+        "capture on must ask for something capture off does not, or this test \
+         cannot tell the two apart.\n{enabled}"
     );
 }
 
