@@ -434,89 +434,6 @@ impl NoiseSessionManager {
     /// Reachable only from tests. The live paths reach a session through
     /// `initiate_handshake` and `handle_incoming_handshake`, which build one
     /// themselves rather than asking for it first.
-    #[allow(dead_code)]
-    pub fn create_session(
-        &mut self,
-        peer_id: String,
-        role: NoiseRole,
-    ) -> Result<NoiseSession, NoiseError> {
-        noise_trace(&format!(
-            "[DEBUG] Creating session for peer: {} with role: {:?}",
-            peer_id, role
-        ));
-
-        // Check if session already exists and is established
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(existing_session) = sessions.get(&peer_id) {
-            if existing_session.state == NoiseSessionState::Established {
-                return Err(NoiseError::AlreadyEstablished); // keep the channel
-            }
-            // handshaking or failed sessions are handled below
-        }
-
-        noise_trace("[DEBUG] About to create new NoiseHandshakeState");
-
-        // Create new handshake state
-        let handshake_state = match role {
-            NoiseRole::Initiator => {
-                noise_trace("[DEBUG] Creating handshake state as initiator");
-                NoiseHandshakeState::new(
-                    role,
-                    NoisePattern::XX,
-                    Some(self.local_static_key.clone()),
-                    None,
-                )
-            }
-            NoiseRole::Responder => {
-                noise_trace("[DEBUG] Creating handshake state as responder");
-                NoiseHandshakeState::new(
-                    role,
-                    NoisePattern::XX,
-                    Some(self.local_static_key.clone()),
-                    None,
-                )
-            }
-        };
-
-        noise_trace("[DEBUG] Handshake state created successfully");
-
-        // Check if we need to create a new session or update existing one
-        if let Some(existing_session) = sessions.get_mut(&peer_id) {
-            // Update existing session with new handshake state
-            existing_session.handshake_state = Some(handshake_state);
-            noise_trace(&format!(
-                "[DEBUG] Updated existing session for peer: {}",
-                peer_id
-            ));
-            Ok(existing_session.clone())
-        } else {
-            // Create new session
-            let session = NoiseSession {
-                peer_id: peer_id.clone(),
-                role,
-                state: NoiseSessionState::Handshaking,
-                handshake_state: Some(handshake_state),
-                send_cipher: None,
-                receive_cipher: None,
-                local_static_key: self.local_static_key.clone(),
-                remote_static_public_key: None,
-                sent_handshake_messages: Vec::new(),
-                handshake_hash: None,
-
-            };
-
-            noise_trace(&format!(
-                "[DEBUG] Session created successfully for peer: {}",
-                peer_id
-            ));
-
-            // Store the session
-            sessions.insert(peer_id.clone(), session.clone());
-
-            Ok(session)
-        }
-    }
-
     pub fn remove_session(&mut self, peer_id: &str) {
         let mut sessions = self.sessions.lock().unwrap();
         noise_trace(&format!("[DEBUG] Removing session for peer: {}", peer_id));
@@ -861,28 +778,42 @@ mod lifecycle_tests {
         // The distinction the send path depends on: mesh.rs asks
         // has_established_session before it will encrypt to a peer, so a session
         // that merely exists must not answer yes.
+        //
+        // Started through `initiate_handshake` rather than `create_session`,
+        // because that is the door `mesh.rs:641` uses. `create_session` is
+        // reached by nothing in production — building the precondition through it
+        // would leave this passing even if the real creation path diverged, which
+        // is the failure a test like this exists to catch.
         let mut manager = manager(2);
-        manager
-            .create_session("aabbccddeeff0011".to_string(), NoiseRole::Initiator)
-            .expect("a fresh session should be creatable");
+        let opening = manager
+            .initiate_handshake("aabbccddeeff0011")
+            .expect("a first handshake message should be producible");
 
-        assert!(manager.has_session("aabbccddeeff0011"), "it should be registered");
+        assert!(
+            !opening.is_empty(),
+            "the opening message carries the ephemeral key and cannot be empty"
+        );
         assert!(
             !manager.has_established_session("aabbccddeeff0011"),
-            "no handshake has happened, so nothing may be encrypted to it yet"
+            "the handshake has only started, so nothing may be encrypted to it yet"
         );
     }
 
     #[test]
     fn removing_a_session_forgets_it() {
-        // remove_session is the one lifecycle call with several callers — it runs
-        // when a peer ages out or is blocked, and a session surviving that would
-        // keep a stale key usable.
+        // remove_session runs when a peer ages out or is blocked, and a session
+        // surviving that would keep a stale key usable. Both ends of this go
+        // through what production calls: `initiate_handshake` to put a session
+        // there, `remove_session` to take it away, and `has_session` only as the
+        // observation, never as the thing being set up.
         let mut manager = manager(3);
         manager
-            .create_session("aabbccddeeff0011".to_string(), NoiseRole::Initiator)
-            .unwrap();
-        assert!(manager.has_session("aabbccddeeff0011"));
+            .initiate_handshake("aabbccddeeff0011")
+            .expect("a first handshake message should be producible");
+        assert!(
+            manager.has_session("aabbccddeeff0011"),
+            "initiating must leave a session behind to remove"
+        );
 
         manager.remove_session("aabbccddeeff0011");
 
