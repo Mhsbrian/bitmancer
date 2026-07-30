@@ -368,7 +368,44 @@ problem it exists to catch:
 
 ### UI boundary
 
-The TUI (`src/tui/`) still shares no types with the backend. Backend → UI messages are strings parsed by `App::add_log_message`: `system: <text>` for notices and `__CHANNEL__:#public:<sender>:<HHMM>:<content>` for chat lines. UI → backend requests are `pending_*` fields on `App` that the main loop `take()`s each iteration. Adding a new backend→UI signal means a marker at the emit site *and* a branch in `add_log_message`.
+Backend → UI is four methods on `App`, one per kind of thing that can arrive:
+`add_channel_line(IncomingLine)`, `add_dm_received`, `add_dm_sent`, `add_notice`.
+UI → backend requests are still `pending_*` fields on `App` that the main loop
+`take()`s each iteration.
+
+It used to be one method, `add_log_message(String)`, and the string carried its
+own type as a prefix: `system: <text>` for a notice,
+`__CHANNEL__:{channel}:{sender}:{epoch}:{content}` for a chat line, plus `__DM__:`
+and `__DM_SENT__:`. The UI took them apart with `splitn(5, ':')` and a handful of
+regexes compiled fresh on every message. Four things were wrong with that, and
+all four were live:
+
+- **A sender chose more than its own name.** `sender` comes off the wire, so a
+  peer calling itself `a:0:x` shifted every field after it — and `epoch` decides
+  where a line sits in the log, so picking a nickname picked a permanent position
+  on someone else's screen. On the geohash side that nickname is an
+  unauthenticated Nostr `n` tag with no length limit.
+- **A notice could be swallowed.** `^system: (.+)$` cannot match across a newline
+  in this regex dialect, so a multi-line notice fell through to a free-text branch
+  that began `if trimmed.contains(&self.nickname) { return }` — discarding any
+  multi-line notice that mentioned the user.
+- **A regex ran before the notice branch and consumed it.** `(\w+) connected` was
+  an unanchored substring match that pushed the captured word into `app.people`
+  and returned, so `system: alice connected` never reached the log. It was also
+  redundant: `app.people` is rebuilt wholesale from `mesh.nicknames()` or the
+  geohash participant list on every maintenance tick.
+- **A mismatch failed silently.** Adding a signal meant a marker at the emit site
+  *and* a branch in the parser, and getting them out of step meant the line simply
+  never appeared — no error anywhere.
+
+A fifth was found while converting: a test fixture wrote
+`__DM__:bob:1200:private words`, four fields where the parser wanted five, so it
+was never filed as a private message at all and the assertion resting on it had
+been passing vacuously.
+
+`add_dm_received` takes a send-time epoch rather than a pre-formatted clock,
+because a message that arrived over Nostr carries its true time inside the sealed
+rumor while the gift wrap's own timestamp is jittered by up to ±900s.
 
 The connection overlay covers the whole UI while disconnected; `Esc` dismisses it so the client stays usable offline (reconnection continues regardless). Keep `App::MAX_POPUP_MESSAGES` small — the popup's message pane is only about four rows.
 
