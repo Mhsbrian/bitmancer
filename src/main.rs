@@ -2,35 +2,9 @@
 //
 // Transport-agnostic UI loop: the BLE radio lives in `transport`, the protocol
 // lives in `mesh`, and this file wires them to the ratatui frontend.
-
-mod announce;
-mod commands;
-mod compression;
-mod courier;
-mod data_structures;
-mod discovery;
-mod file_packet;
-mod favorites;
-mod fragment;
-mod gateway;
-mod geo;
-mod geohash;
-mod mailbox;
-mod media;
-mod mesh;
-mod noise_payload;
-mod noise_protocol;
-mod nostr;
-mod noise_session;
-mod outbox;
-mod peer_id;
-mod persistence;
-mod protocol;
-mod relay;
-mod topology;
-mod transport;
-mod tui;
-mod verification;
+//
+// The modules themselves are declared in `lib.rs`, so both this binary and
+// anything under `tests/` can reach them. This file is the loop and nothing else.
 
 use std::time::{Duration, Instant};
 
@@ -38,17 +12,17 @@ use crossterm::event as crossterm_event;
 use crossterm::event::Event as CrosstermEvent;
 use tokio::sync::mpsc;
 
-use commands::CommandOutcome;
-use geo::GeoService;
-use mesh::{DeliveryStatus, MeshEvent, MeshService};
-use noise_payload::{NoisePayloadType, PrivateMessagePacket};
-use nostr::client::GeoEvent;
-use nostr::health::Notice;
-use transport::{Outbound, TransportEvent};
-use tui::app::{App, TuiPhase};
-use tui::event;
-use tui::tui as tui_mod;
-use tui::ui;
+use bitmancer::commands::{self, CommandOutcome};
+use bitmancer::geo::{self, GeoService};
+use bitmancer::mesh::{DeliveryStatus, MeshEvent, MeshService};
+use bitmancer::noise_payload::{NoisePayloadType, PrivateMessagePacket};
+use bitmancer::nostr::{self, client::GeoEvent, health::Notice};
+use bitmancer::transport::{self, Outbound, TransportEvent};
+use bitmancer::tui::{self, app::App, app::TuiPhase, event, tui as tui_mod, ui};
+use bitmancer::{
+    courier, favorites, gateway, geohash, mailbox, media, outbox, peer_id, persistence, protocol,
+    relay, topology, verification,
+};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 /// Frame interval while a line is still arriving. The reveal sweep runs for a
@@ -59,13 +33,6 @@ const ANIMATION_TICK: Duration = Duration::from_millis(33);
 /// 0x1b is Esc rather than the start of an escape sequence.
 const ESC_RESOLVE_WINDOW: Duration = Duration::from_millis(20);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
-/// How long every link may be gone before the client calls itself offline.
-///
-/// A phone rotates its BLE address every few minutes, so the last link dropping
-/// and another replacing it seconds later is routine. Declaring an outage
-/// immediately covered the screen with a popup, cleared the peer list and made
-/// everyone re-announce — turning a blip into the churn it looked like.
-const OFFLINE_GRACE: Duration = Duration::from_secs(12);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -201,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // future early return can strand the user in raw mode.
     let _terminal_guard = tui_mod::TerminalGuard::new();
     let mut app = App::new_with_nickname(mesh.nickname.clone());
-    app.short_peer_id = crate::peer_id::short_display(&mesh.my_peer_id);
+    app.short_peer_id = peer_id::short_display(&mesh.my_peer_id);
     app.add_popup_message(format!("You are {} ({})", mesh.nickname, mesh.my_peer_id));
     app.add_popup_message("Esc dismisses this; /geo #<geohash> joins a location channel.".into());
 
@@ -1067,7 +1034,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // A link that has been gone this long is an outage rather than an
             // address rotation, and is worth saying so.
-            if offline_since.is_some_and(|since| since.elapsed() >= OFFLINE_GRACE)
+            if offline_since.is_some_and(|since| since.elapsed() >= transport::OFFLINE_GRACE)
                 && links.is_empty()
             {
                 offline_since = None;
@@ -1742,7 +1709,7 @@ fn open_private_envelope(
                 .get(fingerprint)
                 .map(|entry| entry.nickname.clone())
                 .filter(|nickname| !nickname.is_empty())
-                .unwrap_or_else(|| crate::peer_id::short_display(fingerprint));
+                .unwrap_or_else(|| peer_id::short_display(fingerprint));
             (fingerprint.chars().take(16).collect::<String>(), nickname)
         }
         // Someone we favourited who has not favourited us back can reach us

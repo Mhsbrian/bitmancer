@@ -220,6 +220,14 @@ impl ImageCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Whether anything has been cached yet. Paired with `len` because a public
+    /// `len` without it is the kind of API that reads fine and then makes every
+    /// caller write `len() == 0`.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[cfg(test)]

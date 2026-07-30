@@ -343,6 +343,29 @@ Three layers, deliberately not sharing state:
 
 Supporting modules: `protocol.rs` (frame codec + padding), `announce.rs` (TLV + signing), `message.rs` (the chat payload inside 0x02), `peer_id.rs`, `compression.rs`, `commands.rs` (slash commands as an outcome enum), `persistence.rs` (`~/.bitchat/state.json`, holds the Ed25519 identity key and the Noise static key).
 
+### Two targets, one module list
+
+Everything except the UI loop is a library (`src/lib.rs`), and `main.rs` is the
+binary that drives it. The module list lives in `lib.rs`; `main.rs` reaches it as
+`use bitmancer::…` like any other caller.
+
+The crate was bin-only until then, which meant nothing under `tests/` could name
+`bitmancer` at all — that is why the one genuine fixture in the tree is read with
+`include_str!` from inside a unit test rather than from an integration test.
+`tests/public_api.rs` is the first test outside `src/`.
+
+Two things the split surfaced, both worth knowing because they are the class of
+problem it exists to catch:
+
+- `transport.rs` reached *up* into the binary for `crate::OFFLINE_GRACE`. That
+  only compiled while the two were one target. The constant now lives in
+  `transport.rs`, next to the timings it must stay longer than and next to the
+  test that pins the relationship.
+- Making the modules `pub` changed what clippy considers API, so a public `len`
+  without `is_empty` and a `new()` without `Default` became warnings where before
+  they were invisible. `-D warnings` means the tree had to answer them rather
+  than allow them.
+
 ### UI boundary
 
 The TUI (`src/tui/`) still shares no types with the backend. Backend → UI messages are strings parsed by `App::add_log_message`: `system: <text>` for notices and `__CHANNEL__:#public:<sender>:<HHMM>:<content>` for chat lines. UI → backend requests are `pending_*` fields on `App` that the main loop `take()`s each iteration. Adding a new backend→UI signal means a marker at the emit site *and* a branch in `add_log_message`.
