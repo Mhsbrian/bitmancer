@@ -286,6 +286,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             MeshEvent::Send(outgoing) => {
                                 let _ = transport.outbound.send(Outbound::All(outgoing)).await;
                             }
+                            // An answer belongs to the peer that asked and to
+                            // nobody else. The mesh layer deals in peer IDs and
+                            // has no link to name, but the link a frame arrived
+                            // on is the peer that sent it — sync requests carry
+                            // no hops, so their sender is always the far end of
+                            // this link.
+                            MeshEvent::Reply(outgoing) => {
+                                let _ = transport
+                                    .outbound
+                                    .send(Outbound::Only {
+                                        link: link.clone(),
+                                        data: outgoing,
+                                    })
+                                    .await;
+                            }
                             MeshEvent::CarriedEvent {
                                 depositor,
                                 direction,
@@ -1041,6 +1056,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for mesh_event in mesh.prune_peers() {
                 apply_mesh_event(&mut app, mesh_event, &mut last_notice);
             }
+            // Reclaims archived traffic that has aged out of the sync window,
+            // and forgets peers that have stopped asking us for syncs.
+            mesh.sweep_sync_state();
             if post.is_enabled() {
                 post.prune(courier::now_millis());
                 // Every known peer, because an announce is what makes their mail
@@ -1316,7 +1334,7 @@ fn fixed_key(bytes: Option<&[u8]>) -> Option<[u8; 32]> {
 fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut String) {
     match mesh_event {
         // Handled by the caller, which owns the transport.
-        MeshEvent::Send(_) => {}
+        MeshEvent::Send(_) | MeshEvent::Reply(_) => {}
         MeshEvent::FavoriteUpdate {
             nickname, notice, ..
         } => {

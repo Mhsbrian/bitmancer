@@ -1080,11 +1080,43 @@ and why `gateway.rs` is a policy engine rather than a crypto one.
   `pong 0x27`, but neither `BitchatProtocol.swift` nor `Packets.swift` defines
   them and the whitepaper does not mention them. Do not implement these for
   parity; liveness there comes from announces.
-- **Opcodes named but unspecified here:** `requestSync 0x21`, `boardPost 0x23`,
-  `prekeyBundle 0x24`, `groupMessage 0x25`. The names came from reading upstream,
-  but nothing in this repo pins down their payloads. Do not implement from the
-  names alone. `courierEnvelope 0x04` was on this list and is no longer — its
-  wire format is pinned by `courier.rs` and its tests.
+- **`requestSync 0x21` is gossip sync, and the answering half is implemented.**
+  Upstream unicasts one to every connected peer every 15s for messages, 30s for
+  fragments and 60s for files, so a phone in radio range is asking several times
+  a minute; before `src/sync/` existed the dispatch dropped them at
+  `Some(_) => Vec::new()` and this client was a hole in every mesh it joined.
+  The payload is a TLV — `0x01` P, `0x02` M big-endian, `0x03` the Golomb-Rice
+  bitstream, `0x04` type flags, `0x05` a since-cursor, `0x06` a fragment filter.
+  Note that `0x04` is **little-endian** while `0x02` and `0x05` beside it are
+  big-endian, and that an oversized `0x03` fails the whole decode while an
+  oversized `0x06` is dropped and the rest honoured. Both asymmetries are
+  upstream's.
+
+  Membership is a Golomb-Coded Set over
+  `SHA-256(type ‖ senderID ‖ timestamp_be ‖ payload)[0..16]`, hashed again and
+  folded into `[1, M)`; the top bit of that second hash is **masked off**, and
+  half of all ids have it set, so missing the mask means agreeing with nobody.
+  The bitstream is MSB-first. Upstream's `GCSFilterTests.swift` carries no
+  byte-level vector, so ours are hand-derived — see `sync/gcs.rs`, and do not
+  replace them with round-trips, which pass under either bit order.
+
+  Retention is **900 seconds**, not the six hours `WHITEPAPER.md` §6.3 claims;
+  the shipped `publicMessageMaxAgeSeconds` is 900 and its own comment disagrees
+  with it. Recording an *announce* is gated tighter, at 60s, because an announce
+  is a claim about who is here now.
+
+  We answer; we do not yet ask. The requesting half needs the `is_rsr` flag to
+  actually be checked — it is parsed and encoded today and read nowhere, so
+  accepting solicited responses without having asked is an injection path.
+  Upstream guards it with `RequestSyncManager`.
+- **Opcodes named but unspecified here:** `boardPost 0x23`, `prekeyBundle 0x24`,
+  `groupMessage 0x25`. The names came from reading upstream, but nothing in this
+  repo pins down their payloads. Do not implement from the names alone. All
+  three ride on gossip sync upstream — `SyncTypeFlags` gives them bits 8, 9 and
+  10 — so they are reachable now in a way they were not before.
+  `courierEnvelope 0x04` and `requestSync 0x21` were both on this list and are
+  no longer; their wire formats are pinned by `courier.rs` and `sync/`
+  respectively, and by their tests.
 
 ## Verification
 

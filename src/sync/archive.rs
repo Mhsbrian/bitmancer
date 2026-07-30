@@ -32,6 +32,22 @@ pub const FILE_CAPACITY: usize = 200;
 /// packets every phone in the room dropped long ago, on every round, forever.
 pub const MAX_AGE_MS: u64 = 900 * 1000;
 
+/// How recent an announce must be to be *filed*, in milliseconds.
+///
+/// Upstream gates announces twice on the way in: `isPacketFresh` at 900s like
+/// everything else, and then `isAnnouncementFresh` at `stalePeerTimeoutSeconds`
+/// = 60, which also forgets the peer when it fails. Only the tighter gate has
+/// any effect, so that is what this is.
+///
+/// It matters because an announce is a claim about who is *here*. Without it a
+/// peer could replay a fourteen-minute-old announce and have us re-serve it to
+/// the room as current presence. Our own `ANNOUNCE_INTERVAL` is 10s, so a
+/// genuine announce clears this by a wide margin.
+///
+/// Announces already filed stay servable for the full `MAX_AGE_MS`, matching
+/// upstream: the responder checks the loose window, not this one.
+pub const ANNOUNCE_RECORD_MAX_AGE_MS: u64 = 60 * 1000;
+
 /// Which store a packet belongs in.
 ///
 /// Only the types this client actually speaks. Upstream also syncs board posts,
@@ -157,7 +173,7 @@ impl Archive {
     ///
     /// Returns whether it was kept, which is only used by tests and logging —
     /// callers hand everything past and let the archive decide.
-    pub fn record(&mut self, packet: &Packet) -> bool {
+    pub fn record(&mut self, packet: &Packet, now_ms: u64) -> bool {
         // Only broadcast traffic is public history. A packet addressed to
         // someone is a private exchange and re-offering it to the room would be
         // the worst bug in this file.
@@ -167,8 +183,18 @@ impl Archive {
         let Some(message_type) = packet.parsed_type() else {
             return false;
         };
+        if !is_fresh(packet, now_ms) {
+            return false;
+        }
 
         if message_type == MessageType::Announce {
+            // An announce that has aged past the presence window is not
+            // evidence anyone is here. Upstream also drops what it knew about
+            // that peer at this point rather than leaving a stale claim behind.
+            if now_ms.saturating_sub(packet.timestamp) > ANNOUNCE_RECORD_MAX_AGE_MS {
+                self.announces.remove(&packet.sender_id);
+                return false;
+            }
             self.announces.insert(packet.sender_id, packet.clone());
             return true;
         }
@@ -277,7 +303,7 @@ mod tests {
     #[test]
     fn a_broadcast_message_is_kept_and_can_be_read_back() {
         let mut archive = Archive::new();
-        assert!(archive.record(&message_at(1, NOW, b"hello")));
+        assert!(archive.record(&message_at(1, NOW, b"hello"), NOW));
         let held = archive.fresh(Kind::Message, NOW);
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].payload, b"hello");
@@ -291,7 +317,7 @@ mod tests {
         let mut private = message_at(1, NOW, b"for you only");
         private.recipient_id = Some([2u8; 8]);
         assert!(!private.is_broadcast());
-        assert!(!archive.record(&private));
+        assert!(!archive.record(&private, NOW));
         assert!(archive.is_empty());
     }
 
@@ -307,7 +333,7 @@ mod tests {
             MessageType::Leave,
         ] {
             assert!(
-                !archive.record(&packet_at(message_type, 1, NOW, b"x")),
+                !archive.record(&packet_at(message_type, 1, NOW, b"x"), NOW),
                 "{message_type:?} must not be archived"
             );
         }
@@ -317,9 +343,9 @@ mod tests {
     #[test]
     fn each_kind_lands_in_its_own_store() {
         let mut archive = Archive::new();
-        archive.record(&packet_at(MessageType::Message, 1, NOW, b"m"));
-        archive.record(&packet_at(MessageType::Fragment, 1, NOW, b"f"));
-        archive.record(&packet_at(MessageType::FileTransfer, 1, NOW, b"t"));
+        archive.record(&packet_at(MessageType::Message, 1, NOW, b"m"), NOW);
+        archive.record(&packet_at(MessageType::Fragment, 1, NOW, b"f"), NOW);
+        archive.record(&packet_at(MessageType::FileTransfer, 1, NOW, b"t"), NOW);
         assert_eq!(archive.len(Kind::Message), 1);
         assert_eq!(archive.len(Kind::Fragment), 1);
         assert_eq!(archive.len(Kind::File), 1);
@@ -331,8 +357,8 @@ mod tests {
         let original = message_at(1, NOW, b"once");
         let mut relayed = original.clone();
         relayed.ttl = original.ttl - 1;
-        archive.record(&original);
-        archive.record(&relayed);
+        archive.record(&original, NOW);
+        archive.record(&relayed, NOW);
         // The id excludes the hop count, so both are the same message.
         assert_eq!(archive.len(Kind::Message), 1);
     }
@@ -343,11 +369,11 @@ mod tests {
         // everything newer out from under the room.
         let mut archive = Archive::new();
         for i in 0..MESSAGE_CAPACITY {
-            archive.record(&message_at(1, NOW, format!("m{i}").as_bytes()));
+            archive.record(&message_at(1, NOW, format!("m{i}").as_bytes()), NOW);
         }
         // Re-record the oldest, then push one more in.
-        archive.record(&message_at(1, NOW, b"m0"));
-        archive.record(&message_at(1, NOW, b"newest"));
+        archive.record(&message_at(1, NOW, b"m0"), NOW);
+        archive.record(&message_at(1, NOW, b"newest"), NOW);
 
         let held = archive.fresh(Kind::Message, NOW);
         assert_eq!(held.len(), MESSAGE_CAPACITY);
@@ -363,15 +389,13 @@ mod tests {
     fn each_store_is_bounded_by_its_own_capacity() {
         let mut archive = Archive::new();
         for i in 0..(MESSAGE_CAPACITY + 50) {
-            archive.record(&message_at(1, NOW, format!("m{i}").as_bytes()));
+            archive.record(&message_at(1, NOW, format!("m{i}").as_bytes()), NOW);
         }
         for i in 0..(FILE_CAPACITY + 50) {
-            archive.record(&packet_at(
-                MessageType::FileTransfer,
-                1,
-                NOW,
-                format!("f{i}").as_bytes(),
-            ));
+            archive.record(
+                    &packet_at(MessageType::FileTransfer, 1, NOW, format!("f{i}").as_bytes()),
+                    NOW,
+                );
         }
         assert_eq!(archive.len(Kind::Message), MESSAGE_CAPACITY);
         assert_eq!(archive.len(Kind::File), FILE_CAPACITY);
@@ -382,22 +406,84 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_past_the_window_is_not_offered() {
+    fn a_packet_past_the_window_is_refused_at_the_door() {
+        // Upstream guards on freshness before filing, not only before serving,
+        // so a peer replaying something ancient cannot take up a slot at all.
         let mut archive = Archive::new();
-        archive.record(&message_at(1, NOW - MAX_AGE_MS - 1, b"stale"));
-        archive.record(&message_at(1, NOW - MAX_AGE_MS, b"just inside"));
+        assert!(!archive.record(&message_at(1, NOW - MAX_AGE_MS - 1, b"stale"), NOW));
+        assert!(archive.record(&message_at(1, NOW - MAX_AGE_MS, b"just inside"), NOW));
+
         let held = archive.fresh(Kind::Message, NOW);
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].payload, b"just inside");
-        // Still held until swept, just not offered.
-        assert_eq!(archive.len(Kind::Message), 2);
+        assert_eq!(archive.len(Kind::Message), 1, "the stale one never landed");
+    }
+
+    #[test]
+    fn a_packet_that_ages_out_while_held_stops_being_offered() {
+        // The other half: something filed while fresh must drop out of the
+        // answer once the window passes it, without waiting for a sweep.
+        let mut archive = Archive::new();
+        assert!(archive.record(&message_at(1, NOW, b"fresh now"), NOW));
+        assert_eq!(archive.fresh(Kind::Message, NOW).len(), 1);
+        assert!(archive.fresh(Kind::Message, NOW + MAX_AGE_MS + 1).is_empty());
+        assert_eq!(archive.len(Kind::Message), 1, "held until swept");
+    }
+
+    #[test]
+    fn an_announce_replayed_from_long_ago_is_not_treated_as_presence() {
+        // An announce is a claim that somebody is here now. Upstream gates it
+        // on a 60s window rather than the 900s one, and forgets the peer when
+        // it fails, so a replayed announce cannot resurrect a departed peer.
+        let mut archive = Archive::new();
+        assert!(archive.record(
+            &packet_at(MessageType::Announce, 1, NOW, b"here now"),
+            NOW
+        ));
+        assert_eq!(archive.announce_count(), 1);
+
+        let replayed = packet_at(
+            MessageType::Announce,
+            1,
+            NOW - ANNOUNCE_RECORD_MAX_AGE_MS - 1,
+            b"here ages ago",
+        );
+        assert!(!archive.record(&replayed, NOW));
+        assert_eq!(
+            archive.announce_count(),
+            0,
+            "and what we knew about that peer goes with it"
+        );
+
+        // Just inside the window is still presence.
+        assert!(archive.record(
+            &packet_at(
+                MessageType::Announce,
+                2,
+                NOW - ANNOUNCE_RECORD_MAX_AGE_MS,
+                b"only just"
+            ),
+            NOW
+        ));
+        assert_eq!(archive.announce_count(), 1);
+    }
+
+    #[test]
+    fn an_announce_already_filed_stays_servable_past_the_presence_window() {
+        // Recording is gated at 60s; serving is gated at 900s. Upstream splits
+        // them this way so a peer that has gone quiet is still introduced to a
+        // newcomer who needs its signing key.
+        let mut archive = Archive::new();
+        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"key"), NOW);
+        let later = NOW + ANNOUNCE_RECORD_MAX_AGE_MS + 1;
+        assert_eq!(archive.fresh_announces(later).len(), 1);
     }
 
     #[test]
     fn sweeping_reclaims_the_stale_entries() {
         let mut archive = Archive::new();
-        archive.record(&message_at(1, NOW - MAX_AGE_MS - 1, b"stale"));
-        archive.record(&message_at(1, NOW, b"fresh"));
+        archive.record(&message_at(1, NOW - MAX_AGE_MS - 1, b"stale"), NOW);
+        archive.record(&message_at(1, NOW, b"fresh"), NOW);
         archive.drop_stale(NOW);
         assert_eq!(archive.len(Kind::Message), 1);
         assert_eq!(archive.fresh(Kind::Message, NOW)[0].payload, b"fresh");
@@ -408,7 +494,7 @@ mod tests {
         // saturating_sub, so a `now` behind the packet's stamp reads as age
         // zero rather than wrapping to a colossal age and sweeping the store.
         let mut archive = Archive::new();
-        archive.record(&message_at(1, NOW, b"from the future"));
+        archive.record(&message_at(1, NOW, b"from the future"), NOW);
         assert_eq!(archive.fresh(Kind::Message, NOW - 60_000).len(), 1);
         archive.drop_stale(NOW - 60_000);
         assert_eq!(archive.len(Kind::Message), 1);
@@ -417,9 +503,9 @@ mod tests {
     #[test]
     fn only_the_latest_announce_from_a_peer_is_kept() {
         let mut archive = Archive::new();
-        archive.record(&packet_at(MessageType::Announce, 1, NOW - 1000, b"old name"));
-        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"new name"));
-        archive.record(&packet_at(MessageType::Announce, 2, NOW, b"someone else"));
+        archive.record(&packet_at(MessageType::Announce, 1, NOW - 1000, b"old name"), NOW);
+        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"new name"), NOW);
+        archive.record(&packet_at(MessageType::Announce, 2, NOW, b"someone else"), NOW);
         assert_eq!(archive.announce_count(), 2);
         let held = archive.fresh_announces(NOW);
         assert_eq!(held[0].payload, b"new name");
@@ -432,7 +518,7 @@ mod tests {
         // responder's reply unreproducible and its test flaky.
         let mut archive = Archive::new();
         for sender in [9u8, 3, 7, 1] {
-            archive.record(&packet_at(MessageType::Announce, sender, NOW, b"a"));
+            archive.record(&packet_at(MessageType::Announce, sender, NOW, b"a"), NOW);
         }
         let senders: Vec<u8> = archive
             .fresh_announces(NOW)
@@ -450,7 +536,7 @@ mod tests {
             1,
             NOW - MAX_AGE_MS - 1,
             b"gone",
-        ));
+        ), NOW);
         assert!(archive.fresh_announces(NOW).is_empty());
         archive.drop_stale(NOW);
         assert_eq!(archive.announce_count(), 0);
@@ -459,7 +545,7 @@ mod tests {
     #[test]
     fn a_departed_peer_can_be_forgotten() {
         let mut archive = Archive::new();
-        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"here"));
+        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"here"), NOW);
         archive.forget_peer(&[1u8; 8]);
         assert_eq!(archive.announce_count(), 0);
     }
@@ -469,10 +555,10 @@ mod tests {
         // The archive is a record of what the room said near us. `/wipe` has to
         // reach it for the same reason it reaches the opened-envelope list.
         let mut archive = Archive::new();
-        archive.record(&message_at(1, NOW, b"said"));
-        archive.record(&packet_at(MessageType::Fragment, 1, NOW, b"frag"));
-        archive.record(&packet_at(MessageType::FileTransfer, 1, NOW, b"file"));
-        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"who"));
+        archive.record(&message_at(1, NOW, b"said"), NOW);
+        archive.record(&packet_at(MessageType::Fragment, 1, NOW, b"frag"), NOW);
+        archive.record(&packet_at(MessageType::FileTransfer, 1, NOW, b"file"), NOW);
+        archive.record(&packet_at(MessageType::Announce, 1, NOW, b"who"), NOW);
         assert!(!archive.is_empty());
 
         archive.clear();
