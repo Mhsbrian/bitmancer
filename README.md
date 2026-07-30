@@ -103,6 +103,7 @@ and flags the ones running BitChat:
 | `Tab` | move between the sidebar, the log and the input box |
 | `m` | world map (also `/map`) |
 | `i` | view the newest image in this conversation (also `/img`) |
+| `:name:` | becomes an emoji as you close the colon; `Tab` takes a suggestion |
 | `Ctrl+C` | quit |
 | `Esc` | dismiss the connection overlay; the client works fine offline |
 
@@ -115,8 +116,12 @@ and flags the ones running BitChat:
 | `/map` | world map |
 | `/img [n]` | view the newest image link, or the nth one back |
 | `/dm <nick> <message>` | private message, encrypted end to end |
+| `/mesh` | the network around you: links, who forwards, whether you bridge |
 | `/fav <nick>`, `/unfav <nick>` | exchange Nostr addresses; `/fav` alone lists |
 | `/send <path>` | put a file on the mesh, fragmented |
+| `/verify me`, `/verify <url>` | show your card, or read someone else's |
+| `/mailbox on\|off\|status` | hold mail for peers who are not here |
+| `/gateway on\|off` | share this machine's internet with the mesh |
 | `/block <nick>`, `/unblock <nick>` | refuse a peer's traffic; `/block` alone lists |
 | `/wipe confirm` | destroy the stored identity and quit |
 | `/name <nick>` | change your nickname and re-announce |
@@ -171,13 +176,22 @@ bounded to an hour and separated from the present with a `─── live ──�
 
 ## What does not work yet
 
-Relaying. The client holds a single Bluetooth link, and forwarding a packet back
-down the only link it arrived on is an echo, not a relay. The policy is written
-and tested, and it will start forwarding on its own if multi-link support lands.
+Using someone else's gateway. This client can *be* one — `/gateway on` publishes
+geohash events for mesh-only peers nearby and hands back what the relays send —
+but it cannot yet be the peer on the other end of that arrangement.
+
+Filling in the neighbour list other clients draw their maps from. We read the
+announce TLV that carries it and cannot write our own, because an announce has to
+stay under 100 bytes to survive the signature check and a full-length nickname
+leaves two bytes spare. Our own view of the mesh is unaffected; the loss is
+appearing in other people's.
+
+Private messages to a peer who is out of Bluetooth range go over Nostr, and that
+half has never been tested against another implementation.
 
 ## Building on it
 
-`cargo test` runs the suite (214 at the time of writing). Most of it is protocol
+`cargo test` runs the suite (653 at the time of writing). Most of it is protocol
 work that can be checked without a radio: the mesh tests drive two clients
 against each other, and the frame codec carries upstream's own malformed-packet
 cases.

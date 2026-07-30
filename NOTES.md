@@ -872,10 +872,13 @@ and why `gateway.rs` is a policy engine rather than a crypto one.
   one, and every sealing draws a fresh nonce — holding ciphertext would mean
   holding something sendable exactly one way, and resending it would reuse a
   nonce.
-- **`courierEnvelope 0x04` is store-and-forward.** Upstream hands a sealed copy
-  of an undeliverable message to nearby peers who may physically encounter the
-  recipient, addressed by a 16-byte rotating tag — an HMAC of the recipient's
-  static key and the UTC day. Not implemented here.
+- **`courierEnvelope 0x04` is store-and-forward, and it is implemented.**
+  Upstream hands a sealed copy of an undeliverable message to nearby peers who
+  may physically encounter the recipient, addressed by a 16-byte rotating tag —
+  an HMAC of the recipient's static key and the UTC day. See "The mailbox"
+  above; `courier.rs` seals and opens, `mailbox.rs` holds. Earlier versions of
+  this note said it was not implemented, which stopped being true at `e1d00eb`
+  and `830efbe`.
 - **Fragment size is a local choice, not a protocol constant.** `SLICE_BYTES`
   is 213 so a finished fragment frame lands in the 256-byte padding bucket —
   the only bucket we have live evidence a phone accepts, since announces use
@@ -885,17 +888,24 @@ and why `gateway.rs` is a policy engine rather than a crypto one.
   100-byte compression threshold, so a signature could never survive the
   receiver's canonical re-encode. Whether a phone insists on one for
   fileTransfer is untested — if it drops our transfers, look there first.
-- **Announce TLVs 0x04/0x05/0x06** (`direct_neighbors`, `capabilities`,
-  `bridge_geohash`) encode and decode, but nothing ever populates them.
-  `direct_neighbors` is the substrate multi-hop routing needs.
+- **Announce TLVs 0x04 and 0x06** (`direct_neighbors`, `bridge_geohash`) encode
+  and decode, but nothing populates them. `direct_neighbors` is the substrate
+  multi-hop routing needs, and it is blocked by the 100-byte ceiling rather than
+  by not having been written — see "Seeing the mesh". **0x05
+  (`capabilities`) is populated**, by `mesh.rs`, on every announce: `ADVERTISED`
+  is deliberately empty and the `gateway` bit is added only while relays are
+  actually answering, so the set is usually present and zero. That distinction is
+  the point — upstream separates "advertises nothing" from "does not speak
+  capabilities".
 - **No ping/pong upstream.** Our opcode table carries `ping 0x26` and
   `pong 0x27`, but neither `BitchatProtocol.swift` nor `Packets.swift` defines
   them and the whitepaper does not mention them. Do not implement these for
   parity; liveness there comes from announces.
-- **Opcodes named but unspecified here:** `courierEnvelope 0x04`,
-  `requestSync 0x21`, `boardPost 0x23`, `prekeyBundle 0x24`,
-  `groupMessage 0x25`. The names came from reading upstream, but nothing in this
-  repo pins down their payloads. Do not implement from the names alone.
+- **Opcodes named but unspecified here:** `requestSync 0x21`, `boardPost 0x23`,
+  `prekeyBundle 0x24`, `groupMessage 0x25`. The names came from reading upstream,
+  but nothing in this repo pins down their payloads. Do not implement from the
+  names alone. `courierEnvelope 0x04` was on this list and is no longer — its
+  wire format is pinned by `courier.rs` and its tests.
 
 ## Verification
 
