@@ -1373,3 +1373,189 @@ impl Clone for NoiseSymmetricState {
         }
     }
 }
+
+/// The session-lifecycle surface that the rest of the client actually reaches.
+///
+/// Scoped deliberately. `noise_session.rs` measures 43% covered, but a good part
+/// of that is not a testing gap: `migrate_session`, `update_encryption_status`,
+/// `get_encryption_status`, `get_peer_id_for_fingerprint` and the whole
+/// pending-message queue have no callers outside this file, and
+/// `PendingMessage::timestamp` and `retry_count` are written and never read.
+/// Pinning that behaviour with tests would make dead code harder to delete, so
+/// these cover only what something else calls: `remove_session`,
+/// `has_established_session`, and the fingerprint mapping the verification flow
+/// depends on.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn manager(seed: u8) -> NoiseSessionManager {
+        NoiseSessionManager::new(StaticSecret::from([seed; 32]))
+    }
+
+    #[test]
+    fn a_fresh_manager_holds_no_session_for_anyone() {
+        let manager = manager(1);
+        assert!(!manager.has_session("aabbccddeeff0011"));
+        assert!(!manager.has_established_session("aabbccddeeff0011"));
+    }
+
+    #[test]
+    fn creating_a_session_registers_it_but_does_not_establish_it() {
+        // The distinction the send path depends on: mesh.rs asks
+        // has_established_session before it will encrypt to a peer, so a session
+        // that merely exists must not answer yes.
+        let mut manager = manager(2);
+        manager
+            .create_session("aabbccddeeff0011".to_string(), NoiseRole::Initiator)
+            .expect("a fresh session should be creatable");
+
+        assert!(manager.has_session("aabbccddeeff0011"), "it should be registered");
+        assert!(
+            !manager.has_established_session("aabbccddeeff0011"),
+            "no handshake has happened, so nothing may be encrypted to it yet"
+        );
+    }
+
+    #[test]
+    fn removing_a_session_forgets_it() {
+        // remove_session is the one lifecycle call with several callers — it runs
+        // when a peer ages out or is blocked, and a session surviving that would
+        // keep a stale key usable.
+        let mut manager = manager(3);
+        manager
+            .create_session("aabbccddeeff0011".to_string(), NoiseRole::Initiator)
+            .unwrap();
+        assert!(manager.has_session("aabbccddeeff0011"));
+
+        manager.remove_session("aabbccddeeff0011");
+
+        assert!(!manager.has_session("aabbccddeeff0011"), "the session must be gone");
+        assert!(!manager.has_established_session("aabbccddeeff0011"));
+    }
+
+    #[test]
+    fn removing_a_session_that_was_never_there_is_not_an_error() {
+        // Callers remove on peer-left without checking first, and a peer can
+        // leave before any handshake was attempted.
+        let mut manager = manager(4);
+        manager.remove_session("never-existed");
+        assert!(!manager.has_session("never-existed"));
+    }
+
+    #[test]
+    fn our_own_fingerprint_is_derived_from_our_key_and_is_stable() {
+        // A peer reads this off our card to decide we are who we claim, so it
+        // has to be a pure function of the key and not of when it was asked.
+        let first = manager(5).get_identity_fingerprint();
+        let second = manager(5).get_identity_fingerprint();
+
+        assert_eq!(first, second, "same key must give the same fingerprint");
+        assert_eq!(first.len(), 64, "a SHA-256 fingerprint is 64 hex characters");
+        assert!(
+            first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lower-case hex, because it is compared as a string: {first}"
+        );
+    }
+
+    #[test]
+    fn a_different_key_is_a_different_fingerprint() {
+        assert_ne!(
+            manager(6).get_identity_fingerprint(),
+            manager(7).get_identity_fingerprint(),
+            "two identities must not collide"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_is_unverified_until_it_is_verified() {
+        let mut manager = manager(8);
+        let fingerprint = "a".repeat(64);
+
+        assert!(
+            !manager.is_fingerprint_verified(&fingerprint),
+            "nothing is trusted by default"
+        );
+
+        manager.verify_fingerprint(&fingerprint);
+
+        assert!(manager.is_fingerprint_verified(&fingerprint));
+        assert!(manager.get_verified_fingerprints().contains(&fingerprint));
+    }
+
+    #[test]
+    fn verifying_one_fingerprint_does_not_verify_another() {
+        // The failure that would matter: verification is per-peer, and a blanket
+        // yes would mean reading one card trusted everyone.
+        let mut manager = manager(9);
+        let verified = "b".repeat(64);
+        let other = "c".repeat(64);
+
+        manager.verify_fingerprint(&verified);
+
+        assert!(manager.is_fingerprint_verified(&verified));
+        assert!(
+            !manager.is_fingerprint_verified(&other),
+            "trust must not spread to a fingerprint nobody checked"
+        );
+    }
+
+    #[test]
+    fn verified_fingerprints_survive_being_reloaded_from_disk() {
+        // These persist between runs — re-verifying a peer on every launch would
+        // train the user to say yes without reading.
+        let mut manager = manager(10);
+        let one = "d".repeat(64);
+        let two = "e".repeat(64);
+
+        let mut stored = std::collections::HashSet::new();
+        stored.insert(one.clone());
+        stored.insert(two.clone());
+        manager.load_verified_fingerprints(stored);
+
+        assert!(manager.is_fingerprint_verified(&one));
+        assert!(manager.is_fingerprint_verified(&two));
+        assert_eq!(manager.get_verified_fingerprints().len(), 2);
+    }
+
+    #[test]
+    fn verifying_the_same_fingerprint_twice_leaves_one_entry() {
+        // It is a set, and a user who confirms twice must not grow the file that
+        // gets written out.
+        let mut manager = manager(11);
+        let fingerprint = "f".repeat(64);
+
+        manager.verify_fingerprint(&fingerprint);
+        manager.verify_fingerprint(&fingerprint);
+
+        assert_eq!(manager.get_verified_fingerprints().len(), 1);
+    }
+
+    #[test]
+    fn a_peer_with_no_session_has_no_fingerprint() {
+        // get_peer_fingerprint feeds the verification flow, which must not offer
+        // to verify a peer we have never completed a handshake with.
+        let manager = manager(12);
+        assert!(manager.get_peer_fingerprint("aabbccddeeff0011").is_none());
+    }
+
+    #[test]
+    fn storing_a_peers_static_key_is_refused_at_the_wrong_length() {
+        // The key arrives off the wire in an announce, so the length is a
+        // stranger's claim. x25519 is 32 bytes and nothing else.
+        let mut manager = manager(13);
+
+        assert!(
+            manager.store_peer_static_key("aabbccddeeff0011", &[7u8; 32]).is_ok(),
+            "a 32-byte key is the only valid shape"
+        );
+        for bad in [0usize, 1, 31, 33, 64] {
+            assert!(
+                manager
+                    .store_peer_static_key("aabbccddeeff0011", &vec![7u8; bad])
+                    .is_err(),
+                "a {bad}-byte key must be refused"
+            );
+        }
+    }
+}
