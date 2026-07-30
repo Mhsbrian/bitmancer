@@ -510,6 +510,48 @@ business. A test covers exactly that case, and it failed on the first attempt.
 the backend as it goes; there is nothing cached across frames that a resize would
 invalidate.
 
+### Searching the scrollback
+
+`/` from the log pane, `n`/`N` to walk, `Esc` to put the log back. Four things
+about it are decisions rather than defaults.
+
+**Two states, because they take the keyboard differently.** While the prompt is
+open every keystroke is query text. That check sits above every single-key
+shortcut in `handle_key_event`, and it has to: `i` opens the image viewer and `m`
+opens the map, so without it neither "invite" nor "mesh" could be typed into a
+search at all. There is a test for each that drives the real entry point rather
+than the handler, because the ordering is the thing being tested and it only
+exists in the dispatcher.
+
+**`/` is only a search key where it is not already something else.** In the
+compose box it is the command prefix for `/map`, `/help` and the rest, so the
+search binding lives in the log pane's handler where the input box never sees it.
+Same reasoning as `i` and `m`, which have always been guarded that way.
+
+**The newest match is selected first, not the oldest.** In a log the line being
+looked for is nearly always the recent one, and starting at the top means walking
+the whole history to reach it. The status counts oldest-first anyway — `3 of 3`
+for the newest of three — because that is how the log reads.
+
+**Matches are indices into one conversation, so a switch drops them.** Carried
+across, `n` would point at whatever happens to sit at that position in someone
+else's log. The forget lives in `update_current_conversation`, which every switch
+already funnels through, rather than in each of the three callers — a fourth one
+gets it for free.
+
+Two smaller ones. An empty query matches *nothing*, because `contains("")` is true
+for every string and the obvious implementation selects the entire log and calls
+it a result. And `n` is only captured while there are matches to walk: a finished
+search that found nothing leaves the key alone, since a key that silently does
+nothing reads as a wedged keyboard.
+
+The jump puts the match on the last visible row, clamped so the oldest matches
+sit high in the viewport instead of off the top. `scroll_for` computes it, and the
+property test walks every index at six viewport heights asserting the match falls
+inside the `start..end` slice the renderer actually uses — an off-by-one there
+scrolls to the line *next to* the one you asked for, which looks like a search bug
+and is arithmetic.
+
 ## Mesh fragments, files and relaying
 
 **Fragments (`0x20`, `fragment.rs`).** A BLE write is small, so larger frames

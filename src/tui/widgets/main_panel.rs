@@ -136,7 +136,13 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
     // How lit each rendered row is, collected alongside the rows themselves so
     // the gutter beside the text can fade in step with a message that wraps.
     let mut gutter: Vec<f32> = Vec::new();
-    let msg_items: Vec<ListItem> = visible_messages.iter().flat_map(|msg| {
+    // Which absolute index the search is sitting on, if a search is being
+    // walked. Compared against `start + offset` below so the highlight follows
+    // the message rather than a screen row, which moves under it as the log
+    // scrolls.
+    let current_match = app.search.current().filter(|_| app.search.is_walking());
+    let msg_items: Vec<ListItem> = visible_messages.iter().enumerate().flat_map(|(offset, msg)| {
+        let is_search_match = current_match == Some(start + offset);
         // A line lands lit and cools to the resting palette. Anything that was
         // never new to us reports zero and is drawn exactly as it always was.
         let age = msg.arrived.map(|at| at.elapsed());
@@ -166,7 +172,11 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
         let color = theme::arriving(resting, intensity);
         // A line that says your name is the one thing worth interrupting for.
         let is_mention = !msg.is_self && !is_system && msg.content.contains(nickname.as_str());
-        let body_resting = if is_mention {
+        // The line a search jumped to borrows the mention treatment rather than
+        // inventing a colour. Both mean the same thing to a reader — this is the
+        // line you are looking for — and a second alert palette would compete
+        // with the first for attention while saying less.
+        let body_resting = if is_mention || is_search_match {
             theme::ALERT
         } else if is_system {
             theme::DIM
@@ -174,7 +184,7 @@ pub fn render_log(f: &mut Frame, app: &mut App, area: Rect) {
             theme::TEXT
         };
         let mut body_style = Style::default().fg(theme::arriving(body_resting, intensity));
-        if is_mention {
+        if is_mention || is_search_match {
             body_style = body_style.add_modifier(Modifier::BOLD);
         }
 

@@ -5,6 +5,7 @@ pub mod emoji;
 pub mod event;
 pub mod image_render;
 pub mod map;
+pub mod search;
 pub mod theme;
 pub mod viewer;
 // `tui::tui` holds the terminal setup and teardown, distinct from `tui::ui`

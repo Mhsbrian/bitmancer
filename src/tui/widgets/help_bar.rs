@@ -22,6 +22,36 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 /// Only the keys that do something in the pane that has focus.
 fn keys_for(app: &App) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw(" ")];
+
+    // Search takes the keyboard, so it takes the strip too. Listing the pane's
+    // ordinary keys underneath a prompt that will not deliver them is worse
+    // than listing nothing.
+    if app.search.prompt_open {
+        return vec![
+            Span::raw(" "),
+            theme::key("⏎"),
+            theme::hint(" find  "),
+            theme::key("esc"),
+            theme::hint(" cancel"),
+        ];
+    }
+    // Only while the log has focus. `n` and `N` walk matches there and are
+    // ordinary text in the compose box, so advertising them from the input box
+    // would promise a key that types a letter instead.
+    if app.search.is_walking() && app.focus_area == FocusArea::MainPanel {
+        return vec![
+            Span::raw(" "),
+            theme::key("n"),
+            theme::hint("/"),
+            theme::key("N"),
+            theme::hint(" next, previous  "),
+            theme::key("esc"),
+            theme::hint(" done  "),
+            theme::key("tab"),
+            theme::hint(" pane"),
+        ];
+    }
+
     match app.focus_area {
         FocusArea::Sidebar => spans.extend([
             theme::key("↑↓"),
@@ -34,6 +64,8 @@ fn keys_for(app: &App) -> Vec<Span<'static>> {
         FocusArea::MainPanel => spans.extend([
             theme::key("↑↓"),
             theme::hint(" scroll  "),
+            theme::key("/"),
+            theme::hint(" find  "),
             theme::key("m"),
             theme::hint(" map  "),
         ]),

@@ -246,3 +246,264 @@ fn the_whole_ui_fills_the_frame_it_is_given() {
          this test exists to notice"
     );
 }
+
+// The search prompt and the match highlight. Both are render-only: the state
+// they draw from is unit-tested in `tui::search`, but a search whose result is
+// correct and invisible has not found anything as far as the user is concerned.
+// This is the same "given" gap the wheel and paste commit named about itself.
+
+use bitmancer::tui::widgets::input_box;
+
+/// A conversation with something to find in it.
+fn app_with_log() -> App {
+    let mut app = App::new_with_nickname("tester".to_string());
+    let now = chrono::Local::now().timestamp();
+    for (index, text) in ["the relay is down", "which relay", "nothing here"]
+        .iter()
+        .enumerate()
+    {
+        app.add_channel_line(bitmancer::tui::app::IncomingLine {
+            channel: "#public".to_string(),
+            sender: "alice".to_string(),
+            epoch: now - (3 - index as i64),
+            content: text.to_string(),
+        });
+    }
+    app
+}
+
+#[test]
+fn the_search_prompt_shows_the_query_and_the_match_count() {
+    let mut app = app_with_log();
+    app.search.open(0);
+    for character in "relay".chars() {
+        app.search.push(character);
+    }
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+
+    let lines = frame_of(60, 1, |f, area| input_box::render(f, &mut app, area));
+    let rendered = lines.join("");
+
+    assert!(
+        rendered.contains("relay"),
+        "the query has to be on screen while it is being typed: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("2 of 2"),
+        "the live count is the whole reason the prompt beats a blind search: {rendered:?}"
+    );
+}
+
+#[test]
+fn a_query_that_finds_nothing_says_so_before_it_is_committed() {
+    let mut app = app_with_log();
+    app.search.open(0);
+    for character in "nonesuch".chars() {
+        app.search.push(character);
+    }
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+
+    let rendered = frame_of(60, 1, |f, area| input_box::render(f, &mut app, area)).join("");
+    assert!(
+        rendered.contains("no matches"),
+        "a dead query should say so while typing, not after Enter: {rendered:?}"
+    );
+}
+
+#[test]
+fn the_prompt_replaces_the_compose_line_rather_than_covering_the_log() {
+    // The negative control for the two above. Without the prompt open the same
+    // widget must draw the ordinary compose line, or these tests would pass
+    // against a widget that always drew a search box.
+    let mut app = app_with_log();
+    let rendered = frame_of(60, 1, |f, area| input_box::render(f, &mut app, area)).join("");
+    assert!(
+        !rendered.contains('⌕'),
+        "no search is open, so no search prompt: {rendered:?}"
+    );
+}
+
+#[test]
+fn a_narrow_terminal_keeps_the_query_and_drops_the_count() {
+    // The count is the first thing to go when there is no room. Losing the
+    // query instead would make the prompt unusable at exactly the width where
+    // someone most needs to see what they typed.
+    let mut app = app_with_log();
+    app.search.open(0);
+    for character in "relay".chars() {
+        app.search.push(character);
+    }
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+
+    for width in [1u16, 2, 4, 8, 12, 20] {
+        let rendered = frame_of(width, 1, |f, area| input_box::render(f, &mut app, area)).join("");
+        assert!(
+            !rendered.contains("2 of 2") || width >= 12,
+            "the count should not crowd out the query at width {width}: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn the_search_prompt_survives_every_degenerate_size() {
+    let mut app = app_with_log();
+    app.search.open(0);
+    for character in "relay".chars() {
+        app.search.push(character);
+    }
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+
+    for (width, height) in DEGENERATE {
+        let _ = frame_of(*width, *height, |f, area| {
+            input_box::render(f, &mut app, area)
+        });
+    }
+}
+
+#[test]
+fn the_help_bar_offers_the_search_keys_only_where_they_work() {
+    let mut app = app_with_log();
+
+    app.focus_area = FocusArea::MainPanel;
+    let log_pane = frame_of(80, 1, |f, area| help_bar::render(f, &app, area)).join("");
+    assert!(
+        log_pane.contains("find"),
+        "the log pane is where / searches: {log_pane:?}"
+    );
+
+    app.focus_area = FocusArea::InputBox;
+    let compose = frame_of(80, 1, |f, area| help_bar::render(f, &app, area)).join("");
+    assert!(
+        !compose.contains("find"),
+        "in the compose box / is the command prefix, not a search: {compose:?}"
+    );
+}
+
+#[test]
+fn the_help_bar_switches_to_the_walking_keys_once_a_search_lands() {
+    let mut app = app_with_log();
+    app.focus_area = FocusArea::MainPanel;
+    app.search.open(0);
+    for character in "relay".chars() {
+        app.search.push(character);
+    }
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+    app.search.commit();
+
+    let walking = frame_of(80, 1, |f, area| help_bar::render(f, &app, area)).join("");
+    assert!(
+        walking.contains("next, previous"),
+        "n and N are live and the strip should say so: {walking:?}"
+    );
+}
+
+/// Scrollback as a search actually finds it: settled, not arriving.
+///
+/// `add_channel_line` stamps `arrived`, which drives the reveal animation, and a
+/// line one frame old has drawn about one character of its body. The highlight
+/// is on the body, so there is nothing yet to colour. That is not a defect —
+/// searching is a thing you do to history, and history has `arrived: None` —
+/// but it did make the first version of the test below fail, and the honest fix
+/// was the fixture rather than the assertion.
+fn settled_log() -> App {
+    let mut app = App::new_with_nickname("tester".to_string());
+    let messages: Vec<bitmancer::tui::app::Message> = ["the relay is down", "which relay", "nothing here"]
+        .iter()
+        .map(|text| bitmancer::tui::app::Message {
+            sender: "alice".to_string(),
+            timestamp: "12:00".to_string(),
+            content: text.to_string(),
+            is_self: false,
+            epoch: 0,
+            message_id: None,
+            delivery: None,
+            arrived: None,
+        })
+        .collect();
+    app.channel_messages.insert("#public".to_string(), messages);
+    app
+}
+
+/// Which foreground colours appear on each row, so a test can talk about the
+/// line being highlighted rather than about cells.
+fn row_colours<F>(width: u16, height: u16, mut draw: F) -> Vec<Vec<ratatui::style::Color>>
+where
+    F: FnMut(&mut ratatui::Frame, Rect),
+{
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend needs no real terminal");
+    terminal
+        .draw(|f| {
+            let area = f.size();
+            draw(f, area);
+        })
+        .expect("drawing into a buffer cannot fail");
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer.get(x, y).style().fg.unwrap_or(ratatui::style::Color::Reset))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn the_line_a_search_landed_on_is_drawn_differently_from_its_neighbours() {
+    // The whole visible promise of the feature. The jump puts the match on
+    // screen; this is what tells the eye which of the rows it is.
+    use bitmancer::tui::widgets::main_panel;
+
+    let mut app = settled_log();
+    app.message_viewport_height = 6;
+    app.search.open(0);
+    for character in "which".chars() {
+        app.search.push(character);
+    }
+    let messages = app.get_current_messages().0.to_vec();
+    app.search.run(&messages);
+    app.search.commit();
+    let matched = app.search.current().expect("a match");
+
+    let highlighted = row_colours(60, 6, |f, area| main_panel::render_log(f, &mut app, area));
+
+    // Same frame with the search dropped, so the comparison is against this
+    // exact log rather than against an assumption about the palette.
+    let mut plain_app = settled_log();
+    plain_app.message_viewport_height = 6;
+    let plain = row_colours(60, 6, |f, area| main_panel::render_log(f, &mut plain_app, area));
+
+    assert_ne!(
+        highlighted, plain,
+        "a walked search must change how the log is drawn, or the match is \
+         invisible and the jump is the only cue"
+    );
+    // Exactly the matched row, not merely some row. "Something is lit" also
+    // passes for an implementation that lights the whole log, which is a real
+    // mutation this caught: `current_match.is_some()` in place of the index
+    // comparison rendered every line highlighted and the weaker assertion was
+    // happy with it.
+    let lit: Vec<usize> = highlighted
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains(&bitmancer::tui::theme::ALERT))
+        .map(|(row, _)| row)
+        .collect();
+    assert_eq!(
+        lit,
+        vec![matched],
+        "index {matched} was selected, so exactly that row should be lit"
+    );
+    assert!(
+        !plain
+            .iter()
+            .any(|row| row.contains(&bitmancer::tui::theme::ALERT)),
+        "the negative control: with no search there is nothing lit, so the \
+         assertion above cannot be passing on some unrelated line"
+    );
+}

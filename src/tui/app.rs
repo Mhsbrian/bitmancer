@@ -177,6 +177,11 @@ pub struct App {
     pub emoji_selection: usize,
     emoji_dismissed_for: Option<String>,
 
+    /// Finding a line in the scrollback. Holds indices into the *current*
+    /// conversation, so switching conversations drops it rather than carrying
+    /// numbers that now point at someone else's messages.
+    pub search: crate::tui::search::Search,
+
     /// Frame counter, used only to animate the connection spinner.
     pub tick: usize,
     /// When this session began, for the uptime readout.
@@ -509,6 +514,7 @@ impl App {
             focus_area: FocusArea::InputBox,
             sidebar_flat_selected: 0,
             msg_scroll: 0,
+            search: crate::tui::search::Search::default(),
             message_viewport_height: 10, // ADDED: Default value
             nickname,
             network_name: "BitChat Mesh".to_string(),
@@ -585,6 +591,13 @@ impl App {
     }
 
     pub fn update_current_conversation(&mut self) {
+        // A search holds indices into whichever conversation was on screen when
+        // it ran. Carrying them across a switch would point `n` at whatever
+        // happens to sit at that position in someone else's log. Every switch
+        // reaches this function, which is why the forget lives here rather than
+        // in each of the three callers — a fourth one gets it for free.
+        self.search.forget();
+
         if let Some(user_idx) = self.sidebar_state.people_selected {
             if let Some(user) = self.people.get(user_idx) {
                 self.current_conv = Some((Some(user.clone()), None));
