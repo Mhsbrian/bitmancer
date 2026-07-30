@@ -38,7 +38,7 @@ pub mod peer_id;
 pub mod persistence;
 pub mod protocol;
 pub mod relay;
-pub mod sync;
+pub(crate) mod sync;
 pub mod topology;
 pub mod transport;
 pub mod tui;

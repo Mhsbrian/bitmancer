@@ -134,6 +134,7 @@ impl PacketStore {
         self.order.clear();
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.order.len()
     }
@@ -268,14 +269,17 @@ impl Archive {
         self.announces.clear();
     }
 
+    #[cfg(test)]
     pub fn len(&self, kind: Kind) -> usize {
         self.store(kind).len()
     }
 
+    #[cfg(test)]
     pub fn announce_count(&self) -> usize {
         self.announces.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.messages.len() == 0
             && self.fragments.len() == 0

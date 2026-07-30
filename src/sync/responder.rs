@@ -13,7 +13,6 @@ use super::archive::{Archive, Kind};
 use super::gcs;
 use super::packet_id::packet_id;
 use super::request::{decode_fragment_id_filter, RequestSync};
-use super::type_flags::SyncTypeFlags;
 
 /// Builds the packets this request is missing.
 ///
@@ -122,25 +121,11 @@ fn as_reply(packet: &Packet) -> Packet {
     reply
 }
 
-/// The types this client can actually answer for.
-///
-/// Board posts, prekey bundles and group messages are in upstream's table and
-/// we do not implement those opcodes, so a request naming them gets the types
-/// we do hold and silence for the rest — which is exactly what an older peer
-/// looks like to a newer one.
-pub fn answerable_types() -> SyncTypeFlags {
-    SyncTypeFlags::from_types(&[
-        MessageType::Announce,
-        MessageType::Message,
-        MessageType::Fragment,
-        MessageType::FileTransfer,
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sync::gcs::build_filter;
+    use crate::sync::type_flags::SyncTypeFlags;
     use crate::sync::packet_id::PACKET_ID_LEN;
 
     const NOW: u64 = 1_785_000_000_000;

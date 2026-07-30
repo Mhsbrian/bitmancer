@@ -54,6 +54,7 @@ pub struct RequestSync {
 
 /// Encodes 8-byte fragment stream IDs into the `0x06` filter string, dropping
 /// nothing but the overflow past the count cap.
+#[allow(dead_code)] // used by targeted fragment recovery, which the requester drives
 pub fn encode_fragment_id_filter(fragment_ids: &[[u8; 8]]) -> Option<String> {
     if fragment_ids.is_empty() {
         return None;
@@ -92,6 +93,7 @@ pub fn decode_fragment_id_filter(filter: Option<&str>) -> Option<Vec<[u8; 8]>> {
 }
 
 impl RequestSync {
+    #[allow(dead_code)] // the requesting half builds these; tests build them now
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut put = |tag: u8, value: &[u8]| {

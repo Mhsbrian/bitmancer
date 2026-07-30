@@ -111,10 +111,12 @@ impl SyncTypeFlags {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(self) -> bool {
         self.raw == 0
     }
 
+    #[allow(dead_code)]
     pub fn raw(self) -> u64 {
         self.raw
     }
@@ -125,6 +127,7 @@ impl SyncTypeFlags {
     /// omits the TLV entirely, and a zero-length `0x04` would be read by the
     /// far side as "no types named", which then defaults to public messages.
     /// Those are not the same request.
+    #[allow(dead_code)] // written by the requester; read by us
     pub fn to_bytes(self) -> Option<Vec<u8>> {
         if self.raw == 0 {
             return None;
