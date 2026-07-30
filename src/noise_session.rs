@@ -493,9 +493,18 @@ impl NoiseSessionManager {
         }
     }
 
-    /// Reachable only from tests. `MeshService::has_session` is the one the
-    /// client calls and it is a different function on a different type — the
-    /// shared name makes a grep for callers look answered when it is not.
+    /// Whether a session is *registered* for this peer, established or not.
+    ///
+    /// Reachable only from tests, and the pair with `has_established_session`
+    /// above is the point: answering yes here says a session object exists,
+    /// which is not the same as a finished handshake. Encrypting on the
+    /// strength of this one would mean encrypting to a peer nothing has
+    /// authenticated. The client asks the other.
+    ///
+    /// `MeshService` used to expose its own `has_session` meaning the
+    /// established sense, which made a grep for callers of either look
+    /// answered while pointing at the wrong function. That one is now
+    /// `has_encrypted_channel`, so the two names no longer collide.
     #[allow(dead_code)]
     pub fn has_session(&self, peer_id: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();

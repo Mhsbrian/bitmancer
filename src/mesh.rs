@@ -358,7 +358,16 @@ impl MeshService {
     }
 
     /// Whether an encrypted channel to this peer is already up.
-    pub fn has_session(&self, peer_id: &str) -> bool {
+    ///
+    /// Named for what it answers rather than for what it calls. This was
+    /// `has_session`, which collided with `NoiseSessionManager::has_session` —
+    /// a different function, on a different type, answering a different
+    /// question: that one is `contains_key`, meaning a session is *registered*,
+    /// where this one means the handshake finished. A grep for callers of
+    /// `has_session` looked answered and pointed at the wrong one, which is how
+    /// five methods nearly got recorded as live when nothing outside tests
+    /// reaches them.
+    pub fn has_encrypted_channel(&self, peer_id: &str) -> bool {
         self.sessions.has_established_session(peer_id)
     }
 
@@ -2093,7 +2102,7 @@ mod noise_dm_tests {
         let events = settle(&mut alice, &mut bob, opening);
 
         assert!(
-            alice.has_session(&target),
+            alice.has_encrypted_channel(&target),
             "the initiator should end up with an established session"
         );
         let delivered: Vec<&MeshEvent> = events
@@ -2143,7 +2152,7 @@ mod noise_dm_tests {
 
         // Bob now has a session, so his reply should encrypt immediately rather
         // than starting a second handshake.
-        assert!(bob.has_session(&alice_id));
+        assert!(bob.has_encrypted_channel(&alice_id));
         let reply = bob.dm_frames(&alice_id, "pong").unwrap().frames;
         let events = settle(&mut bob, &mut alice, reply);
 
