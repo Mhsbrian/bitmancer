@@ -313,3 +313,81 @@ fn two_concurrent_runs_on_one_mode_both_survive() {
         );
     }
 }
+
+/// Every private mode `init` turns on, `restore` must turn back off.
+///
+/// `restore`'s own comment says it "undoes each mode set by `init`". That was a
+/// claim about a list someone has to keep in step by hand, and the two are
+/// eleven lines apart in the same file — which is exactly the distance at which
+/// a fourth mode gets added to one and not the other. Leaving a mode on outlives
+/// the process, which is the whole reason `90296c6` exists.
+///
+/// The check derives the modes from the transcript rather than naming them, so
+/// it cannot go stale: whatever `init` asks for is what `restore` is held to.
+/// That matters more than it looks, because `EnableMouseCapture` is not one mode
+/// — crossterm expands it to five (1000, 1002, 1003, 1006, 1015), and the
+/// assertions elsewhere in this suite name only 1006.
+fn private_modes(transcript: &str) -> (Vec<String>, Vec<String>) {
+    let chars: Vec<char> = transcript.chars().collect();
+    let (mut set, mut unset) = (Vec::new(), Vec::new());
+    let mut index = 0;
+    while index < chars.len() {
+        // A private mode is ESC [ ? <digits> then 'h' to set or 'l' to reset.
+        if chars[index] == '\x1b'
+            && index + 2 < chars.len()
+            && chars[index + 1] == '['
+            && chars[index + 2] == '?'
+        {
+            let mut cursor = index + 3;
+            let mut digits = String::new();
+            while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+                digits.push(chars[cursor]);
+                cursor += 1;
+            }
+            if cursor < chars.len() && !digits.is_empty() {
+                match chars[cursor] {
+                    'h' => set.push(digits),
+                    'l' => unset.push(digits),
+                    _ => {}
+                }
+            }
+            index = cursor;
+        } else {
+            index += 1;
+        }
+    }
+    set.sort();
+    set.dedup();
+    unset.sort();
+    unset.dedup();
+    (set, unset)
+}
+
+#[test]
+fn every_mode_the_client_turns_on_is_turned_back_off() {
+    if !pty_available() {
+        eprintln!("skipping: script(1) is unavailable, so no pty can be allocated");
+        return;
+    }
+    let run = run_in_pty("clean_guarded");
+    let (set, unset) = private_modes(&run.transcript);
+
+    // Guards against the vacuous pass. A transcript with no modes in it would
+    // satisfy the pairing below completely, and that is the state this test
+    // would be in if `init` silently stopped running. Naming the two rather than
+    // asserting a count, because the count is an implementation choice that can
+    // legitimately change while these two cannot: 1049 is the alternate screen
+    // and 2004 is bracketed paste, and `init` is defined by setting them.
+    assert!(
+        set.contains(&"1049".to_string()) && set.contains(&"2004".to_string()),
+        "the alternate screen and bracketed paste must both have been requested, \
+         or this transcript is not of a client that started.\nset: {set:?}"
+    );
+
+    let left_on: Vec<&String> = set.iter().filter(|mode| !unset.contains(mode)).collect();
+    assert!(
+        left_on.is_empty(),
+        "these were turned on and never off, and they outlive the process: {left_on:?}\n\
+         set:   {set:?}\nunset: {unset:?}"
+    );
+}
