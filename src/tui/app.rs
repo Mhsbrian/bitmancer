@@ -145,6 +145,14 @@ pub struct App {
     /// (history, /help, composing) while offline.
     pub connection_popup_dismissed: bool,
 
+    /// Which emoji suggestion is highlighted, and whether the strip has been
+    /// dismissed for the shortcode currently being typed.
+    ///
+    /// The query itself is not stored — it is derived from the input every frame,
+    /// so it cannot drift out of step with what is actually on screen.
+    pub emoji_selection: usize,
+    emoji_dismissed_for: Option<String>,
+
     /// Frame counter, used only to animate the connection spinner.
     pub tick: usize,
     /// When this session began, for the uptime readout.
@@ -298,6 +306,102 @@ fn apply_admission(messages: &mut [Message], message: &mut Message, admitted: Op
 }
 
 impl App {
+    /// The shortcode being typed and what it matches, when the strip should show.
+    ///
+    /// Requires at least one character after the colon. A bare `:` is punctuation
+    /// far more often than the start of an emoji, and a strip that appeared on
+    /// every colon in prose would be a tax on ordinary typing.
+    pub fn emoji_suggestions(&self) -> Option<(crate::tui::emoji::Query, Vec<&'static crate::tui::emoji::Emoji>)> {
+        let query = crate::tui::emoji::query_at(self.input.value(), self.input.cursor())?;
+        if query.text.is_empty() {
+            return None;
+        }
+        if self.emoji_dismissed_for.as_deref() == Some(query.text.as_str()) {
+            return None;
+        }
+        let matches = crate::tui::emoji::suggestions(&query.text);
+        if matches.is_empty() {
+            return None;
+        }
+        Some((query, matches))
+    }
+
+    /// Moves the highlight, stopping at both ends.
+    ///
+    /// Not wrapping: the list is rebuilt as the query narrows, and a highlight
+    /// that jumped from the last row to the first would be indistinguishable
+    /// from the matches shifting underneath it.
+    pub fn move_emoji_selection(&mut self, delta: isize) {
+        let Some((_, matches)) = self.emoji_suggestions() else {
+            return;
+        };
+        let next = (self.emoji_selection as isize + delta).clamp(0, matches.len() as isize - 1);
+        self.emoji_selection = next as usize;
+    }
+
+    /// Puts the highlighted emoji into the input, replacing the shortcode.
+    pub fn accept_emoji(&mut self) -> bool {
+        let Some((query, matches)) = self.emoji_suggestions() else {
+            return false;
+        };
+        let Some(chosen) = matches.get(self.emoji_selection.min(matches.len() - 1)) else {
+            return false;
+        };
+        let (text, cursor) = crate::tui::emoji::apply(self.input.value(), &query, chosen.glyph);
+        self.input = Input::new(text).with_cursor(cursor);
+        self.emoji_selection = 0;
+        self.emoji_dismissed_for = None;
+        true
+    }
+
+    /// Hides the strip without changing the text.
+    ///
+    /// Remembered against the specific shortcode, so typing one more character
+    /// brings the matches back rather than leaving the feature switched off for
+    /// the rest of the message.
+    pub fn dismiss_emoji(&mut self) {
+        if let Some(query) = crate::tui::emoji::query_at(self.input.value(), self.input.cursor()) {
+            self.emoji_dismissed_for = Some(query.text);
+        }
+        self.emoji_selection = 0;
+    }
+
+    /// Expands `:name:` the moment the closing colon is typed.
+    ///
+    /// The path that matters once somebody knows three shortcodes: type it and it
+    /// is simply there, with no strip to read and no key to press. A picker that
+    /// always demands a selection is slower than the thing it replaced.
+    pub fn expand_finished_shortcode(&mut self) -> bool {
+        let value = self.input.value().to_string();
+        let cursor = self.input.cursor();
+        let chars: Vec<char> = value.chars().collect();
+        // Only ever triggered by the colon just typed.
+        if cursor == 0 || chars.get(cursor - 1) != Some(&':') {
+            return false;
+        }
+        // The name sits between this colon and the one before it.
+        let Some(query) = crate::tui::emoji::query_at(&value, cursor - 1) else {
+            return false;
+        };
+        if query.text.is_empty() {
+            return false;
+        }
+        let Some(found) = crate::tui::emoji::exact(&query.text) else {
+            return false;
+        };
+        // Replace the whole `:name:`, closing colon included.
+        let closed = crate::tui::emoji::Query {
+            start: query.start,
+            end: cursor,
+            text: query.text,
+        };
+        let (text, position) = crate::tui::emoji::apply(&value, &closed, found.glyph);
+        self.input = Input::new(text).with_cursor(position);
+        self.emoji_selection = 0;
+        self.emoji_dismissed_for = None;
+        true
+    }
+
     /// Whether anything on screen is still arriving, so the main loop knows to
     /// draw at the animation rate rather than the idle one. Only the tail of
     /// the conversation can be mid-arrival, so the scan stops early.
@@ -371,6 +475,8 @@ impl App {
             map_open: false,
             map: crate::tui::map::MapState::new(),
             joined_geohashes: std::collections::HashSet::new(),
+            emoji_selection: 0,
+            emoji_dismissed_for: None,
             carrying: None,
             holding: None,
             mesh_view_open: false,

@@ -8,4 +8,5 @@ pub mod map_panel;
 pub mod mesh_panel;
 pub mod sidebar;
 pub mod status_band;
+pub mod emoji_strip;
 pub mod help_bar;

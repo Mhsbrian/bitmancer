@@ -50,6 +50,16 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
         handle_map_events(app, key_event);
         return;
     }
+    // Emoji matches are dismissed before the connection overlay: the strip is
+    // the more local thing, and Esc means "put away what just appeared". Without
+    // this, Esc while offline would clear the overlay and leave the strip up.
+    if key_event.code == KeyCode::Esc
+        && app.focus_area == FocusArea::InputBox
+        && app.emoji_suggestions().is_some()
+    {
+        app.dismiss_emoji();
+        return;
+    }
     // Dismiss the connection overlay so the client is usable while offline;
     // reconnection continues in the background either way.
     if !matches!(app.phase, crate::tui::app::TuiPhase::Connected)
@@ -61,6 +71,18 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
     // 'm' opens the map from anywhere the input box is not capturing text.
     if key_event.code == KeyCode::Char('m') && app.focus_area != FocusArea::InputBox {
         app.open_map();
+        return;
+    }
+    // Tab cycles panes — unless emoji matches are showing, where it takes one.
+    // This check has to be here rather than in the input handler: the pane cycle
+    // runs before dispatch, so a completion that claimed Tab further down would
+    // never see it. Found by pressing Tab in the running client and watching the
+    // focus move instead.
+    if key_event.code == KeyCode::Tab
+        && app.focus_area == FocusArea::InputBox
+        && app.emoji_suggestions().is_some()
+    {
+        app.accept_emoji();
         return;
     }
     if key_event.code == KeyCode::Tab {
@@ -254,6 +276,35 @@ fn handle_popup_events(app: &mut App, key_event: KeyEvent, _input_tx: &mpsc::Sen
 }
 
 fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
+    // Emoji completion claims a few keys, and deliberately not Enter.
+    //
+    // Slack and Discord let Enter accept a completion, which is fine when a
+    // picker only opens on purpose. Here a colon is punctuation far more often
+    // than the start of an emoji, so hijacking Enter would mean "note: done"
+    // followed by Enter silently inserting 😄 instead of sending. Tab accepts;
+    // Enter always sends. Nothing surprising can happen to a message.
+    if app.emoji_suggestions().is_some() {
+        match key_event.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                app.accept_emoji();
+                return;
+            }
+            KeyCode::Up => {
+                app.move_emoji_selection(-1);
+                return;
+            }
+            KeyCode::Down => {
+                app.move_emoji_selection(1);
+                return;
+            }
+            KeyCode::Esc => {
+                app.dismiss_emoji();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key_event.code {
         KeyCode::Enter => {
             let input_str = app.input.value().to_string();
@@ -266,8 +317,12 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
                 }
         }
         _ => {
-            // FIX: Ignore the return value of handle_event
             let _ = app.input.handle_event(&CrosstermEvent::Key(key_event));
+            // A closing colon completes a shortcode outright, so someone who
+            // knows the name never sees the strip at all.
+            if key_event.code == KeyCode::Char(':') {
+                app.expand_finished_shortcode();
+            }
         }
     }
 }
@@ -295,6 +350,107 @@ mod tests {
         }
         app.map.note_voice("dr", "someone", false);
         app
+    }
+
+    fn composing(text: &str) -> App {
+        let mut app = App::new_with_nickname("tui".into());
+        app.focus_area = FocusArea::InputBox;
+        app.input = tui_input::Input::new(text.to_string()).with_cursor(text.chars().count());
+        app
+    }
+
+    /// Through the real entry point, because that is the only path a keystroke
+    /// actually takes — a test that calls the inner handler can pass while the
+    /// keyboard does something else entirely, which is exactly what happened.
+    fn typed(app: &mut App, text: &str, input_tx: &mpsc::Sender<String>) {
+        for character in text.chars() {
+            handle_key_event(app, press(KeyCode::Char(character)), input_tx);
+        }
+    }
+
+    #[test]
+    fn a_finished_shortcode_expands_on_its_closing_colon() {
+        // The path that matters once somebody knows three shortcodes: no strip to
+        // read, no key to press.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = composing("");
+        typed(&mut app, "ship it :fire:", &tx);
+        assert_eq!(app.input.value(), "ship it 🔥");
+    }
+
+    #[test]
+    fn an_unknown_shortcode_is_left_as_typed() {
+        // Not everything between colons is an emoji, and mangling text that
+        // merely looks like one would be worse than doing nothing.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = composing("");
+        typed(&mut app, "see :zzzqqq:", &tx);
+        assert_eq!(app.input.value(), "see :zzzqqq:");
+    }
+
+    #[test]
+    fn tab_inserts_the_highlighted_match() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = composing("nice :fi");
+        handle_key_event(&mut app, press(KeyCode::Tab), &tx);
+        assert_eq!(app.input.value(), "nice 🔥");
+        assert_eq!(
+            app.focus_area,
+            FocusArea::InputBox,
+            "and the focus stays where the typing is"
+        );
+    }
+
+    #[test]
+    fn arrows_move_the_highlight_without_touching_the_text() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = composing(":s");
+        let before = app.input.value().to_string();
+        handle_key_event(&mut app, press(KeyCode::Down), &tx);
+        assert_eq!(app.emoji_selection, 1);
+        assert_eq!(app.input.value(), before);
+        handle_key_event(&mut app, press(KeyCode::Up), &tx);
+        assert_eq!(app.emoji_selection, 0);
+    }
+
+    #[test]
+    fn enter_always_sends_and_never_inserts_an_emoji() {
+        // The reason Enter is not a completion key. "note: done" then Enter must
+        // send those words, not quietly become an emoji.
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut app = composing("nice :fi");
+        handle_key_event(&mut app, press(KeyCode::Enter), &tx);
+        assert_eq!(
+            rx.try_recv().ok().as_deref(),
+            Some("nice :fi"),
+            "the words as typed"
+        );
+        assert!(app.input.value().is_empty(), "and the box is cleared");
+    }
+
+    #[test]
+    fn esc_hides_the_matches_and_keeps_the_text() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = composing("nice :fi");
+        assert!(app.emoji_suggestions().is_some());
+        handle_key_event(&mut app, press(KeyCode::Esc), &tx);
+        assert!(app.emoji_suggestions().is_none(), "hidden");
+        assert_eq!(app.input.value(), "nice :fi", "text untouched");
+
+        // One more character is a different shortcode, so the matches return
+        // rather than the feature staying off for the rest of the message.
+        typed(&mut app, "r", &tx);
+        assert!(app.emoji_suggestions().is_some());
+    }
+
+    #[test]
+    fn tab_still_switches_panes_when_no_matches_are_showing() {
+        // The completion borrows Tab; it must give it back.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = composing("ordinary text");
+        assert!(app.emoji_suggestions().is_none());
+        handle_key_event(&mut app, press(KeyCode::Tab), &tx);
+        assert_ne!(app.focus_area, FocusArea::InputBox, "focus moved on");
     }
 
     #[test]

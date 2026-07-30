@@ -438,6 +438,42 @@ only stored thing that costs a walk across town to rebuild, so it persists in
   that is not ours — otherwise a peer collects our signature over a claim about
   a third party.
 
+## Typing emoji (`tui/emoji.rs`)
+
+A terminal has no emoji picker and no way to reach one without leaving the
+keyboard, which for a client whose whole interaction model is typing is the wrong
+trade. So emoji are typed the way people already type them: `:fire:` becomes 🔥.
+
+Two paths through one mechanism, and the first is the one that matters:
+
+- **Know the name and it is simply there.** The closing colon expands it, with no
+  strip to read and no key to press. A picker that always demands a selection is
+  slower than the thing it replaced.
+- **Do not know it and the matches appear** above the prompt as you type. Tab
+  takes one, arrows move, Esc puts it away.
+
+- **Enter is never a completion key**, unlike Slack and Discord. Those can afford
+  it because a picker only opens deliberately; here a colon is punctuation far
+  more often than the start of an emoji, so hijacking Enter would mean "note:
+  done" plus Enter silently inserting 😄 instead of sending. Tab accepts, Enter
+  always sends, and nothing surprising can happen to a message.
+- **The strip needs at least one character after the colon**, so `9:30` and
+  `TODO:` stay quiet. A hint that appeared on every colon would be a tax on
+  ordinary typing.
+- **Prefix matches beat substring matches, and table order breaks ties** — which
+  is why the table is ordered by how often things are actually sent rather than
+  alphabetically. A list that reshuffled as you typed would be unusable at speed.
+- **Key precedence had to be fixed twice, both found by pressing the key rather
+  than by testing.** Tab is claimed by the pane cycle and Esc by the connection
+  overlay, both of which run *before* dispatch to the input handler — so a
+  completion claiming them further down never saw them. Worse, the tests passed:
+  they called `handle_input_events` directly, which is not a path any keystroke
+  takes. They now go through `handle_key_event`.
+- Sending emoji was already safe: `split_into_chunks` respects char boundaries,
+  so a 255-byte TLV split cannot cut a codepoint in half. It can still split a ZWJ
+  sequence across chunks, which degrades to separate glyphs rather than corruption,
+  and needs a single unbroken run of ~10 family emoji to happen at all.
+
 ## The mailbox (`/mailbox`)
 
 The one thing in the protocol that needs **no infrastructure at all** — not a

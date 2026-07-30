@@ -92,12 +92,17 @@ fn render_conversation(f: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(2)
         .clamp(1, 5) as u16;
 
+    // The emoji strip takes a row only while it has something to say, so the
+    // conversation is never one line shorter for a feature that is not in use.
+    let strip_height = if widgets::emoji_strip::visible(app) { 1 } else { 0 };
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),            // context
             Constraint::Length(1),            // rule
             Constraint::Min(1),               // log
+            Constraint::Length(strip_height), // emoji matches, when there are any
             Constraint::Length(1),            // rule
             Constraint::Length(input_height), // compose
         ])
@@ -106,8 +111,11 @@ fn render_conversation(f: &mut Frame, app: &mut App, area: Rect) {
     widgets::main_panel::render_context(f, app, rows[0]);
     horizontal_rule(f, rows[1]);
     widgets::main_panel::render_log(f, app, rows[2]);
-    horizontal_rule(f, rows[3]);
-    widgets::input_box::render(f, app, rows[4]);
+    if strip_height > 0 {
+        widgets::emoji_strip::render(f, app, rows[3]);
+    }
+    horizontal_rule(f, rows[4]);
+    widgets::input_box::render(f, app, rows[5]);
 }
 
 fn horizontal_rule(f: &mut Frame, area: Rect) {
