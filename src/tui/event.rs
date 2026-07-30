@@ -343,7 +343,16 @@ fn handle_search_events(app: &mut App, key_event: KeyEvent) {
             app.search.backspace();
             rerun_search(app);
         }
-        KeyCode::Char(character) => {
+        // Shift is allowed through because that is how an uppercase letter
+        // arrives; every other modifier is a chord, not text. Without this the
+        // arm matched on the code alone and typed the bare letter: `Ctrl+W`,
+        // which deletes a word almost everywhere, put a `w` in the query
+        // instead, and so did twenty-four of its neighbours. Ignoring a chord is
+        // the honest reading — a query is short and Backspace is right there —
+        // and it is better than inventing editing bindings nobody asked for.
+        KeyCode::Char(character)
+            if key_event.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+        {
             app.search.push(character);
             rerun_search(app);
         }
@@ -876,6 +885,54 @@ mod tests {
         for character in text.chars() {
             handle_key_event(app, press(KeyCode::Char(character)), &sender);
         }
+    }
+
+    /// A modifier chord is not text, and the query must not take it as text.
+    ///
+    /// The other direction of the sweep above. That one asks whether anything
+    /// steals a character *from* the prompt; this asks whether the prompt takes
+    /// something it should not. It did: the `Char` arm matched on the key code
+    /// alone, so every `Ctrl` chord typed its bare letter — `Ctrl+W` and
+    /// `Ctrl+U`, which delete a word and a line nearly everywhere, put a `w` and
+    /// a `u` in the query. Twenty-five of the twenty-six, all but `Ctrl+C`,
+    /// which quits above this handler and should.
+    ///
+    /// Found the same way `r` was: by driving the whole keyspace rather than by
+    /// naming the keys the code was written for.
+    #[test]
+    fn a_modifier_chord_is_not_typed_into_the_query() {
+        let (sender, _receiver) = mpsc::channel::<String>(64);
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for character in 'a'..='z' {
+                let mut app = searchable_app();
+                app.search.open(app.msg_scroll);
+                handle_key_event(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(character), modifier),
+                    &sender,
+                );
+                assert!(
+                    app.search.query.is_empty(),
+                    "{modifier:?}+{character} put a character in the query"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shift_still_types_because_that_is_how_a_capital_arrives() {
+        // The negative control for the test above. Rejecting every modifier
+        // would satisfy it completely and make the prompt unable to type an
+        // uppercase letter, which many terminals deliver as Char + SHIFT.
+        let (sender, _receiver) = mpsc::channel::<String>(64);
+        let mut app = searchable_app();
+        app.search.open(app.msg_scroll);
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            &sender,
+        );
+        assert_eq!(app.search.query, "R", "a capital has to be typable");
     }
 
     /// Every printable character, in both connection phases, must land in the

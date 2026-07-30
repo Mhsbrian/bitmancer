@@ -28,12 +28,27 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// multi-line paste arrives as individual keystrokes and every embedded return
 /// sends the line — on a network where nothing can be unsent.
 pub fn init() -> io::Result<Tui> {
-    execute!(
-        stdout(),
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    init_with(true)
+}
+
+/// `init` with the mouse capture made a choice rather than a given.
+///
+/// The capture buys the wheel and costs the terminal's own click-drag
+/// selection, and `Shift`+drag reaching the selection underneath is the
+/// terminal's behaviour rather than anything this client controls. Where it
+/// does not work there was previously no way out, so `mouse_capture = false` in
+/// the config hands the mouse back and gives up the wheel.
+///
+/// Kept as a second entry point rather than a parameter on `init`, because
+/// `tests/terminal_events.rs` and `tests/terminal_restore.rs` both drive
+/// `init()` and assert on the modes it sets. A signature change would have made
+/// those a compile error and the capture assertion a decision about test
+/// plumbing, which is exactly the kind of edit that quietly weakens a check.
+pub fn init_with(mouse_capture: bool) -> io::Result<Tui> {
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    if mouse_capture {
+        execute!(stdout(), EnableMouseCapture)?;
+    }
     enable_raw_mode()?;
     Terminal::new(CrosstermBackend::new(stdout()))
 }

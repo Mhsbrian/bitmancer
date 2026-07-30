@@ -15,6 +15,7 @@
 
 pub(crate) mod announce;
 pub mod commands;
+pub mod config;
 pub(crate) mod compression;
 pub mod courier;
 pub(crate) mod data_structures;

@@ -128,6 +128,30 @@ The trade is deliberate: on the alternate screen there is no scrollback to selec
 from anyway, so what selection loses is one visible frame and what the wheel
 gains is the whole log.
 
+### Configuring it
+
+Optional. `~/.bitmancer/config`, `key = value`, `#` starts a comment:
+
+```
+# The name used on a machine that has not been given one yet.
+nickname = alice
+
+# Hand the mouse back to the terminal, giving up the wheel to get
+# click-drag selection. Only worth setting if Shift+drag does not
+# reach the selection in your terminal.
+mouse_capture = false
+```
+
+The client only ever *reads* this file — it is safe to keep in a dotfiles repo
+and it never holds anything secret. That is the difference between it and
+`~/.bitmancer/state.json`, which the client writes and which contains your
+private keys.
+
+A persisted nickname wins over the configured one, since that is the name peers
+have already seen; the setting is for a machine with no identity yet. Anything
+in the file that cannot be read is reported in the startup overlay rather than
+ignored.
+
 ### Commands
 
 | | |
