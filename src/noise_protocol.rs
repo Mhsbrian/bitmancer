@@ -1997,3 +1997,123 @@ mod adversarial_tests {
         assert!(handshake.get_transport_ciphers().is_err());
     }
 }
+
+/// Completeness: is anything low-order *missing* from the table?
+///
+/// `low_order_table_entries_are_actually_low_order` checks no entry is wrong and
+/// `every_table_entry_is_reachable_by_the_check` checks none is unreachable.
+/// Neither can notice an omission, and omission is the mistake this table has
+/// actually made twice — four canonical points absent, then every point present
+/// in only one of its two encodings.
+///
+/// So this asks the question from the other side. Rather than reading the table
+/// and looking for gaps, sweep the values a low-order point could plausibly be
+/// written as, ask x25519 which of them drive the shared secret to zero, and
+/// require that every one of those is refused. The table's own length is never
+/// consulted.
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+
+    /// p = 2^255 - 19, little-endian.
+    fn p_bytes() -> [u8; 32] {
+        let mut value = [0xffu8; 32];
+        value[0] = 0xed;
+        value[31] = 0x7f;
+        value
+    }
+
+    fn small(n: u8) -> [u8; 32] {
+        let mut value = [0u8; 32];
+        value[0] = n;
+        value
+    }
+
+    /// p + delta for the range where only byte zero moves.
+    fn near_p(delta: i16) -> [u8; 32] {
+        let mut value = p_bytes();
+        value[0] = (0xed_i16 + delta) as u8;
+        value
+    }
+
+    fn hex32(hex: &str) -> [u8; 32] {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect();
+        bytes.try_into().expect("32 bytes")
+    }
+
+    /// Where a low-order point can hide. Small values, because a masked
+    /// u-coordinate is below 2^255 = p + 19 and anything in [p, p+18] reduces to
+    /// [0, 18]. The neighbourhood of p, for the same reason from the other end.
+    /// And the two order-8 points, which are not near either.
+    fn candidates() -> Vec<(String, [u8; 32])> {
+        let mut all: Vec<(String, [u8; 32])> = (0u8..=32)
+            .map(|n| (format!("small {n}"), small(n)))
+            .collect();
+        all.extend((-32i16..=18).map(|k| (format!("p{k:+}"), near_p(k))));
+        all.push((
+            "order 8 a".into(),
+            hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        ));
+        all.push((
+            "order 8 b".into(),
+            hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7"),
+        ));
+        all
+    }
+
+    #[test]
+    fn nothing_that_zeroes_the_shared_secret_is_accepted() {
+        let secret = StaticSecret::from([9u8; 32]);
+        let mut zeroing = 0usize;
+        let mut accepted_and_zeroing = Vec::new();
+
+        for (name, base) in candidates() {
+            // Both encodings. Bit 255 is ignored by the receiver, so each value
+            // has two spellings that are the same point.
+            for spelling in ["as written", "bit 255 set"] {
+                let mut bytes = base;
+                if spelling == "bit 255 set" {
+                    bytes[31] |= 0x80;
+                }
+                let zeroes_the_secret = secret
+                    .diffie_hellman(&PublicKey::from(bytes))
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| *byte == 0);
+                if !zeroes_the_secret {
+                    continue;
+                }
+                zeroing += 1;
+                if NoiseHandshakeState::validate_public_key(&bytes).is_ok() {
+                    accepted_and_zeroing.push(format!("{name} [{spelling}]"));
+                }
+            }
+        }
+
+        // The sweep has to find some, or it is proving nothing about a check that
+        // could be refusing everything or nothing.
+        assert_eq!(
+            zeroing, 14,
+            "seven low-order points in two encodings each should be present in \
+             this sweep; finding {zeroing} means the sweep itself has drifted"
+        );
+        assert!(
+            accepted_and_zeroing.is_empty(),
+            "these force the shared secret to all zeroes and were accepted: {accepted_and_zeroing:?}"
+        );
+    }
+
+    #[test]
+    fn an_honest_key_in_this_sweep_is_not_refused() {
+        // The other direction. A validator that refused every 32-byte value
+        // would satisfy the test above completely.
+        let honest = PublicKey::from(&StaticSecret::from([31u8; 32]));
+        assert!(
+            NoiseHandshakeState::validate_public_key(honest.as_bytes()).is_ok(),
+            "a key from a real scalar must still pass"
+        );
+    }
+}
