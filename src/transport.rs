@@ -44,13 +44,34 @@ pub const MAX_LINKS: usize = 6;
 /// `bleConnectRateLimitInterval`. Dialling several peers back to back tends to
 /// make BlueZ fail all of them.
 const CONNECT_RATE_LIMIT: Duration = Duration::from_millis(500);
-/// How long to wait before looking for more peers when links are already held.
-/// Scanning is not free — it costs power and airtime on the same radio the
-/// links are using — so a client with peers looks around far less often than
-/// one with none.
+/// How long to wait before looking for more peers when links are already held,
+/// and how far that backs off when looking turns nothing up.
+///
+/// Scanning is emphatically not free. Active BLE discovery shares one radio with
+/// every link we hold, and BlueZ interleaves it badly: a 15-second scan every 45
+/// seconds put the adapter in discovery a third of the time and made traffic
+/// between two connected peers crawl. Once the peers nearby are known and
+/// linked, looking again is speculative, so the interval grows until something
+/// actually changes.
 const RESCAN_WITH_LINKS: Duration = Duration::from_secs(45);
+const RESCAN_MAX: Duration = Duration::from_secs(300);
+/// Scan window while we already hold links.
+///
+/// Short because the job is different: with nobody, a scan has to work through
+/// the grace period a stack needs before it attaches signal strengths, and
+/// finding *someone* is the whole point. With a link already up we are only
+/// looking for extras, and a peer worth adding is one advertising loudly enough
+/// to be seen in a glance.
+const SCAN_TIMEOUT_LINKED: Duration = Duration::from_secs(4);
 /// Poll interval when every slot is full: nothing to do but notice a departure.
 const IDLE_POLL: Duration = Duration::from_secs(5);
+/// Connection attempts per scan pass.
+///
+/// A failed attempt costs the whole `CONNECT_TIMEOUT`, so an unbounded walk down
+/// a list of stale addresses spends minutes hanging while a live peer's signal
+/// goes unread. Three is enough to get past a couple of ghosts to a real peer,
+/// and short enough that the next pass sees current signal strengths.
+const MAX_ATTEMPTS_PER_PASS: usize = 3;
 
 /// How long one scan pass looks for an advertiser before reporting back.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -207,9 +228,11 @@ async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<
 async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<TransportEvent>) {
     let mut failures = FailureLog::default();
     let mut announced_empty = false;
+    let mut rescan = RESCAN_WITH_LINKS;
 
     loop {
         failures.prune();
+        let held_before = links.count();
 
         if links.count() >= MAX_LINKS {
             time::sleep(IDLE_POLL).await;
@@ -227,7 +250,13 @@ async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<Transpor
                 .await;
         }
 
-        let found = match scan_for_peers(&adapter).await {
+        // A glance when we have someone, a proper look when we do not.
+        let window = if links.count() > 0 {
+            SCAN_TIMEOUT_LINKED
+        } else {
+            SCAN_TIMEOUT
+        };
+        let found = match scan_for_peers(&adapter, window).await {
             Ok(found) => found,
             Err(error) => {
                 if links.count() == 0 {
@@ -249,9 +278,20 @@ async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<Transpor
             .filter(|candidate| !held.contains(&candidate.address))
             .collect();
 
+        let mut attempted = 0usize;
         for candidate in discovery::rank(&candidates, &failures) {
             if links.count() >= MAX_LINKS {
                 break;
+            }
+            // Stop and rescan rather than grind through a stale list. Every
+            // failed attempt costs the full connect timeout, and the addresses
+            // at the bottom of a long list are the least likely to answer — so
+            // a fresh scan with current signal strengths beats persisting.
+            if attempted >= MAX_ATTEMPTS_PER_PASS {
+                break;
+            }
+            if !discovery::worth_dialling(&candidate, links.count()) {
+                continue;
             }
             let Some((peripheral, _)) = found
                 .iter()
@@ -259,6 +299,7 @@ async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<Transpor
             else {
                 continue;
             };
+            attempted += 1;
 
             // Dialling several peers at once tends to make BlueZ fail all of
             // them, so attempts are spaced whether or not the last succeeded.
@@ -312,14 +353,22 @@ async fn dialler(adapter: Adapter, links: LinkSet, events: mpsc::Sender<Transpor
             }
         }
 
-        // A client with peers looks around far less often: scanning shares the
-        // radio with every link it already holds.
-        let quiet = if links.count() > 0 {
-            RESCAN_WITH_LINKS
+        // With nobody, keep looking briskly — that is the whole job. With links
+        // held, looking is speculative, so a pass that gained nothing doubles
+        // the wait. The radio goes back to carrying traffic instead of hunting
+        // for peers that are not there.
+        if links.count() == 0 {
+            rescan = RESCAN_WITH_LINKS;
+            time::sleep(RECONNECT_BACKOFF_START).await;
+            continue;
+        }
+        if links.count() > held_before {
+            // Something changed, so the neighbourhood is worth watching again.
+            rescan = RESCAN_WITH_LINKS;
         } else {
-            RECONNECT_BACKOFF_START
-        };
-        time::sleep(quiet).await;
+            rescan = (rescan * 2).min(RESCAN_MAX);
+        }
+        time::sleep(rescan).await;
     }
 }
 
@@ -487,14 +536,17 @@ fn is_already_in_progress(error: &btleplug::Error) -> bool {
 /// Returns the whole list rather than a pick, because with several links to
 /// fill the ranking is the caller's to work down. An empty result is a normal
 /// outcome, not an error.
-async fn scan_for_peers(adapter: &Adapter) -> Result<Vec<(Peripheral, Candidate)>, btleplug::Error> {
+async fn scan_for_peers(
+    adapter: &Adapter,
+    window: Duration,
+) -> Result<Vec<(Peripheral, Candidate)>, btleplug::Error> {
     if let Err(error) = adapter.start_scan(ScanFilter::default()).await {
         if !is_already_in_progress(&error) {
             return Err(error);
         }
         // Someone else is scanning; enumerate what they turn up.
     }
-    let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + window;
 
     // Every exit from here stops the scan. Returning early with one running
     // makes the *next* start_scan fail, which used to strand the client.
@@ -505,8 +557,8 @@ async fn scan_for_peers(adapter: &Adapter) -> Result<Vec<(Peripheral, Candidate)
             // committing: an entry with no RSSI is usually a cached ghost, and
             // the first sweep after start_scan often has none at all.
             let heard_any = found.iter().any(|(_, candidate)| candidate.rssi.is_some());
-            let past_grace = tokio::time::Instant::now() + SCAN_TIMEOUT - deadline
-                > Duration::from_millis(1500);
+            let past_grace =
+                tokio::time::Instant::now() + window - deadline > Duration::from_millis(1500);
 
             if !found.is_empty() && (heard_any || past_grace) {
                 return Ok(found);
@@ -724,6 +776,34 @@ mod tests {
         assert!(
             LINK_SILENCE_TIMEOUT >= crate::mesh::ANNOUNCE_INTERVAL * 6,
             "a quiet-but-live peer must get several announces' grace"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_has_time_to_land_before_we_declare_an_outage() {
+        // A phone rotates its BLE address every few minutes, so the last link
+        // dropping and another replacing it is routine. The grace window has to
+        // cover an actual reconnect — the settle after a loss, plus one connect
+        // attempt — or the client announces an outage it is already recovering
+        // from, covering the screen and clearing the peer list on a blip.
+        let fastest_reconnect = SETTLE_AFTER_LINK_LOSS + CONNECT_TIMEOUT;
+        assert!(
+            crate::OFFLINE_GRACE > fastest_reconnect,
+            "grace is {:?}, a reconnect needs at least {fastest_reconnect:?}",
+            crate::OFFLINE_GRACE
+        );
+    }
+
+    #[test]
+    fn a_pass_of_failures_cannot_outlast_the_grace_window() {
+        // Otherwise the dialler is still working through stale addresses when
+        // the client gives up and says it is offline — which is how the two
+        // halves of this end up disagreeing about what is happening.
+        let worst_pass = CONNECT_TIMEOUT * MAX_ATTEMPTS_PER_PASS as u32;
+        assert!(
+            worst_pass <= crate::OFFLINE_GRACE * 3,
+            "a failing pass takes {worst_pass:?}, which is far past the {:?} grace",
+            crate::OFFLINE_GRACE
         );
     }
 

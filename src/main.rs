@@ -56,6 +56,13 @@ const ANIMATION_TICK: Duration = Duration::from_millis(33);
 /// 0x1b is Esc rather than the start of an escape sequence.
 const ESC_RESOLVE_WINDOW: Duration = Duration::from_millis(20);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long every link may be gone before the client calls itself offline.
+///
+/// A phone rotates its BLE address every few minutes, so the last link dropping
+/// and another replacing it seconds later is routine. Declaring an outage
+/// immediately covered the screen with a popup, cleared the peer list and made
+/// everyone re-announce — turning a blip into the churn it looked like.
+const OFFLINE_GRACE: Duration = Duration::from_secs(12);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -220,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut live_relays: std::collections::HashSet<String> = std::collections::HashSet::new();
     // How much we have carried this session, for the readout.
     let mut carried_out = 0usize;
+    // When the last link went, if it has. `None` means we are linked, or have
+    // already said we are not.
+    let mut offline_since: Option<Instant> = None;
     // Whether the map sampler is currently running, so it can be torn down
     // exactly once when the map closes.
     let mut sampling = false;
@@ -242,6 +252,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 TransportEvent::LinkUp { link, label, held } => {
                     links.insert(link);
+                    // Back before anyone was told we had gone.
+                    offline_since = None;
                     if held == 1 {
                         app.transition_to_connected();
                         app.add_log_message("system: Connected to the mesh.".to_string());
@@ -305,16 +317,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TransportEvent::LinkDown { link, reason, held } => {
                     links.remove(&link);
                     if held == 0 {
-                        // Only now are we actually off the mesh. Losing one of
-                        // several links must not clear peers reachable through
-                        // the others; those age out on their own if they were
-                        // only behind the link that went.
-                        mesh.clear_peers();
-                        app.people.clear();
-                        app.connected = false;
-                        app.phase = TuiPhase::Connecting;
-                        app.popup_messages.clear();
-                        app.add_popup_message(format!("{reason}. Reconnecting..."));
+                        // Not declared offline yet. A phone rotates its BLE
+                        // address every few minutes, so the last link dropping
+                        // and a new one replacing it seconds later is the
+                        // ordinary case — and throwing a full-screen popup over
+                        // it, clearing the peer list and making everyone
+                        // re-announce turns a blip into an outage. The
+                        // maintenance tick decides, once the grace period has
+                        // had a chance to be wrong.
+                        offline_since.get_or_insert_with(Instant::now);
+                        app.add_log_message(format!("system: link lost ({reason})"));
                     } else {
                         app.add_log_message(format!(
                             "system: a link ended ({reason}); {held} still up"
@@ -912,6 +924,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for (target, event) in geo.due_presence() {
                 nostr_client.publish(&target, event).await;
+            }
+
+            // A link that has been gone this long is an outage rather than an
+            // address rotation, and is worth saying so.
+            if offline_since.is_some_and(|since| since.elapsed() >= OFFLINE_GRACE)
+                && links.is_empty()
+            {
+                offline_since = None;
+                mesh.clear_peers();
+                app.people.clear();
+                app.connected = false;
+                app.phase = TuiPhase::Connecting;
+                app.popup_messages.clear();
+                app.add_popup_message(
+                    "No BitChat peer in range. Reconnecting...".to_string(),
+                );
             }
 
             // The offer has to track reality: relays come and go, and a claim

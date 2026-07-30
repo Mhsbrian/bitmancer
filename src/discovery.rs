@@ -66,6 +66,22 @@ impl FailureLog {
     }
 }
 
+/// Whether a candidate is worth the connect timeout right now.
+///
+/// The whole cost of a wrong guess is asymmetric: a live peer answers in under a
+/// second, and a dead address does not fail — it *hangs* for the full timeout,
+/// on the same radio as every link already held.
+///
+/// So a cached entry with no signal is worth trying when we have nobody, because
+/// a stack that never reports RSSI would otherwise never connect at all; and
+/// never worth trying once linked, because chasing a speculative extra peer can
+/// take down the one we have. That is not hypothetical — a run of ghost dials
+/// alongside a live link ended in `GattCharacteristic1 doesn't exist` on the
+/// link, which is BlueZ tearing down the connection we were using.
+pub fn worth_dialling(candidate: &Candidate, links_held: usize) -> bool {
+    links_held == 0 || candidate.rssi.is_some()
+}
+
 /// Every candidate worth trying, best first.
 ///
 /// Holding several links at once means dialling several peers, so the
@@ -185,6 +201,36 @@ mod tests {
             best(&candidates, &FailureLog::default()).unwrap().address,
             "AA:AA"
         );
+    }
+
+    #[test]
+    fn a_ghost_is_worth_trying_only_when_we_have_nobody() {
+        // The regression this fixes: with six link slots to fill, the dialler
+        // walked past the live peer it had just connected to and spent eight
+        // seconds each on the cached addresses below it — on the same radio as
+        // the link it had. That run ended with BlueZ tearing down the live
+        // connection.
+        let live = live("AA:AA", -60);
+        let ghost = ghost("BB:BB");
+
+        assert!(worth_dialling(&ghost, 0), "with nobody, a ghost beats nothing");
+        assert!(worth_dialling(&live, 0));
+
+        assert!(
+            !worth_dialling(&ghost, 1),
+            "once linked, a hanging connect risks the link we have"
+        );
+        assert!(
+            worth_dialling(&live, 1),
+            "a peer we can actually hear is still worth a slot"
+        );
+    }
+
+    #[test]
+    fn a_ghost_is_refused_at_every_link_count_above_zero() {
+        for held in 1..=6 {
+            assert!(!worth_dialling(&ghost("BB:BB"), held), "{held} links held");
+        }
     }
 
     #[test]

@@ -438,6 +438,41 @@ only stored thing that costs a walk across town to rebuild, so it persists in
   that is not ours — otherwise a peer collects our signature over a claim about
   a third party.
 
+## The radio is one radio, and scanning is not free
+
+Multi-link introduced a regression that only showed up against a real phone, as
+"very serious delays between devices". Three causes, all the same mistake — six
+link slots made the dialler behave as though hunting for peers were free:
+
+- **A 15-second active scan every 45 seconds while already linked** put the
+  adapter in discovery a third of the time. BlueZ interleaves discovery with
+  established GATT traffic badly, and that alone made a connected pair crawl. A
+  scan while linked is now 4 seconds — the job is only to spot extras — and the
+  interval doubles up to 5 minutes on any pass that gains nothing, resetting when
+  the link set changes.
+- **Ghost dialling.** A phone rotates its BLE address every few minutes and BlueZ
+  keeps the old entries, complete with the friendly name. Connecting to one does
+  not fail, it *hangs* for the full 8-second timeout — and the dialler walked the
+  whole ranked list trying to fill six slots, so it spent up to 40 seconds per
+  pass hanging on dead addresses on the same radio as the live link. Observed
+  ending in `Method "WriteValue" ... "org.bluez.GattCharacteristic1" doesn't
+  exist` — BlueZ tearing down the connection we were actually using.
+  `discovery::worth_dialling` now refuses a signal-less candidate once any link
+  is held, and attempts are capped per pass.
+- **Ghosts are still dialled when we have nobody**, and that is not a hedge: a
+  measured run connected successfully to an entry reporting *no signal*. BlueZ
+  had simply not attached RSSI yet. With zero links a hanging attempt costs
+  nothing that matters; with a link it costs the link.
+
+Measured after: one scan and two dials in 150 seconds, then silence.
+
+**A dropped last link is not an outage.** Because the address rotates, the last
+link dropping and another replacing it seconds later is routine. Declaring it
+immediately covered the screen with a popup, cleared the peer list and made every
+peer re-announce — manufacturing the churn it appeared to report. `OFFLINE_GRACE`
+waits 12 seconds, which is longer than a settle plus one connect attempt, and
+there is a test pinning that relationship.
+
 ## Gateway mode: sharing this machine's internet with the mesh
 
 A phone in a crowd often has a radio and no data. This client usually runs on
