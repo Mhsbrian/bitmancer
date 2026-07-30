@@ -1389,9 +1389,45 @@ impl MeshService {
     fn handle_request_sync(&mut self, packet: &Packet) -> Vec<MeshEvent> {
         let now = now_millis();
 
-        // Ask before diffing. One answer can put the whole archive on the air,
-        // so a peer requesting in a tight loop must not be able to spend
-        // everyone else's airtime and battery through us.
+        // A sync request is link-local, and the reply is routed back down the
+        // link it arrived on. That routing is only correct while the sender is
+        // the far end of this link, which is only guaranteed while the request
+        // has taken no hops — so the premise is enforced here rather than
+        // assumed. Without this, a peer setting one byte gets its request
+        // relayed across the mesh, and every node that hears it answers down
+        // the wrong link: the asker gets nothing and a stranger gets somebody
+        // else's history. `relay::plan` refuses to carry these at all, so both
+        // halves of that have to fail before it matters. Upstream sends ttl 0
+        // on both request forms, so this refuses nothing legitimate.
+        if packet.ttl != 0 {
+            return if self.debug {
+                vec![MeshEvent::Trace(format!(
+                    "ignored a sync request from {} that arrived with {} hop(s) left",
+                    short_display(&packet.sender_hex()),
+                    packet.ttl
+                ))]
+            } else {
+                Vec::new()
+            };
+        }
+
+        // Parse before spending the budget. The limiter exists to bound the
+        // expensive thing — diffing and replaying the archive — and its own
+        // documentation says the refusal is the answer, so a caller must not
+        // take a slot and then decline to use it. Charging for a frame we were
+        // never going to answer let eight malformed frames carrying a peer's
+        // ID silence us towards that peer for the whole window, and nothing
+        // authenticates the ID they carry.
+        let Some(request) = RequestSync::decode(&packet.payload) else {
+            return vec![MeshEvent::Notice(format!(
+                "malformed sync request from {}",
+                short_display(&packet.sender_hex())
+            ))];
+        };
+
+        // One answer can put the whole archive on the air, so a peer asking in
+        // a tight loop must not be able to spend everyone else's airtime and
+        // battery through us.
         if !self.sync_limiter.should_respond(packet.sender_id, now) {
             return if self.debug {
                 vec![MeshEvent::Trace(format!(
@@ -1402,13 +1438,6 @@ impl MeshService {
                 Vec::new()
             };
         }
-
-        let Some(request) = RequestSync::decode(&packet.payload) else {
-            return vec![MeshEvent::Notice(format!(
-                "malformed sync request from {}",
-                short_display(&packet.sender_hex())
-            ))];
-        };
 
         let replies = responder::respond(&self.archive, &request, now);
         let mut events = Vec::new();
@@ -1442,9 +1471,17 @@ impl MeshService {
     /// Drops archived traffic that has aged out, and forgets peers that have
     /// stopped asking for syncs.
     pub fn sweep_sync_state(&mut self) {
-        let now = now_millis();
-        self.archive.drop_stale(now);
-        self.sync_limiter.prune(now);
+        self.sweep_sync_state_at(now_millis());
+    }
+
+    /// `sweep_sync_state` against a supplied clock.
+    ///
+    /// Split for the same reason `persistence::load_state_at` is: a sweep whose
+    /// only clock is `now_millis()` cannot be shown to sweep anything without
+    /// waiting fifteen minutes, so what it actually calls goes untested.
+    pub fn sweep_sync_state_at(&mut self, now_ms: u64) {
+        self.archive.drop_stale(now_ms);
+        self.sync_limiter.prune(now_ms);
     }
 
     fn handle_announce(&mut self, packet: &Packet) -> Vec<MeshEvent> {
@@ -4004,5 +4041,251 @@ mod gossip_sync_tests {
             replies(alice.handle_frame(&request_frame(&bob, &[], None))).is_empty(),
             "once we stop believing bob is here, we stop telling the room he is"
         );
+    }
+}
+
+#[cfg(test)]
+mod gossip_sync_hardening_tests {
+    //! The findings from the review of PR #17, each with the test that would
+    //! have caught it. Kept together because they are one story: the responder
+    //! answered questions it should have refused, and paid for frames it never
+    //! answered.
+
+    use super::*;
+    use crate::relay;
+    use crate::sync::gcs::build_filter;
+    use crate::sync::packet_id::{packet_id, PACKET_ID_LEN};
+    use crate::sync::rate_limit::MAX_RESPONSES;
+    use crate::sync::request::RequestSync;
+    use crate::sync::responder::MAX_REPLIES_PER_ROUND;
+
+    fn pair() -> (MeshService, MeshService) {
+        (
+            MeshService::new([11; 32], [12; 32], "alice"),
+            MeshService::new([21; 32], [22; 32], "bob"),
+        )
+    }
+
+    fn replies(events: Vec<MeshEvent>) -> Vec<Packet> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                MeshEvent::Reply(frame) => Packet::decode(&frame),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A sync request frame from `asker`, at a chosen hop count.
+    fn request_frame_ttl(asker: &MeshService, held: &[Packet], ttl: u8) -> Vec<u8> {
+        let ids: Vec<[u8; PACKET_ID_LEN]> = held.iter().map(packet_id).collect();
+        let params = build_filter(&ids, 400, 0.01);
+        let request = RequestSync {
+            p: params.p,
+            m: params.m,
+            data: params.data,
+            types: None,
+            since_timestamp: None,
+            fragment_id_filter: None,
+        };
+        Packet::new(
+            MessageType::RequestSync,
+            peer_id_to_bytes(&asker.my_peer_id),
+            request.encode(),
+            ttl,
+        )
+        .encode()
+        .expect("a sync request encodes")
+    }
+
+    fn alice_hearing_bob() -> (MeshService, MeshService) {
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        for frame in bob.public_message_frames("hello the room") {
+            alice.handle_frame(&frame);
+        }
+        (alice, bob)
+    }
+
+    #[test]
+    fn a_sync_request_is_never_carried_onward() {
+        // Upstream refuses this before it looks at the hop count at all
+        // (`RelayController.decide`: "never relay it, even when a peer crafts
+        // one with TTL headroom to turn every reachable node into a
+        // responder"). One crafted frame would otherwise reach every node in
+        // the mesh and make each of them replay its whole archive.
+        let links = vec!["a".to_string(), "b".to_string()];
+        for ttl in [2u8, 3, 7] {
+            let request = Packet::new(MessageType::RequestSync, [9; 8], vec![0u8; 4], ttl);
+            assert_eq!(
+                relay::plan(&request, &links, "a", "aaaaaaaaaaaaaaaa"),
+                relay::Relay::Suppress("a sync request does not leave its link"),
+                "a request with {ttl} hops left must still not be carried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_request_that_has_travelled_is_not_answered() {
+        // The reply is routed back down the link the request arrived on, which
+        // is only the peer that asked while the request has taken no hops. A
+        // relayed request answered down the ingress link sends a stranger's
+        // history to the wrong peer and leaves the asker with nothing.
+        let (mut alice, bob) = alice_hearing_bob();
+
+        assert!(
+            !replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0))).is_empty(),
+            "a request with no hops left is the one we answer"
+        );
+        for ttl in [1u8, 2, 7] {
+            assert!(
+                replies(alice.handle_frame(&request_frame_ttl(&bob, &[], ttl))).is_empty(),
+                "a request carrying {ttl} hop(s) must go unanswered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_we_refuse_to_answer_does_not_spend_the_asker_s_budget() {
+        // The limiter's own documentation says the refusal is the answer, so a
+        // caller must not take a slot and then decline to use it. Eight
+        // malformed frames carrying bob's peer ID used to silence us towards
+        // bob for the whole window — and nothing authenticates that ID, so the
+        // sender chooses whom to silence.
+        let (mut alice, bob) = alice_hearing_bob();
+
+        let spoofed = Packet::new(
+            MessageType::RequestSync,
+            peer_id_to_bytes(&bob.my_peer_id),
+            vec![0xFF; 6], // will not parse
+            0,
+        )
+        .encode()
+        .expect("encodes");
+
+        for _ in 0..(MAX_RESPONSES * 2) {
+            alice.handle_frame(&spoofed);
+        }
+
+        assert!(
+            !replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0))).is_empty(),
+            "bob's own request must still be answered"
+        );
+    }
+
+    #[test]
+    fn a_request_with_hops_on_it_does_not_spend_a_budget_either() {
+        let (mut alice, bob) = alice_hearing_bob();
+        for _ in 0..(MAX_RESPONSES * 2) {
+            alice.handle_frame(&request_frame_ttl(&bob, &[], 7));
+        }
+        assert!(
+            !replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0))).is_empty(),
+            "refusing on hop count must not charge for the refusal"
+        );
+    }
+
+    #[test]
+    fn a_full_archive_answers_within_the_links_capacity() {
+        // End to end through the dispatch, not just through `respond`: the
+        // headline case is somebody arriving and asking for everything, and
+        // that was the case that overflowed a 64-deep queue and lost most of
+        // its own answer without saying so.
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        for i in 0..(MAX_REPLIES_PER_ROUND * 3) {
+            for frame in alice.public_message_frames(&format!("message number {i}")) {
+                let _ = frame;
+            }
+        }
+
+        let sent = replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0)));
+        assert!(
+            sent.len() <= MAX_REPLIES_PER_ROUND,
+            "one round produced {} frames into a {}-deep queue",
+            sent.len(),
+            crate::transport::LINK_INBOX_DEPTH
+        );
+    }
+
+    #[test]
+    fn the_maintenance_sweep_actually_prunes_the_limiter() {
+        // `sweep_sync_state` is the only caller of `prune` in the binary, and
+        // nothing checked that it calls it — the limiter's own test covers the
+        // method, not the wiring.
+        let (mut alice, bob) = alice_hearing_bob();
+        alice.handle_frame(&request_frame_ttl(&bob, &[], 0));
+        assert_eq!(alice.sync_limiter.tracked_peers(), 1);
+
+        let now = now_millis();
+        alice.sweep_sync_state_at(now);
+        assert_eq!(
+            alice.sync_limiter.tracked_peers(),
+            1,
+            "still inside the window"
+        );
+
+        // Past the window it must actually be forgotten. Without this the test
+        // holds whether or not the sweep calls `prune` at all — which is
+        // precisely how the wiring went unchecked in the first place.
+        alice.sweep_sync_state_at(now + crate::sync::rate_limit::WINDOW_MS + 1);
+        assert_eq!(alice.sync_limiter.tracked_peers(), 0);
+    }
+
+    #[test]
+    fn the_maintenance_sweep_actually_reclaims_the_archive() {
+        // The other half of the same wiring, and the same trap: `drop_stale`
+        // has its own test, but nothing showed the sweep reaching it.
+        let (mut alice, _bob) = alice_hearing_bob();
+        assert!(alice.archive.len(crate::sync::archive::Kind::Message) > 0);
+
+        let now = now_millis();
+        alice.sweep_sync_state_at(now);
+        assert!(
+            alice.archive.len(crate::sync::archive::Kind::Message) > 0,
+            "still inside the window"
+        );
+
+        alice.sweep_sync_state_at(now + crate::sync::archive::MAX_AGE_MS + 1);
+        assert_eq!(alice.archive.len(crate::sync::archive::Kind::Message), 0);
+    }
+
+    #[test]
+    fn a_peer_who_never_heard_the_original_can_read_what_we_send_back() {
+        // Every other test in this feature stops at "we produced the right
+        // bytes". This is the only one that would fail if the reply were
+        // unusable, which is the failure mode this repo keeps hitting: carol
+        // has never heard bob, and learns both who he is and what he said
+        // entirely from alice's answer.
+        let (mut alice, mut bob) = pair();
+        let mut carol = MeshService::new([31; 32], [32; 32], "carol");
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        for frame in bob.public_message_frames("hello the room") {
+            alice.handle_frame(&frame);
+        }
+
+        let sent = replies(alice.handle_frame(&request_frame_ttl(&carol, &[], 0)));
+        assert!(!sent.is_empty());
+
+        let mut saw_bob = false;
+        let mut saw_message = false;
+        for reply in &sent {
+            let frame = reply.encode().expect("a reply re-encodes");
+            for event in carol.handle_frame(&frame) {
+                match event {
+                    MeshEvent::PeerAppeared { nickname, .. } if nickname == "bob" => {
+                        saw_bob = true;
+                    }
+                    MeshEvent::PublicMessage { content, sender, .. } => {
+                        assert_eq!(sender, "bob", "attributed to its author, not to alice");
+                        assert_eq!(content, "hello the room");
+                        saw_message = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_bob, "carol learns bob exists from the relayed announce");
+        assert!(saw_message, "and reads the message he sent before she arrived");
     }
 }
