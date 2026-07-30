@@ -1002,6 +1002,65 @@ impl MeshService {
         }
     }
 
+    /// Opens mail carried here for us.
+    ///
+    /// Returns the message and the sender's *authenticated* key — authenticated
+    /// by the pattern rather than claimed in the payload, so neither the courier
+    /// nor anyone who captured it in transit can change who it appears to be
+    /// from.
+    ///
+    /// The block check happens here rather than in the UI, and has to: a
+    /// couriered sender is by definition absent, so there is no live session to
+    /// resolve them through. This is the only point where their full static key
+    /// is in hand.
+    pub fn open_courier(
+        &self,
+        envelope: &crate::courier::Envelope,
+    ) -> Option<(PrivateMessagePacket, String)> {
+        if envelope.prekey_id.is_some() {
+            // Sealed to a one-time prekey rather than our identity key. We do
+            // not publish prekeys, so this cannot be for us however it was
+            // addressed — and trying the static open would fail anyway.
+            return None;
+        }
+        let (typed, sender_static) = self.sessions.open_courier(&envelope.ciphertext)?;
+        let sender_fingerprint = fingerprint(&sender_static);
+        if self.is_blocked(&sender_fingerprint) {
+            return None;
+        }
+        let payload = NoisePayload::decode(&typed)?;
+        if payload.kind != NoisePayloadType::PrivateMessage {
+            return None;
+        }
+        let record = PrivateMessagePacket::decode(&payload.body)?;
+        Some((record, sender_fingerprint))
+    }
+
+    /// Seals a private message for someone we cannot reach, to be left with a
+    /// courier.
+    ///
+    /// The recipient's static key comes from a favourite's stored announce — we
+    /// cannot post to someone whose key we have never seen, which is the same
+    /// constraint as addressing them at all.
+    pub fn seal_for_courier(
+        &self,
+        recipient_static_key: &[u8],
+        content: &str,
+        expiry_ms: u64,
+        now_seconds: u64,
+    ) -> Option<(crate::courier::Envelope, String)> {
+        let record = PrivateMessagePacket::new(content);
+        let message_id = record.message_id.clone();
+        let payload = NoisePayload::new(NoisePayloadType::PrivateMessage, record.encode()?).encode();
+        let sealed = self.sessions.seal_courier(&payload, recipient_static_key)?;
+        let tag = crate::courier::recipient_tag(
+            recipient_static_key,
+            crate::courier::epoch_day(now_seconds),
+        );
+        let envelope = crate::courier::Envelope::new(tag, expiry_ms, sealed, 1, None)?;
+        Some((envelope, message_id))
+    }
+
     /// Wraps sealed mail for the air, directed at whoever it is for.
     pub fn courier_frame(
         &self,
@@ -1300,6 +1359,10 @@ impl MeshService {
 
         let nickname = announcement.nickname.clone();
         let fingerprint = fingerprint(&announcement.noise_public_key);
+        // Cached now, while they are here, because a courier envelope for them
+        // later needs the key and a fingerprint cannot be reversed into one.
+        self.favorites
+            .note_key(&fingerprint, &announcement.noise_public_key);
         let capabilities = announcement.advertised();
         let claims_neighbors: Vec<String> = announcement
             .direct_neighbors
@@ -2870,6 +2933,135 @@ mod courier_tests {
         let packet = Packet::decode(&frame).unwrap();
         assert_eq!(Envelope::decode(&packet.payload).as_ref(), Some(&envelope));
         assert_eq!(packet.recipient_hex().as_deref(), Some(recipient.my_peer_id.as_str()));
+    }
+
+    #[test]
+    fn a_message_reaches_an_absent_peer_through_a_stranger() {
+        // The whole point, end to end, with no infrastructure anywhere in it.
+        // Alice cannot reach Bob. She hands the sealed message to a courier who
+        // cannot read it. Bob later collects it from the courier and reads it,
+        // and can prove Alice wrote it.
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut courier_node = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut bob = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        // Alice knows Bob's announced key from when he was last around.
+        let bob_fingerprint = crate::peer_id::fingerprint(&bob.noise_public_key);
+        alice.favorites.apply_notice(
+            &bob_fingerprint,
+            "bob",
+            &crate::favorites::FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: None,
+            },
+        );
+        alice
+            .favorites
+            .note_key(&bob_fingerprint, &bob.noise_public_key);
+
+        // She seals a message for him and hands it to the courier.
+        let (envelope, message_id) = alice
+            .seal_for_courier(
+                &bob.noise_public_key,
+                "the back gate is open",
+                (now + 3600) * 1000,
+                now,
+            )
+            .expect("sealing to a key we hold");
+        let deposit = alice
+            .courier_frame(&envelope, &courier_node.my_peer_id)
+            .unwrap();
+
+        // The courier recognises it as somebody else's and cannot read it.
+        let held = courier_node
+            .handle_frame(&deposit)
+            .into_iter()
+            .find_map(|event| match event {
+                MeshEvent::CourierDeposit { envelope, .. } => Some(*envelope),
+                _ => None,
+            })
+            .expect("shelved rather than opened");
+        assert!(
+            courier_node.open_courier(&held).is_none(),
+            "a courier must not be able to read what it carries"
+        );
+
+        // Bob turns up. The courier computes his tag from his announced key and
+        // hands over what matches.
+        courier_node.handle_frame(&bob.announce_frame().unwrap());
+        let bob_peer = &courier_node.peers[&bob.my_peer_id];
+        let tags = courier::candidate_tags(&bob_peer.noise_public_key, now);
+        assert!(
+            tags.contains(&held.recipient_tag),
+            "the courier can tell it is his without ever knowing it was"
+        );
+
+        let delivery = courier_node
+            .courier_frame(&held, &bob.my_peer_id)
+            .unwrap();
+        let arrived = bob
+            .handle_frame(&delivery)
+            .into_iter()
+            .find_map(|event| match event {
+                MeshEvent::CourierArrived { envelope, .. } => Some(*envelope),
+                _ => None,
+            })
+            .expect("bob recognises his own tag");
+
+        let (record, sender_fingerprint) = bob.open_courier(&arrived).expect("bob can read it");
+        assert_eq!(record.content, "the back gate is open");
+        assert_eq!(record.message_id, message_id, "the same letter throughout");
+        assert_eq!(
+            sender_fingerprint,
+            crate::peer_id::fingerprint(&alice.noise_public_key),
+            "and it is provably from alice"
+        );
+    }
+
+    #[test]
+    fn mail_from_a_blocked_sender_is_not_read() {
+        // The block check has to happen at the open, because a couriered sender
+        // is absent by definition — there is no live session to resolve them
+        // through, and this is the only point their full key is in hand.
+        let alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        let (envelope, _) = alice
+            .seal_for_courier(&bob.noise_public_key, "let me in", (now + 3600) * 1000, now)
+            .unwrap();
+        assert!(bob.open_courier(&envelope).is_some(), "readable before blocking");
+
+        let mut blocked = HashSet::new();
+        blocked.insert(crate::peer_id::fingerprint(&alice.noise_public_key));
+        bob.load_blocked(blocked);
+        assert!(
+            bob.open_courier(&envelope).is_none(),
+            "a block must hold for mail that arrived without them"
+        );
+    }
+
+    #[test]
+    fn mail_sealed_to_a_prekey_is_left_alone() {
+        // We do not publish prekeys, so such an envelope cannot be for us however
+        // it is addressed. Refused up front rather than by failing to decrypt.
+        let alice = MeshService::new([11; 32], [12; 32], "alice");
+        let bob = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        let (envelope, _) = alice
+            .seal_for_courier(&bob.noise_public_key, "hello", (now + 3600) * 1000, now)
+            .unwrap();
+        let forward_secret = Envelope::new(
+            envelope.recipient_tag,
+            envelope.expiry_ms,
+            envelope.ciphertext.clone(),
+            1,
+            Some(7),
+        )
+        .unwrap();
+        assert!(bob.open_courier(&forward_secret).is_none());
     }
 
     #[test]

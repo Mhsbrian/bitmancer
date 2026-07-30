@@ -184,6 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .get(&fingerprint)
                         .cloned()
                         .unwrap_or_default(),
+                    noise_public_key: state
+                        .favorite_noise_keys
+                        .get(&fingerprint)
+                        .and_then(|key| hex::decode(key).ok()),
                 },
             );
         }
@@ -227,6 +231,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The shelf. Restored on the way in, minus anything that expired while we
     // were off — a restart must not extend the promise.
     let mut post = mailbox::Mailbox::open(courier::now_millis());
+    // Couriered mail arrives as several separately sealed envelopes carrying one
+    // letter, so what must not repeat is the letter, not the envelope. Shares the
+    // durable store with private envelopes for the same reason: a relaunch that
+    // re-showed yesterday's mail would be the same bug twice.
+    let mut opened_mail = nostr::processed::ProcessedEvents::open();
     let mut relays_up = false;
     // Relays currently answering. Held as a set rather than a count so a
     // repeated failure from one host cannot take the whole gateway down.
@@ -312,16 +321,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 envelope,
                             } => shelve(&mut app, &mut post, &mesh, &depositor, *envelope),
                             MeshEvent::CourierArrived { courier, envelope } => {
-                                // We can carry and deliver but not yet open: the
-                                // ciphertext is one-way Noise to our static key,
-                                // a pattern this client does not implement. Said
-                                // plainly rather than dropped, because somebody
-                                // went to real trouble to get it here.
-                                app.add_log_message(format!(
-                                    "system: {} carried sealed mail here for you ({} bytes). Opening couriered mail is not implemented yet, so it has been left unread.",
-                                    peer_id::short_display(&courier),
-                                    envelope.ciphertext.len()
-                                ));
+                                // `None` from `open_courier` is not for us after
+                                // all, is from someone we block, or is sealed to
+                                // a prekey we do not publish. Silent in every
+                                // case: a tag collision is rare but not an event,
+                                // and the other two are decisions already made.
+                                //
+                                // Deduplicated on the *inner* message id rather
+                                // than the envelope: redundant copies of one
+                                // letter are each sealed separately, so they are
+                                // different envelopes carrying the same message.
+                                if let Some((record, sender_fingerprint)) =
+                                    mesh.open_courier(&envelope)
+                                        .filter(|(record, _)| {
+                                            opened_mail.remember(&record.message_id)
+                                        })
+                                {
+                                    let sender = mesh
+                                        .favorites
+                                        .resolve(&sender_fingerprint)
+                                        .map(|(_, entry)| entry.nickname.clone())
+                                        .filter(|name| !name.is_empty())
+                                        .unwrap_or_else(|| {
+                                            peer_id::short_display(&sender_fingerprint)
+                                        });
+                                    let clock = chrono::Local::now().format("%H%M");
+                                    app.add_log_message(format!(
+                                        "__DM__:{sender}:{clock}:{}:{}",
+                                        record.message_id, record.content
+                                    ));
+                                    app.add_log_message(format!(
+                                        "system: that message was carried here by {} while {sender} was away.",
+                                        peer_id::short_display(&courier)
+                                    ));
+                                }
                             }
                             other => apply_mesh_event(&mut app, other, &mut last_notice),
                         }
@@ -626,6 +659,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // conversation exists.
                     let present = mesh.peers.contains_key(&target);
                     let address = mesh.nostr_address_for(&target).map(str::to_string);
+                    // Neither reachable nor addressable, but somebody nearby
+                    // might see them before we do. This is the case with no
+                    // infrastructure at all in it, and the only one where a
+                    // stranger's radio is the whole delivery mechanism.
+                    if !present && address.is_none() {
+                        if let Some(sent) = post_to_couriers(&mut app, &mesh, &target, &content) {
+                            for frame in sent {
+                                let _ = transport.outbound.send(Outbound::All(frame)).await;
+                            }
+                            continue;
+                        }
+                    }
                     if matches!(outbox::route(present, address.as_deref()), outbox::Route::Nostr) {
                         let address = address.expect("Route::Nostr means we hold an address");
                         match send_over_nostr(&mut geo, &mesh, &address, &target, &content) {
@@ -1190,6 +1235,7 @@ fn save_favorites(state: &mut persistence::AppState, mesh: &MeshService, app: &m
     state.favorited_us.clear();
     state.favorite_nostr_keys.clear();
     state.favorite_nicknames.clear();
+    state.favorite_noise_keys.clear();
     for (fingerprint, entry) in mesh.favorites.all() {
         if entry.we_favorited {
             state.favorites.insert(fingerprint.clone());
@@ -1206,6 +1252,13 @@ fn save_favorites(state: &mut persistence::AppState, mesh: &MeshService, app: &m
             state
                 .favorite_nicknames
                 .insert(fingerprint.clone(), entry.nickname.clone());
+        }
+        // Their announced key, so mail can still be addressed to them after
+        // they walk away — the one case couriering exists for.
+        if let Some(key) = &entry.noise_public_key {
+            state
+                .favorite_noise_keys
+                .insert(fingerprint.clone(), hex::encode(key));
         }
     }
     if let Err(error) = persistence::save_state(state) {
@@ -1379,6 +1432,68 @@ fn apply_mesh_event(app: &mut App, mesh_event: MeshEvent, last_notice: &mut Stri
         }
         MeshEvent::Trace(text) => app.add_log_message(format!("system: {text}")),
     }
+}
+
+/// Leaves a sealed message with every courier in range.
+///
+/// The last resort, and the only path with no infrastructure in it: the recipient
+/// is not here and we have no address for them, so the message is handed to
+/// whoever *is* here in the hope that one of them meets them first. Nothing
+/// acknowledges it and nothing can — the recipient is absent by definition, which
+/// is why it is offered as a possibility rather than reported as a send.
+///
+/// Returns `None` when there is nobody to ask, so the caller can fall through to
+/// saying the message could not go anywhere.
+fn post_to_couriers(
+    app: &mut App,
+    mesh: &MeshService,
+    target: &str,
+    content: &str,
+) -> Option<Vec<Vec<u8>>> {
+    // Their announced key, kept by the favourites table after they walked away.
+    // Without it there is no tag to address the envelope with, which is the same
+    // constraint as being able to name them at all.
+    let (_, relationship) = mesh.favorites.resolve(target)?;
+    let recipient_key = relationship.noise_public_key.clone()?;
+    let nickname = if relationship.nickname.is_empty() {
+        peer_id::short_display(target)
+    } else {
+        relationship.nickname.clone()
+    };
+
+    // Anyone we can currently talk to who is not the recipient. A courier does
+    // not need to be trusted — it cannot read what it carries — so the bar is
+    // only that we have a link to them.
+    let couriers: Vec<String> = mesh
+        .peers
+        .keys()
+        .filter(|peer_id| peer_id.as_str() != target)
+        .cloned()
+        .collect();
+    if couriers.is_empty() {
+        return None;
+    }
+
+    let now_seconds = courier::now_seconds();
+    let expiry_ms = (now_seconds + courier::MAX_LIFETIME_SECONDS) * 1000;
+    let (envelope, message_id) =
+        mesh.seal_for_courier(&recipient_key, content, expiry_ms, now_seconds)?;
+
+    let frames: Vec<Vec<u8>> = couriers
+        .iter()
+        .filter_map(|peer_id| mesh.courier_frame(&envelope, peer_id))
+        .collect();
+    if frames.is_empty() {
+        return None;
+    }
+
+    let clock = chrono::Local::now().format("%H%M");
+    app.add_log_message(format!("__DM_SENT__:{nickname}:{clock}:{message_id}:{content}"));
+    app.add_log_message(format!(
+        "system: {nickname} is not here and has no internet address. Left with {} nearby peer(s) to carry — it reaches them only if one of them sees them within a day, and nothing will tell you either way.",
+        frames.len()
+    ));
+    Some(frames)
 }
 
 /// Takes a deposit onto the shelf, or says why not.

@@ -27,6 +27,13 @@ pub struct AppState {
     /// Peers who favourited us, by fingerprint.
     #[serde(default)]
     pub favorited_us: HashSet<String>,
+    /// Announced Noise keys of favourites, hex, by fingerprint.
+    ///
+    /// A fingerprint is one-way, and a courier envelope is addressed by a tag
+    /// derived from the key — so without this, mail cannot be posted to the one
+    /// person store-and-forward is for: a favourite who is not here.
+    #[serde(default)]
+    pub favorite_noise_keys: HashMap<String, String>,
     /// Fingerprints checked against a card shown out of band, by fingerprint.
     ///
     /// This is the only trust in the client that does not come off the air, so
@@ -53,6 +60,7 @@ impl AppState {
             favorite_nostr_keys: HashMap::new(),
             favorite_nicknames: HashMap::new(),
             favorited_us: HashSet::new(),
+            favorite_noise_keys: HashMap::new(),
             verified_fingerprints: HashSet::new(),
             identity_key: None,
             noise_static_key: None,

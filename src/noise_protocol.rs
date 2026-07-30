@@ -45,6 +45,16 @@ pub enum NoisePattern {
     XX, // Most versatile, mutual authentication
     IK, // Initiator knows responder's static key
     NK, // Anonymous initiator
+    /// One message, no reply: the initiator already knows the responder's
+    /// static key and says everything in one go. Exactly IK's first message,
+    /// which is why it costs nothing but a table entry here.
+    ///
+    /// Used for courier envelopes, where the recipient is by definition not
+    /// present to complete a handshake. The trade is stated plainly upstream and
+    /// worth repeating: a one-way message has **no forward secrecy** — a later
+    /// compromise of the recipient's static key exposes envelopes captured in
+    /// transit. An established session is better whenever the peer is reachable.
+    X,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -624,6 +634,21 @@ impl NoiseHandshakeState {
         local_static_key: Option<StaticSecret>,
         remote_static_key: Option<PublicKey>,
     ) -> Self {
+        Self::with_prologue(role, pattern, local_static_key, remote_static_key, &[])
+    }
+
+    /// The same, with a prologue mixed into the transcript before anything else.
+    ///
+    /// Domain separation, and load-bearing: it is what stops a one-way courier
+    /// envelope and an interactive handshake transcript from ever being
+    /// confused for one another.
+    pub fn with_prologue(
+        role: NoiseRole,
+        pattern: NoisePattern,
+        local_static_key: Option<StaticSecret>,
+        remote_static_key: Option<PublicKey>,
+        prologue: &[u8],
+    ) -> Self {
         // Initialize protocol name
         let protocol_name = NoiseProtocolName::new(pattern.pattern_name());
         let full_name = protocol_name.full_name();
@@ -659,24 +684,30 @@ impl NoiseHandshakeState {
         };
 
         // Mix pre-message keys according to pattern
-        handshake.mix_pre_message_keys();
+        handshake.mix_pre_message_keys(prologue);
         handshake
     }
 
-    fn mix_pre_message_keys(&mut self) {
-        // Mix prologue (empty for XX pattern normally)
-        self.symmetric_state.mix_hash(&[]); // Empty prologue for XX pattern
-                                            // For XX pattern, no pre-message keys
-                                            // For IK/NK patterns, we'd mix the responder's static key here
+    fn mix_pre_message_keys(&mut self, prologue: &[u8]) {
+        self.symmetric_state.mix_hash(prologue);
         match self.pattern {
             NoisePattern::XX => {
-                // No pre-message keys
+                // Nothing is known in advance, so there is no pre-message.
             }
-            NoisePattern::IK | NoisePattern::NK => {
-                if matches!(self.role, NoiseRole::Initiator) {
-                    if let Some(remote_static) = self.remote_static_public {
-                        self.symmetric_state.mix_hash(&remote_static.to_bytes());
-                    }
+            // `<- s`: the responder's static key is known to the initiator
+            // before the handshake starts, so both sides mix it into the
+            // transcript. **Both** — the initiator mixes the key it was given
+            // and the responder mixes its own. Mixing on one side only leaves
+            // the two transcripts different and nothing decrypts, which stayed
+            // invisible while only XX was in use.
+            NoisePattern::IK | NoisePattern::NK | NoisePattern::X => {
+                let responder_static = if matches!(self.role, NoiseRole::Initiator) {
+                    self.remote_static_public.map(|key| key.to_bytes())
+                } else {
+                    self.local_static_public.map(|key| key.to_bytes())
+                };
+                if let Some(key) = responder_static {
+                    self.symmetric_state.mix_hash(&key);
                 }
             }
         }
@@ -1188,26 +1219,31 @@ impl NoiseHandshakeState {
             &format!("Decrypting payload, length: {}", payload.len()),
         );
 
-        let decrypted_payload = match self.symmetric_state.decrypt_and_hash(payload) {
-            Ok(p) => {
-                log_noise_protocol_event(
-                    "READ_MESSAGE_PAYLOAD_SUCCESS",
-                    &format!("Payload decrypted successfully, length: {}", p.len()),
-                );
-                p
-            }
-            Err(e) => {
-                log_noise_protocol_event(
-                    "READ_MESSAGE_PAYLOAD_ERROR",
-                    &format!(
-                        "Payload decryption failed: {:?}, but continuing handshake",
-                        e
-                    ),
-                );
-                // Continue handshake even if payload decryption fails (for debugging)
-                vec![]
-            }
-        };
+        // A payload that does not authenticate fails the handshake. It used to
+        // be swallowed and returned as an empty payload "for debugging", which
+        // is an integrity hole rather than a leniency: the tag check is the only
+        // thing standing between a reader and modified plaintext, and treating
+        // its failure as "no message" means anyone in the path can silently
+        // blank a message while the *sender* still authenticates — the static
+        // key decrypts a step earlier. The recipient then sees an empty message
+        // that is provably from someone who never sent it.
+        //
+        // Latent while every handshake payload we sent was empty. Not latent for
+        // courier envelopes, where the payload is the message.
+        let decrypted_payload = self.symmetric_state.decrypt_and_hash(payload).map_err(|e| {
+            log_noise_protocol_event(
+                "READ_MESSAGE_PAYLOAD_ERROR",
+                &format!("Payload failed to authenticate: {e:?}"),
+            );
+            e
+        })?;
+        log_noise_protocol_event(
+            "READ_MESSAGE_PAYLOAD_SUCCESS",
+            &format!(
+                "Payload decrypted successfully, length: {}",
+                decrypted_payload.len()
+            ),
+        );
 
         self.current_pattern += 1;
         log_noise_protocol_event(
@@ -1263,6 +1299,7 @@ impl NoisePattern {
             NoisePattern::XX => "XX",
             NoisePattern::IK => "IK",
             NoisePattern::NK => "NK",
+            NoisePattern::X => "X",
         }
     }
 
@@ -1300,6 +1337,17 @@ impl NoisePattern {
                     vec![NoiseMessagePattern::E, NoiseMessagePattern::ES], // -> e, es
                     vec![NoiseMessagePattern::E, NoiseMessagePattern::EE], // <- e, ee
                 ]
+            }
+            // IK's first message and nothing after it. The `ss` is what binds
+            // the sender's identity to the ciphertext, so a recipient learns who
+            // wrote to them without either side exchanging a second packet.
+            NoisePattern::X => {
+                vec![vec![
+                    NoiseMessagePattern::E,
+                    NoiseMessagePattern::ES,
+                    NoiseMessagePattern::S,
+                    NoiseMessagePattern::SS,
+                ]] // -> e, es, s, ss
             }
         }
     }

@@ -199,6 +199,66 @@ fn push_tlv(data: &mut Vec<u8>, tag: u8, value: &[u8]) {
     data.extend_from_slice(value);
 }
 
+/// Domain separation for courier envelopes.
+///
+/// Mixed into the transcript before anything else, so a one-way envelope and an
+/// interactive handshake can never be confused for one another even though they
+/// share a cipher suite. Upstream's `courierPrologue`; a different string here
+/// would produce mail nobody else can open.
+const SEAL_PROLOGUE: &[u8] = b"bitchat-courier-v1";
+
+/// Seals a payload to a recipient we cannot talk to.
+///
+/// One-way Noise X: one message, no reply, because the recipient is by
+/// definition not present. Our own static key rides *inside* the ciphertext, so
+/// the recipient learns who wrote to them and a courier does not.
+///
+/// The cost, which upstream states and is worth repeating: a one-way message has
+/// **no forward secrecy**. A later compromise of the recipient's static key
+/// exposes envelopes captured in transit. When a peer is reachable, an
+/// established session is the better choice and this is the fallback.
+pub fn seal(
+    payload: &[u8],
+    recipient_static_key: &[u8],
+    our_static: &x25519_dalek::StaticSecret,
+) -> Option<Vec<u8>> {
+    use crate::noise_protocol::{NoiseHandshakeState, NoisePattern, NoiseRole};
+
+    let recipient = NoiseHandshakeState::validate_public_key(recipient_static_key).ok()?;
+    let mut handshake = NoiseHandshakeState::with_prologue(
+        NoiseRole::Initiator,
+        NoisePattern::X,
+        Some(our_static.clone()),
+        Some(recipient),
+        SEAL_PROLOGUE,
+    );
+    handshake.write_message(payload).ok()
+}
+
+/// Opens an envelope addressed to us, returning what it says and who wrote it.
+///
+/// The sender's key is not a claim in the payload — it is authenticated by the
+/// `ss` step of the pattern, which only the holder of that static key could have
+/// performed. So a courier cannot alter who mail appears to be from, and neither
+/// can anyone who captured it in transit.
+pub fn open(
+    ciphertext: &[u8],
+    our_static: &x25519_dalek::StaticSecret,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    use crate::noise_protocol::{NoiseHandshakeState, NoisePattern, NoiseRole};
+
+    let mut handshake = NoiseHandshakeState::with_prologue(
+        NoiseRole::Responder,
+        NoisePattern::X,
+        Some(our_static.clone()),
+        None,
+        SEAL_PROLOGUE,
+    );
+    let payload = handshake.read_message(ciphertext).ok()?;
+    let sender = handshake.get_remote_static_public_key()?;
+    Some((payload, sender.to_bytes().to_vec()))
+}
+
 /// Seconds since the epoch. Zero if the clock is somehow before it, which
 /// would make every tag wrong but must not make anything panic.
 pub fn now_seconds() -> u64 {
@@ -267,6 +327,133 @@ mod tests {
             prekey_id,
         )
         .unwrap()
+    }
+
+    fn identity(seed: u8) -> x25519_dalek::StaticSecret {
+        x25519_dalek::StaticSecret::from([seed; 32])
+    }
+
+    fn public(secret: &x25519_dalek::StaticSecret) -> Vec<u8> {
+        x25519_dalek::PublicKey::from(secret).to_bytes().to_vec()
+    }
+
+    #[test]
+    fn sealed_mail_opens_for_its_recipient_and_names_its_sender() {
+        // The whole point of the pattern: one message, no reply, and the
+        // recipient still learns who wrote to them.
+        let alice = identity(1);
+        let bob = identity(2);
+
+        let sealed = seal(b"meet me where we said", &public(&bob), &alice)
+            .expect("sealing to a known key");
+        let (payload, sender) = open(&sealed, &bob).expect("bob can open his own mail");
+
+        assert_eq!(payload, b"meet me where we said");
+        assert_eq!(
+            sender,
+            public(&alice),
+            "the sender's key is authenticated by the pattern, not claimed in the payload"
+        );
+    }
+
+    #[test]
+    fn nobody_else_can_open_it() {
+        let alice = identity(1);
+        let bob = identity(2);
+        let carol = identity(3);
+
+        let sealed = seal(b"for bob only", &public(&bob), &alice).unwrap();
+        assert!(
+            open(&sealed, &carol).is_none(),
+            "a courier holding this must not be able to read it"
+        );
+    }
+
+    #[test]
+    fn a_tampered_envelope_does_not_open() {
+        // A courier cannot alter mail it carries without the recipient noticing,
+        // which is what makes handing mail to a stranger reasonable at all.
+        let alice = identity(1);
+        let bob = identity(2);
+        let sealed = seal(b"unaltered", &public(&bob), &alice).unwrap();
+
+        for index in 0..sealed.len() {
+            let mut altered = sealed.clone();
+            altered[index] ^= 0x01;
+            assert!(
+                open(&altered, &bob).is_none(),
+                "flipping byte {index} must break the seal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sender_cannot_be_forged() {
+        // Carol seals her own mail but claims Alice's key: the `ss` step can only
+        // be performed by whoever holds the static secret, so the substitution
+        // cannot survive.
+        let alice = identity(1);
+        let bob = identity(2);
+        let carol = identity(3);
+
+        let hers = seal(b"pretending", &public(&bob), &carol).unwrap();
+        let (_, sender) = open(&hers, &bob).unwrap();
+        assert_eq!(sender, public(&carol), "it is her key, not the one she wanted");
+        assert_ne!(sender, public(&alice));
+    }
+
+    #[test]
+    fn each_sealing_is_different_even_for_the_same_words() {
+        // A fresh ephemeral per envelope. Identical ciphertext for identical text
+        // would let a courier see that two people said the same thing.
+        let alice = identity(1);
+        let bob = identity(2);
+        let first = seal(b"same words", &public(&bob), &alice).unwrap();
+        let again = seal(b"same words", &public(&bob), &alice).unwrap();
+        assert_ne!(first, again);
+    }
+
+    #[test]
+    fn a_malformed_recipient_key_is_refused_rather_than_used() {
+        let alice = identity(1);
+        assert!(seal(b"hello", &[0u8; 31], &alice).is_none(), "wrong length");
+        assert!(seal(b"hello", &[0u8; 32], &alice).is_none(), "all-zero is not a point");
+    }
+
+    #[test]
+    fn rubbish_does_not_open_and_does_not_panic() {
+        let bob = identity(2);
+        for bytes in [vec![], vec![0u8; 1], vec![0u8; 32], vec![0xFF; 128]] {
+            assert!(open(&bytes, &bob).is_none());
+        }
+    }
+
+    #[test]
+    fn an_empty_message_still_seals() {
+        // A receipt or an acknowledgement has nothing to say and still has to
+        // travel.
+        let alice = identity(1);
+        let bob = identity(2);
+        let sealed = seal(b"", &public(&bob), &alice).unwrap();
+        let (payload, _) = open(&sealed, &bob).unwrap();
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn a_full_size_message_fits_the_envelope_it_travels_in() {
+        // The seal adds an ephemeral key, an encrypted static key and two tags.
+        // If that overhead pushed a maximum-length message past the envelope's
+        // ciphertext limit, the largest messages would fail at the last step.
+        let alice = identity(1);
+        let bob = identity(2);
+        let long = vec![b'x'; 8 * 1024];
+        let sealed = seal(&long, &public(&bob), &alice).unwrap();
+        assert!(
+            sealed.len() <= MAX_CIPHERTEXT_BYTES,
+            "sealed to {} bytes, envelope holds {MAX_CIPHERTEXT_BYTES}",
+            sealed.len()
+        );
+        assert!(Envelope::new([0; TAG_BYTES], NOW_MS, sealed, 1, None).is_some());
     }
 
     #[test]

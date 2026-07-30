@@ -40,6 +40,14 @@ pub struct Relationship {
     /// Last nickname seen, so a favourite list can be read by a human after
     /// the peer has gone out of range.
     pub nickname: String,
+    /// Their announced Noise static key.
+    ///
+    /// Kept because a fingerprint is one-way and a courier envelope is addressed
+    /// by a tag derived from the *key*. Without this we can name an absent
+    /// favourite and still have no way to write to them — which is precisely the
+    /// person store-and-forward exists for. The key is public; what is new is
+    /// that it now outlives the peer being in range.
+    pub noise_public_key: Option<Vec<u8>>,
 }
 
 impl Relationship {
@@ -102,6 +110,17 @@ impl Favorites {
     pub fn notice_text(is_favorite: bool, our_nostr_key: &str) -> String {
         let marker = if is_favorite { FAVORITED } else { UNFAVORITED };
         format!("{marker}:{our_nostr_key}")
+    }
+
+    /// Remembers a peer's announced key, if we have any relationship with them.
+    ///
+    /// Deliberately does not create an entry: caching a key for every stranger
+    /// who announces would turn the favourites table into a log of everyone ever
+    /// seen, which is a different thing with different consequences.
+    pub fn note_key(&mut self, fingerprint: &str, noise_public_key: &[u8]) {
+        if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint.to_lowercase()) {
+            entry.noise_public_key = Some(noise_public_key.to_vec());
+        }
     }
 
     /// Records that we favourited, or stopped favouriting, a peer.

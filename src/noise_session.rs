@@ -462,6 +462,21 @@ pub struct NoiseSessionManager {
 }
 
 impl NoiseSessionManager {
+    /// Opens a courier envelope addressed to us, returning what it says and the
+    /// sender's authenticated static key.
+    ///
+    /// Lives here because this is where the static secret lives, and handing the
+    /// secret out to be used elsewhere would make every future caller a place it
+    /// could escape from.
+    pub fn open_courier(&self, ciphertext: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        crate::courier::open(ciphertext, &self.local_static_key)
+    }
+
+    /// Seals a payload to a peer we cannot reach, for a courier to carry.
+    pub fn seal_courier(&self, payload: &[u8], recipient_static_key: &[u8]) -> Option<Vec<u8>> {
+        crate::courier::seal(payload, recipient_static_key, &self.local_static_key)
+    }
+
     pub fn new(local_static_key: StaticSecret) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),

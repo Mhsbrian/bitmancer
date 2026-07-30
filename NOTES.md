@@ -472,11 +472,47 @@ hello, and needs nothing else.
   so being reliably in one place is what it offers instead. A phone is a postal
   van; this is the box on the corner. The copy budget is preserved and honoured,
   never spent.
-- **Not done: opening mail addressed to us.** The ciphertext is one-way Noise to
-  our static key, a pattern this client does not implement — we have interactive
-  XX for sessions. Arrival is reported plainly rather than dropped, because
-  somebody went to real trouble to get it here. Composing an envelope needs the
-  same primitive, so both halves of "post and read" wait on it together.
+- **Posting and reading both work.** `/dm` to a favourite who is neither present
+  nor internet-addressable seals the message and leaves a copy with every peer in
+  range. Mail carried to us is opened, attributed and shown in the sender's
+  thread. Nothing acknowledges a couriered send and nothing can — the recipient is
+  absent by definition — so it is offered as a possibility rather than reported as
+  a delivery.
+- **Noise X is IK's first message and nothing after it.** `-> e, es, s, ss`, so
+  adding the pattern cost a table entry rather than new crypto. The prologue is
+  `"bitchat-courier-v1"`, which is what keeps a one-way envelope and an
+  interactive transcript from ever being confused. The sender's key is
+  authenticated by the `ss` step rather than claimed in the payload, so neither
+  the courier nor anyone who captured it can change who mail is from.
+- **A one-way message has no forward secrecy.** A later compromise of the
+  recipient's static key exposes envelopes captured in transit. Upstream says so
+  and it bears repeating: when a peer is reachable, a session is better and this
+  is the fallback. Upstream's answer is one-time prekeys (the `prekey_id` field);
+  we do not publish any, so such an envelope is refused up front rather than
+  failed at the decrypt.
+- **Two bugs found on the way in**, both latent because only XX was ever used:
+  - `mix_pre_message_keys` had the **responder never mixing its own static key**
+    for IK/NK. The `<- s` pre-message must be mixed by both sides; on one side
+    only, the transcripts differ and nothing decrypts.
+  - `read_message` **swallowed a failed payload decrypt** and returned an empty
+    payload "for debugging". That is an integrity hole, not a leniency: the static
+    key decrypts a step earlier, so anyone in the path could blank a message while
+    the *sender* still authenticated — the recipient sees an empty message
+    provably from someone who never sent it. Found by flipping every byte of a
+    sealed envelope and asking which flips still opened.
+- **Retaining a favourite's announced key is required, not incidental.** A
+  fingerprint is one-way and an envelope is addressed by a tag derived from the
+  key, so without `favorite_noise_keys` we could name an absent favourite and
+  still have no way to write to them — exactly the person this feature is for.
+  Cached while they are in range, and only for peers we already have a
+  relationship with: caching every stranger's key would turn the favourites table
+  into a log of everyone ever seen.
+- **Deduplicated on the inner message id**, not the envelope. Redundant copies of
+  one letter are each sealed separately with a fresh ephemeral, so they are
+  different envelopes carrying the same message.
+- **The block check happens at the open.** A couriered sender is absent, so there
+  is no live session to resolve them through; that open is the only point their
+  full static key is in hand.
 
 ## Seeing the mesh (`/mesh`)
 
