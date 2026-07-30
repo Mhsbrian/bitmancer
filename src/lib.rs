@@ -13,15 +13,15 @@
 // The module list is the same list `main.rs` used to declare. Nothing moved; the
 // declarations just live somewhere both targets can see them.
 
-pub mod announce;
+pub(crate) mod announce;
 pub mod commands;
-pub mod compression;
+pub(crate) mod compression;
 pub mod courier;
-pub mod data_structures;
-pub mod discovery;
+pub(crate) mod data_structures;
+pub(crate) mod discovery;
 pub mod favorites;
-pub mod file_packet;
-pub mod fragment;
+pub(crate) mod file_packet;
+pub(crate) mod fragment;
 pub mod gateway;
 pub mod geo;
 pub mod geohash;
@@ -29,8 +29,8 @@ pub mod mailbox;
 pub mod media;
 pub mod mesh;
 pub mod noise_payload;
-pub mod noise_protocol;
-pub mod noise_session;
+pub(crate) mod noise_protocol;
+pub(crate) mod noise_session;
 pub mod nostr;
 pub mod outbox;
 pub mod peer_id;

@@ -1,10 +1,17 @@
 
-// The session manager exposes more than the mesh layer currently calls -
-// per-session state queries, verification bookkeeping, rekeying. It is the API
-// the remaining private-messaging work builds on; trimming it to today's call
-// sites would mean restoring it piecemeal.
-#![allow(dead_code)]
-use crate::data_structures::{noise_trace, EncryptionStatus};
+// This file used to say the manager deliberately exposed more than the mesh
+// layer called, because it was the API the remaining private-messaging work
+// would build on. That was true when it was written and the work has since
+// landed somewhere else: holding messages during a handshake is `outbox.rs`,
+// resolving a fingerprint to a peer is `favorites::resolve`, and the
+// secured-versus-verified indicator arrives through `verification.rs`. What was
+// left here was a second implementation of each, which is how two mechanisms
+// drift apart, so it is gone.
+//
+// What remains is what the client calls, plus a few items reachable only from
+// tests, each annotated individually with the reason. Nothing here is covered
+// by a blanket allow any more.
+use crate::data_structures::noise_trace;
 use crate::debug_full_println;
 use crate::noise_protocol::{
     NoiseCipherState, NoiseError, NoiseHandshakeState, NoisePattern, NoiseRole, NoiseSymmetricState,
@@ -12,7 +19,6 @@ use crate::noise_protocol::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 // MARK: - Debug Logging
@@ -29,21 +35,19 @@ fn log_noise_event(event: &str, peer_id: &str, details: &str) {
 
 // MARK: - Noise Session State
 
+/// A session is either not started, mid-handshake, or up.
+///
+/// There used to be a fourth, `Failed(String)`, and nothing ever constructed it.
+/// It was half of a failure-handling design that `mesh.rs` replaced with
+/// remove-on-error — clearing a broken session rather than marking it, which is
+/// stronger, because a cleared session cannot be resumed into a bad state at all.
+/// See issue #4: that replacement covers the responder path and not the
+/// initiator one, which is worth fixing and is not what this enum was doing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoiseSessionState {
     Uninitialized,
     Handshaking,
     Established,
-    Failed(String),
-}
-
-// MARK: - Pending Message
-
-#[derive(Debug, Clone)]
-pub struct PendingMessage {
-    pub content: String,
-    pub timestamp: SystemTime,
-    pub retry_count: u8,
 }
 
 // MARK: - Noise Session
@@ -63,123 +67,10 @@ pub struct NoiseSession {
     // Handshake messages for retransmission
     sent_handshake_messages: Vec<Vec<u8>>,
     handshake_hash: Option<Vec<u8>>,
-
-    // Message queue for pending messages during handshake
-    pending_messages: Vec<PendingMessage>,
 }
 
 impl NoiseSession {
-    pub fn new(
-        peer_id: String,
-        role: NoiseRole,
-        local_static_key: StaticSecret,
-        remote_static_key: Option<PublicKey>,
-    ) -> Self {
-        Self {
-            peer_id,
-            role,
-            state: NoiseSessionState::Uninitialized,
-            handshake_state: None,
-            send_cipher: None,
-            receive_cipher: None,
-            local_static_key,
-            remote_static_public_key: remote_static_key,
-            sent_handshake_messages: Vec::new(),
-            handshake_hash: None,
-            pending_messages: Vec::new(),
-        }
-    }
-
-    // MARK: - Message Queue
-
-    pub fn queue_message(&mut self, content: String) {
-        let pending_msg = PendingMessage {
-            content,
-            timestamp: SystemTime::now(),
-            retry_count: 0,
-        };
-        self.pending_messages.push(pending_msg);
-        debug_full_println!(
-            "[NOISE] Queued message for {} ({} pending)",
-            self.peer_id,
-            self.pending_messages.len()
-        );
-    }
-
-    pub fn get_pending_messages(&mut self) -> Vec<String> {
-        let messages: Vec<String> = self
-            .pending_messages
-            .iter()
-            .map(|pm| pm.content.clone())
-            .collect();
-        self.pending_messages.clear();
-        messages
-    }
-
-    pub fn has_pending_messages(&self) -> bool {
-        !self.pending_messages.is_empty()
-    }
-
     // MARK: - Handshake
-
-    pub fn start_handshake(&mut self) -> Result<Vec<u8>, NoiseError> {
-        log_noise_event(
-            "HANDSHAKE_START",
-            &self.peer_id,
-            &format!("Role: {:?}, State: {:?}", self.role, self.state),
-        );
-
-        if self.state != NoiseSessionState::Uninitialized {
-            log_noise_event(
-                "HANDSHAKE_ERROR",
-                &self.peer_id,
-                &format!("Invalid state: {:?}", self.state),
-            );
-            return Err(NoiseError::InvalidState);
-        }
-
-        log_noise_event("HANDSHAKE_INIT", &self.peer_id, "Creating handshake state");
-
-        // For XX pattern, we don't need remote static key upfront
-        self.handshake_state = Some(NoiseHandshakeState::new(
-            self.role,
-            NoisePattern::XX,
-            Some(self.local_static_key.clone()),
-            None,
-        ));
-
-        self.state = NoiseSessionState::Handshaking;
-        log_noise_event(
-            "HANDSHAKE_STATE_CHANGE",
-            &self.peer_id,
-            "State changed to Handshaking",
-        );
-
-        // Only initiator writes the first message
-        if matches!(self.role, NoiseRole::Initiator) {
-            log_noise_event(
-                "HANDSHAKE_WRITE",
-                &self.peer_id,
-                "Initiator writing first message",
-            );
-            let message = self.handshake_state.as_mut().unwrap().write_message(&[])?;
-            log_noise_event(
-                "HANDSHAKE_MESSAGE_CREATED",
-                &self.peer_id,
-                &format!("Message size: {} bytes", message.len()),
-            );
-            self.sent_handshake_messages.push(message.clone());
-            Ok(message)
-        } else {
-            log_noise_event(
-                "HANDSHAKE_RESPONDER",
-                &self.peer_id,
-                "Responder waiting for initiation",
-            );
-            // Responder doesn't send first message in XX pattern
-            Ok(vec![])
-        }
-    }
 
     pub fn process_handshake_message(
         &mut self,
@@ -398,24 +289,6 @@ impl NoiseSession {
         self.remote_static_public_key
     }
 
-    pub fn get_handshake_hash(&self) -> Option<Vec<u8>> {
-        self.handshake_hash.clone()
-    }
-
-    pub fn reset(&mut self) {
-        let was_established = matches!(self.state, NoiseSessionState::Established);
-        self.state = NoiseSessionState::Uninitialized;
-        self.handshake_state = None;
-        self.send_cipher = None;
-        self.receive_cipher = None;
-        self.sent_handshake_messages.clear();
-        self.handshake_hash = None;
-        self.pending_messages.clear();
-
-        if was_established {
-            debug_full_println!("[NOISE] Session expired for {}", self.peer_id);
-        }
-    }
 }
 
 // MARK: - Session Manager
@@ -426,19 +299,9 @@ pub struct NoiseSessionManager {
 
     // Fingerprint management (matching Swift implementation)
     peer_fingerprints: Arc<Mutex<HashMap<String, String>>>, // peer_id -> fingerprint
-    fingerprint_to_peer_id: Arc<Mutex<HashMap<String, String>>>, // fingerprint -> peer_id
 
     // Verified fingerprints (matching Swift implementation)
     verified_fingerprints: Arc<Mutex<std::collections::HashSet<String>>>,
-
-    // Encryption status tracking (matching Swift implementation)
-    peer_encryption_status: Arc<Mutex<HashMap<String, EncryptionStatus>>>,
-
-    // Callbacks (matching Swift implementation)
-    on_session_established: Option<Box<dyn Fn(String, PublicKey) + Send + Sync>>,
-    on_session_failed: Option<Box<dyn Fn(String, NoiseError) + Send + Sync>>,
-    on_peer_authenticated: Option<Box<dyn Fn(String, String) + Send + Sync>>, // peer_id, fingerprint
-    on_handshake_required: Option<Box<dyn Fn(String) + Send + Sync>>, // peer_id needs handshake
 }
 
 impl NoiseSessionManager {
@@ -462,44 +325,8 @@ impl NoiseSessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             local_static_key,
             peer_fingerprints: Arc::new(Mutex::new(HashMap::new())),
-            fingerprint_to_peer_id: Arc::new(Mutex::new(HashMap::new())),
             verified_fingerprints: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            peer_encryption_status: Arc::new(Mutex::new(HashMap::new())),
-            on_session_established: None,
-            on_session_failed: None,
-            on_peer_authenticated: None,
-            on_handshake_required: None,
         }
-    }
-
-    // MARK: - Callback Management
-
-    pub fn set_on_session_established<F>(&mut self, callback: F)
-    where
-        F: Fn(String, PublicKey) + Send + Sync + 'static,
-    {
-        self.on_session_established = Some(Box::new(callback));
-    }
-
-    pub fn set_on_session_failed<F>(&mut self, callback: F)
-    where
-        F: Fn(String, NoiseError) + Send + Sync + 'static,
-    {
-        self.on_session_failed = Some(Box::new(callback));
-    }
-
-    pub fn set_on_peer_authenticated<F>(&mut self, callback: F)
-    where
-        F: Fn(String, String) + Send + Sync + 'static,
-    {
-        self.on_peer_authenticated = Some(Box::new(callback));
-    }
-
-    pub fn set_on_handshake_required<F>(&mut self, callback: F)
-    where
-        F: Fn(String) + Send + Sync + 'static,
-    {
-        self.on_handshake_required = Some(Box::new(callback));
     }
 
     // MARK: - Fingerprint Management
@@ -507,11 +334,6 @@ impl NoiseSessionManager {
     pub fn get_peer_fingerprint(&self, peer_id: &str) -> Option<String> {
         let fingerprints = self.peer_fingerprints.lock().unwrap();
         fingerprints.get(peer_id).cloned()
-    }
-
-    pub fn get_peer_id_for_fingerprint(&self, fingerprint: &str) -> Option<String> {
-        let fingerprint_map = self.fingerprint_to_peer_id.lock().unwrap();
-        fingerprint_map.get(fingerprint).cloned()
     }
 
     // MARK: - Verified Fingerprint Management (matching Swift implementation)
@@ -526,6 +348,11 @@ impl NoiseSessionManager {
         );
     }
 
+    /// Reachable only from tests. The client asks `verification.rs` and the
+    /// verified-fingerprints list instead of asking a session manager, so this
+    /// is covered but never called in anger — see the note in NOTES.md about
+    /// what the restored lint can and cannot tell you.
+    #[allow(dead_code)]
     pub fn is_fingerprint_verified(&self, fingerprint: &str) -> bool {
         let verified = self.verified_fingerprints.lock().unwrap();
         verified.contains(fingerprint)
@@ -546,93 +373,12 @@ impl NoiseSessionManager {
         );
     }
 
-    // MARK: - Encryption Status Management (matching Swift implementation)
-
-    pub fn update_encryption_status(&mut self, peer_id: &str) {
-        let sessions = self.sessions.lock().unwrap();
-        let mut status_map = self.peer_encryption_status.lock().unwrap();
-
-        if let Some(session) = sessions.get(peer_id) {
-            match session.get_state() {
-                NoiseSessionState::Established => {
-                    // Check if fingerprint is verified
-                    if let Some(fingerprint) = self.get_peer_fingerprint(peer_id) {
-                        if self.is_fingerprint_verified(&fingerprint) {
-                            status_map.insert(peer_id.to_string(), EncryptionStatus::NoiseVerified);
-                            log_noise_event(
-                                "STATUS_UPDATE",
-                                peer_id,
-                                "Setting encryption status to NoiseVerified",
-                            );
-                        } else {
-                            status_map.insert(peer_id.to_string(), EncryptionStatus::NoiseSecured);
-                            log_noise_event(
-                                "STATUS_UPDATE",
-                                peer_id,
-                                "Setting encryption status to NoiseSecured",
-                            );
-                        }
-                    } else {
-                        status_map.insert(peer_id.to_string(), EncryptionStatus::NoiseSecured);
-                        log_noise_event(
-                            "STATUS_UPDATE",
-                            peer_id,
-                            "Setting encryption status to NoiseSecured (no fingerprint)",
-                        );
-                    }
-                }
-                NoiseSessionState::Handshaking => {
-                    status_map.insert(peer_id.to_string(), EncryptionStatus::NoiseHandshaking);
-                    log_noise_event(
-                        "STATUS_UPDATE",
-                        peer_id,
-                        "Setting encryption status to NoiseHandshaking",
-                    );
-                }
-                NoiseSessionState::Uninitialized => {
-                    status_map.insert(peer_id.to_string(), EncryptionStatus::NoHandshake);
-                    log_noise_event(
-                        "STATUS_UPDATE",
-                        peer_id,
-                        "Setting encryption status to NoHandshake",
-                    );
-                }
-                NoiseSessionState::Failed(_) => {
-                    status_map.insert(peer_id.to_string(), EncryptionStatus::None);
-                    log_noise_event(
-                        "STATUS_UPDATE",
-                        peer_id,
-                        "Setting encryption status to None (failed)",
-                    );
-                }
-            }
-        } else {
-            status_map.insert(peer_id.to_string(), EncryptionStatus::NoHandshake);
-            log_noise_event(
-                "STATUS_UPDATE",
-                peer_id,
-                "Setting encryption status to NoHandshake (no session)",
-            );
-        }
-    }
-
-    pub fn get_encryption_status(&self, peer_id: &str) -> EncryptionStatus {
-        let status_map = self.peer_encryption_status.lock().unwrap();
-        status_map
-            .get(peer_id)
-            .cloned()
-            .unwrap_or(EncryptionStatus::NoHandshake)
-    }
-
-    pub fn clear_encryption_status(&mut self, peer_id: &str) {
-        let mut status_map = self.peer_encryption_status.lock().unwrap();
-        status_map.remove(peer_id);
-        log_noise_event("STATUS_CLEARED", peer_id, "Cleared encryption status");
-    }
-
     // MARK: - Identity Fingerprint (matching Swift implementation)
 
     /// Get our own identity fingerprint (SHA256 hash of our static public key)
+    /// Reachable only from tests; the live identity fingerprint the user sees
+    /// comes through `verification.rs`.
+    #[allow(dead_code)]
     pub fn get_identity_fingerprint(&self) -> String {
         let public_key = PublicKey::from(&self.local_static_key);
         self.calculate_fingerprint(&public_key)
@@ -667,10 +413,8 @@ impl NoiseSessionManager {
         // Store fingerprint mapping
         {
             let mut fingerprints = self.peer_fingerprints.lock().unwrap();
-            let mut fingerprint_map = self.fingerprint_to_peer_id.lock().unwrap();
 
             fingerprints.insert(peer_id.clone(), fingerprint.clone());
-            fingerprint_map.insert(fingerprint.clone(), peer_id.clone());
             log_noise_event(
                 "FINGERPRINT_STORED",
                 &peer_id,
@@ -683,39 +427,14 @@ impl NoiseSessionManager {
             peer_id,
             &fingerprint[..16]
         );
-
-        // Call session established callback if set
-        if let Some(callback) = &self.on_session_established {
-            log_noise_event(
-                "CALLBACK_TRIGGERED",
-                &peer_id,
-                "Calling session established callback",
-            );
-            callback(peer_id.clone(), remote_static_key);
-        } else {
-            log_noise_event(
-                "NO_CALLBACK",
-                &peer_id,
-                "No session established callback set",
-            );
-        }
-
-        // Call peer authenticated callback if set (matching Swift implementation)
-        if let Some(callback) = &self.on_peer_authenticated {
-            log_noise_event(
-                "PEER_AUTH_CALLBACK",
-                &peer_id,
-                &format!(
-                    "Calling peer authenticated callback with fingerprint: {}",
-                    &fingerprint[..16]
-                ),
-            );
-            callback(peer_id.clone(), fingerprint);
-        }
     }
 
     // MARK: - Session Management
 
+    /// Reachable only from tests. The live paths reach a session through
+    /// `initiate_handshake` and `handle_incoming_handshake`, which build one
+    /// themselves rather than asking for it first.
+    #[allow(dead_code)]
     pub fn create_session(
         &mut self,
         peer_id: String,
@@ -783,7 +502,7 @@ impl NoiseSessionManager {
                 remote_static_public_key: None,
                 sent_handshake_messages: Vec::new(),
                 handshake_hash: None,
-                pending_messages: Vec::new(),
+
             };
 
             noise_trace(&format!(
@@ -796,11 +515,6 @@ impl NoiseSessionManager {
 
             Ok(session)
         }
-    }
-
-    pub fn get_session(&self, peer_id: &str) -> Option<NoiseSession> {
-        let sessions = self.sessions.lock().unwrap();
-        sessions.get(peer_id).cloned()
     }
 
     pub fn remove_session(&mut self, peer_id: &str) {
@@ -817,14 +531,19 @@ impl NoiseSessionManager {
         // Also remove fingerprint mappings
         {
             let mut fingerprints = self.peer_fingerprints.lock().unwrap();
-            let mut fingerprint_map = self.fingerprint_to_peer_id.lock().unwrap();
-
-            if let Some(fingerprint) = fingerprints.remove(peer_id) {
-                fingerprint_map.remove(&fingerprint);
-            }
+            fingerprints.remove(peer_id);
         }
     }
 
+    /// Moves a session to the peer's new id after a BLE address rotation.
+    ///
+    /// Nothing calls this yet, and it is annotated rather than deleted because
+    /// it is the one piece of this file's unused surface that was never
+    /// superseded. Everything else removed alongside it had a live replacement
+    /// somewhere in the tree; peer-id rotation is a real protocol event with no
+    /// handler anywhere, so this is unbuilt rather than obsolete. See
+    /// https://github.com/Mhsbrian/bitmancer/issues/6.
+    #[allow(dead_code)]
     pub fn migrate_session(&mut self, from_old_peer_id: &str, to_new_peer_id: &str) {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.remove(from_old_peer_id) {
@@ -839,22 +558,11 @@ impl NoiseSessionManager {
         // Also migrate fingerprint mappings
         {
             let mut fingerprints = self.peer_fingerprints.lock().unwrap();
-            let mut fingerprint_map = self.fingerprint_to_peer_id.lock().unwrap();
 
             if let Some(fingerprint) = fingerprints.remove(from_old_peer_id) {
-                fingerprints.insert(to_new_peer_id.to_string(), fingerprint.clone());
-                fingerprint_map.insert(fingerprint, to_new_peer_id.to_string());
+                fingerprints.insert(to_new_peer_id.to_string(), fingerprint);
             }
         }
-    }
-
-    pub fn get_established_sessions(&self) -> Vec<NoiseSession> {
-        let sessions = self.sessions.lock().unwrap();
-        sessions
-            .values()
-            .filter(|session| session.is_established())
-            .cloned()
-            .collect()
     }
 
     // MARK: - Handshake Helpers
@@ -868,6 +576,10 @@ impl NoiseSessionManager {
         }
     }
 
+    /// Reachable only from tests. `MeshService::has_session` is the one the
+    /// client calls and it is a different function on a different type — the
+    /// shared name makes a grep for callers look answered when it is not.
+    #[allow(dead_code)]
     pub fn has_session(&self, peer_id: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();
         let has_session = sessions.contains_key(peer_id);
@@ -876,216 +588,6 @@ impl NoiseSessionManager {
             peer_id, has_session
         ));
         has_session
-    }
-
-    pub fn store_pending_message(
-        &mut self,
-        peer_id: &str,
-        message: String,
-    ) -> Result<(), NoiseError> {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get_mut(peer_id) {
-            session.pending_messages.push(PendingMessage {
-                content: message,
-                timestamp: std::time::SystemTime::now(),
-                retry_count: 0,
-            });
-            Ok(())
-        } else {
-            Err(NoiseError::SessionNotFound)
-        }
-    }
-
-    pub fn encrypt_message(
-        &mut self,
-        peer_id: &str,
-        message: &[u8],
-    ) -> Result<Vec<u8>, NoiseError> {
-        log_noise_event(
-            "ENCRYPT_MESSAGE_START",
-            peer_id,
-            &format!(
-                "Starting encryption for message of length: {}",
-                message.len()
-            ),
-        );
-
-        let mut sessions = self.sessions.lock().unwrap();
-        log_noise_event(
-            "ENCRYPT_MESSAGE_SESSIONS",
-            peer_id,
-            &format!("Found {} total sessions", sessions.len()),
-        );
-
-        if let Some(session) = sessions.get_mut(peer_id) {
-            log_noise_event(
-                "ENCRYPT_MESSAGE_SESSION_FOUND",
-                peer_id,
-                &format!("Session state: {:?}", session.get_state()),
-            );
-
-            if session.is_established() {
-                log_noise_event(
-                    "ENCRYPT_MESSAGE_ESTABLISHED",
-                    peer_id,
-                    "Session is established, checking send cipher",
-                );
-
-                if let Some(send_cipher) = &mut session.send_cipher {
-                    log_noise_event(
-                        "ENCRYPT_MESSAGE_CIPHER_FOUND",
-                        peer_id,
-                        &format!(
-                            "Send cipher found, encrypting message of length: {}",
-                            message.len()
-                        ),
-                    );
-
-                    let result = send_cipher.encrypt(message, &[]);
-                    match &result {
-                        Ok(encrypted) => {
-                            log_noise_event(
-                                "ENCRYPT_MESSAGE_SUCCESS",
-                                peer_id,
-                                &format!(
-                                    "Encryption successful, result length: {}",
-                                    encrypted.len()
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            log_noise_event(
-                                "ENCRYPT_MESSAGE_CIPHER_ERROR",
-                                peer_id,
-                                &format!("Cipher encryption failed: {:?}", e),
-                            );
-                            // Don't reset session on encryption failure, just return error
-                        }
-                    }
-                    result
-                } else {
-                    log_noise_event(
-                        "ENCRYPT_MESSAGE_NO_CIPHER",
-                        peer_id,
-                        "Session established but no send cipher available",
-                    );
-                    Err(NoiseError::NotEstablished)
-                }
-            } else {
-                log_noise_event(
-                    "ENCRYPT_MESSAGE_NOT_ESTABLISHED",
-                    peer_id,
-                    &format!(
-                        "Session not established, current state: {:?}",
-                        session.get_state()
-                    ),
-                );
-                Err(NoiseError::NotEstablished)
-            }
-        } else {
-            log_noise_event(
-                "ENCRYPT_MESSAGE_NO_SESSION",
-                peer_id,
-                "No session found for peer",
-            );
-            Err(NoiseError::SessionNotFound)
-        }
-    }
-
-    pub fn decrypt_message(
-        &mut self,
-        peer_id: &str,
-        encrypted_message: &[u8],
-    ) -> Result<Vec<u8>, NoiseError> {
-        log_noise_event(
-            "DECRYPT_MESSAGE_START",
-            peer_id,
-            &format!(
-                "Starting decryption for message of length: {}",
-                encrypted_message.len()
-            ),
-        );
-
-        let mut sessions = self.sessions.lock().unwrap();
-        log_noise_event(
-            "DECRYPT_MESSAGE_SESSIONS",
-            peer_id,
-            &format!("Found {} total sessions", sessions.len()),
-        );
-
-        if let Some(session) = sessions.get_mut(peer_id) {
-            log_noise_event(
-                "DECRYPT_MESSAGE_SESSION_FOUND",
-                peer_id,
-                &format!("Session state: {:?}", session.get_state()),
-            );
-
-            if session.is_established() {
-                log_noise_event(
-                    "DECRYPT_MESSAGE_ESTABLISHED",
-                    peer_id,
-                    "Session is established, checking receive cipher",
-                );
-
-                if let Some(recv_cipher) = &mut session.receive_cipher {
-                    log_noise_event(
-                        "DECRYPT_MESSAGE_CIPHER_FOUND",
-                        peer_id,
-                        &format!(
-                            "Receive cipher found, decrypting message of length: {}",
-                            encrypted_message.len()
-                        ),
-                    );
-
-                    let result = recv_cipher.decrypt(encrypted_message, &[]);
-                    match &result {
-                        Ok(decrypted) => {
-                            log_noise_event(
-                                "DECRYPT_MESSAGE_SUCCESS",
-                                peer_id,
-                                &format!(
-                                    "Decryption successful, result length: {}",
-                                    decrypted.len()
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            log_noise_event(
-                                "DECRYPT_MESSAGE_CIPHER_ERROR",
-                                peer_id,
-                                &format!("Cipher decryption failed: {:?}", e),
-                            );
-                            // Don't reset session on decryption failure, just return error
-                        }
-                    }
-                    result
-                } else {
-                    log_noise_event(
-                        "DECRYPT_MESSAGE_NO_CIPHER",
-                        peer_id,
-                        "Session established but no receive cipher available",
-                    );
-                    Err(NoiseError::NotEstablished)
-                }
-            } else {
-                log_noise_event(
-                    "DECRYPT_MESSAGE_NOT_ESTABLISHED",
-                    peer_id,
-                    &format!(
-                        "Session not established, current state: {:?}",
-                        session.get_state()
-                    ),
-                );
-                Err(NoiseError::NotEstablished)
-            }
-        } else {
-            log_noise_event(
-                "DECRYPT_MESSAGE_NO_SESSION",
-                peer_id,
-                "No session found for peer",
-            );
-            Err(NoiseError::SessionNotFound)
-        }
     }
 
     pub fn initiate_handshake(&mut self, peer_id: &str) -> Result<Vec<u8>, NoiseError> {
@@ -1120,7 +622,7 @@ impl NoiseSessionManager {
                 remote_static_public_key: None,
                 sent_handshake_messages: Vec::new(),
                 handshake_hash: None,
-                pending_messages: Vec::new(),
+
             };
 
             sessions.insert(peer_id.to_string(), session);
@@ -1149,20 +651,6 @@ impl NoiseSessionManager {
                     "[DEBUG] Handshake message created, length: {}",
                     message.len()
                 ));
-
-                // Call handshake required callback if set
-                if let Some(callback) = &self.on_handshake_required {
-                    log_noise_event(
-                        "HANDSHAKE_REQUIRED",
-                        peer_id,
-                        "Calling handshake required callback",
-                    );
-                    callback(peer_id.to_string());
-                }
-
-                // Update encryption status (need to drop sessions lock first)
-                drop(sessions);
-                self.update_encryption_status(peer_id);
 
                 Ok(message)
             } else {
@@ -1201,14 +689,13 @@ impl NoiseSessionManager {
 
         let mut sessions = self.sessions.lock().unwrap();
 
-        // Only create new session if none exists or current is failed
-        let should_create_new = match sessions.get(peer_id) {
-            None => true,
-            Some(session) => match session.get_state() {
-                NoiseSessionState::Failed(_) => true,
-                _ => false, // Continue with existing session
-            },
-        };
+        // A session we already hold is continued, never replaced. There used to
+        // be a second arm here for `Failed`, and it was unreachable — nothing
+        // constructed that state. Collapsing it is behaviour-preserving for that
+        // reason rather than because it looked redundant, which is a distinction
+        // worth keeping: a broken session is cleared by `mesh.rs` on the way out
+        // of a failed handshake, not marked and resumed here.
+        let should_create_new = sessions.get(peer_id).is_none();
 
         if should_create_new {
             let session = NoiseSession {
@@ -1222,7 +709,7 @@ impl NoiseSessionManager {
                 remote_static_public_key: None,
                 sent_handshake_messages: Vec::new(),
                 handshake_hash: None,
-                pending_messages: Vec::new(),
+
             };
             sessions.insert(peer_id.to_string(), session);
         }
@@ -1258,47 +745,12 @@ impl NoiseSessionManager {
         session.decrypt(ciphertext)
     }
 
-    // MARK: - Message Queue Management
-
-    pub fn queue_message(&mut self, peer_id: &str, content: String) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get_mut(peer_id) {
-            session.queue_message(content);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn get_pending_messages(&mut self, peer_id: &str) -> Vec<String> {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get_mut(peer_id) {
-            session.get_pending_messages()
-        } else {
-            Vec::new()
-        }
-    }
-
     // MARK: - Key Management
 
-    pub fn get_remote_static_key(&self, peer_id: &str) -> Option<PublicKey> {
-        self.get_session(peer_id)?.get_remote_static_public_key()
-    }
-
-    pub fn get_handshake_hash(&self, peer_id: &str) -> Option<Vec<u8>> {
-        self.get_session(peer_id)?.get_handshake_hash()
-    }
-
-    /// Check if a session is ready for transport cipher encryption/decryption
-    pub fn is_session_ready(&self, peer_id: &str) -> bool {
-        let sessions = self.sessions.lock().unwrap();
-        sessions
-            .get(peer_id)
-            .map(|s| s.is_established())
-            .unwrap_or(false)
-    }
-
     // FIXED: Add method to store peer static keys for identity announcements
+    /// Reachable only from tests. Announced static keys reach a handshake
+    /// through `handle_incoming_handshake`, not through this.
+    #[allow(dead_code)]
     pub fn store_peer_static_key(&mut self, peer_id: &str, static_key_bytes: &[u8]) -> Result<(), NoiseError> {
         if static_key_bytes.len() != 32 {
             return Err(NoiseError::InvalidPublicKey);
@@ -1329,7 +781,6 @@ impl Clone for NoiseSession {
             remote_static_public_key: self.remote_static_public_key,
             sent_handshake_messages: self.sent_handshake_messages.clone(),
             handshake_hash: self.handshake_hash.clone(),
-            pending_messages: self.pending_messages.clone(),
         }
     }
 }
@@ -1376,15 +827,20 @@ impl Clone for NoiseSymmetricState {
 
 /// The session-lifecycle surface that the rest of the client actually reaches.
 ///
-/// Scoped deliberately. `noise_session.rs` measures 43% covered, but a good part
-/// of that is not a testing gap: `migrate_session`, `update_encryption_status`,
+/// Scoped deliberately. `noise_session.rs` measured 43% covered, but a good part
+/// of that was never a testing gap: `update_encryption_status`,
 /// `get_encryption_status`, `get_peer_id_for_fingerprint` and the whole
-/// pending-message queue have no callers outside this file, and
-/// `PendingMessage::timestamp` and `retry_count` are written and never read.
-/// Pinning that behaviour with tests would make dead code harder to delete, so
-/// these cover only what something else calls: `remove_session`,
+/// pending-message queue had no callers outside this file. Pinning that
+/// behaviour with tests would have made dead code harder to delete, so these
+/// cover only what something else calls: `remove_session`,
 /// `has_established_session`, and the fingerprint mapping the verification flow
 /// depends on.
+///
+/// That judgement paid off directly — everything named above has since been
+/// deleted, and because none of it was tested, the deletion removed no tests.
+/// Five of the methods below did turn out to be reachable only from here, which
+/// their own annotations now say; they are kept because deleting them would
+/// delete these tests, which is a worse trade than an annotation.
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
