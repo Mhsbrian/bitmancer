@@ -407,6 +407,30 @@ been passing vacuously.
 because a message that arrived over Nostr carries its true time inside the sealed
 rumor while the gift wrap's own timestamp is jittered by up to ±900s.
 
+**A remote line's timestamp is clamped into `[0, now]` on the way in**
+(`believable_epoch`), and both arrival paths do it. Typing the boundary stopped a
+nickname from *becoming* the epoch; it did not change who supplies the epoch, and
+nothing on either transport validates it — the geohash path passes
+`event.created_at` off a relay, the mesh path passes `packet.timestamp / 1000`.
+`insert_in_time_order` sorts on that value and nothing else, so an unbounded one
+bought the newest slot in the log for the whole session, with every genuine
+message that followed sorting in underneath it. `DateTime::from_timestamp` then
+returned `None` for the absurd value and the caller fell back to the current
+clock, so it was drawn with a *plausible* time and nothing on screen to say
+otherwise.
+
+The ceiling is `now` rather than now plus a grace, because any future window at
+all leaves that slot buyable for the length of the window. It costs nothing:
+there is no way to tell a peer whose clock runs fast from one claiming to, so for
+anything stamped ahead of us the honest order is the order it arrived in, which
+is what clamping to now produces. Clamping is one-sided — replayed history keeps
+its own times, or the hour-of-backlog ordering collapses into arrival order.
+
+`is_current` saturates for the same reason. It was `now - epoch` on a number a
+stranger chose, so `created_at: i64::MIN` overflowed it: a panic in debug, and in
+release a wrap that made the distant past read as live. A signature proves who
+sent a number, not that the number is sane.
+
 The connection overlay covers the whole UI while disconnected; `Esc` dismisses it so the client stays usable offline (reconnection continues regardless). Keep `App::MAX_POPUP_MESSAGES` small — the popup's message pane is only about four rows.
 
 ## Mesh fragments, files and relaying

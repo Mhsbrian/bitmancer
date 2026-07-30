@@ -246,8 +246,45 @@ const LIVE_HORIZON: i64 = 120;
 
 /// Whether a line's own timestamp says it belongs to the present. An hour-old
 /// backlog is nowhere near, which is the distinction that matters.
+///
+/// Saturating, because the epoch is a number a stranger chose. A signed geohash
+/// event carrying `created_at: i64::MIN` overflowed the plain subtraction — a
+/// panic in a debug build, and in release a wrap that made the distant past
+/// read as live. A signature proves who sent a number, not that the number is
+/// sane.
 fn is_current(epoch: i64) -> bool {
-    chrono::Local::now().timestamp() - epoch <= LIVE_HORIZON
+    chrono::Local::now()
+        .timestamp()
+        .saturating_sub(epoch)
+        .le(&LIVE_HORIZON)
+}
+
+/// Brings a remote line's timestamp back into a range worth believing.
+///
+/// Nothing on either transport validates it. On the geohash path it is
+/// `event.created_at` off a relay; on the mesh path it is `packet.timestamp`
+/// divided by 1000. `insert_in_time_order` sorts on nothing else, so an
+/// unbounded value bought the newest slot in the log — the one the eye goes to —
+/// for the whole session, with every genuine message that followed sorting in
+/// underneath it. `DateTime::from_timestamp` then returned `None` for the absurd
+/// value and the caller fell back to the current clock, so it was drawn with a
+/// plausible time and nothing on screen to suggest otherwise.
+///
+/// Clamped rather than rejected: a peer with a badly set clock is still someone
+/// talking, and silently dropping chat is worse than drawing it out of order.
+///
+/// The ceiling is *now*, not now plus a tolerance. Allowing any future window at
+/// all leaves the newest slot buyable for the length of that window, which is
+/// the whole defect in miniature. And refusing the future costs nothing real: we
+/// cannot tell a peer whose clock runs fast from one claiming to be fast, so for
+/// anything stamped ahead of us the honest ordering is the order it arrived in —
+/// which is what clamping to now produces.
+///
+/// The floor is the Unix epoch. No real message predates it, and it keeps
+/// `from_timestamp` from ever failing on remote input, which is what made the
+/// fallback draw a plausible clock time over an absurd one.
+fn believable_epoch(epoch: i64) -> i64 {
+    epoch.clamp(0, chrono::Local::now().timestamp())
 }
 
 /// Places a message by time rather than by arrival, so a slow relay replaying
@@ -589,6 +626,9 @@ impl App {
             content,
         } = line;
 
+        // The sender chose this number and nothing upstream checked it.
+        let epoch = believable_epoch(epoch);
+
         let timestamp = chrono::DateTime::from_timestamp(epoch, 0)
             .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
             .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
@@ -645,6 +685,14 @@ impl App {
         content: String,
         sent_at: i64,
     ) {
+        // Also a stranger's number when it came out of a Nostr envelope. Private
+        // messages are not time-sorted, so there is no slot to be stolen here,
+        // but an absurd value still made `from_timestamp` fail and the fallback
+        // below draw a plausible clock time over it. Bounding one of the two
+        // arrival paths and not the other is how the trace writer ended up with
+        // one gated copy and one ungated one.
+        let sent_at = believable_epoch(sent_at);
+
         let timestamp = chrono::DateTime::from_timestamp(sent_at, 0)
             .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
             .unwrap_or_else(|| chrono::Local::now().format("%H:%M").to_string());
@@ -1294,6 +1342,119 @@ mod inbound_arrival_tests {
         assert_eq!(
             hostile.epoch, now,
             "the sender does not get to choose where it sits"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_from_the_far_future_cannot_hold_the_newest_position() {
+        // Typing the boundary stopped a nickname from *becoming* the epoch. It did
+        // not change who supplies the epoch: on the geohash path it is
+        // `event.created_at` straight off a relay, and on the mesh path it is
+        // `packet.timestamp / 1000`. Neither is validated anywhere, and
+        // `insert_in_time_order` sorts on nothing else — so a sender could claim
+        // the newest slot, the one the eye goes to, for the whole session.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+
+        app.add_channel_line(channel_line("alice", now - 60, "earlier"));
+        app.add_channel_line(channel_line("attacker", i64::MAX, "pinned"));
+        app.add_channel_line(channel_line("carol", now, "genuine and newest"));
+
+        let last = lines(&app).last().expect("the log is not empty");
+        assert_eq!(
+            last.sender, "carol",
+            "a genuine later message must outrank a claimed future one, got {:?}",
+            lines(&app)
+                .iter()
+                .map(|message| message.sender.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_timestamp_from_the_far_future_is_brought_back_into_a_believable_window() {
+        // The display made it a spoof rather than a curiosity:
+        // `from_timestamp(i64::MAX, 0)` is None, so the old code fell back to
+        // `Local::now()` and drew a plausible current clock time on a message
+        // pinned forever. Nothing on screen suggested anything was wrong.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+
+        app.add_channel_line(channel_line("attacker", i64::MAX, "pinned"));
+
+        let line = &lines(&app)[0];
+        // Bounded to now, not to now plus a tolerance: any future window at all
+        // leaves the newest slot buyable for the length of it.
+        assert!(
+            line.epoch <= chrono::Local::now().timestamp(),
+            "epoch must be brought back to the present, got {} against a now of {}",
+            line.epoch,
+            now
+        );
+    }
+
+    #[test]
+    fn a_timestamp_from_before_the_unix_epoch_does_not_take_the_client_down() {
+        // `is_current` was `now - epoch`, raw. A signed geohash event carrying
+        // `created_at: i64::MIN` overflowed it — a panic in debug, and in release
+        // a wrap that made an ancient message read as live. A signature proves
+        // who sent the number, not that the number is sane.
+        let mut app = App::new_with_nickname("me".into());
+
+        app.add_channel_line(channel_line("attacker", i64::MIN, "underflow"));
+
+        assert_eq!(lines(&app).len(), 1, "the line is handled, not dropped");
+    }
+
+    #[test]
+    fn judging_newness_never_overflows() {
+        // Asserted directly on the predicate as well as through the boundary,
+        // because this is the arithmetic that panicked and it has other callers.
+        assert!(!is_current(i64::MIN), "the distant past is not current");
+        assert!(is_current(i64::MAX), "an absurd future is not the past");
+    }
+
+    #[test]
+    fn a_clock_a_little_ahead_of_ours_is_still_shown_and_still_live() {
+        // The bound must not punish ordinary skew — two phones in one channel
+        // rarely agree to the second. It brings a fast clock back to now rather
+        // than letting it sit in the future, because there is no way to tell a
+        // peer whose clock runs fast from one claiming to, and the message must
+        // still appear and still count as news either way.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+
+        app.add_channel_line(channel_line("alice", now + 5, "just ahead"));
+
+        let line = &lines(&app)[0];
+        assert_eq!(line.content, "just ahead", "the message must still be shown");
+        assert!(
+            line.arrived.is_some(),
+            "a live message must still animate after clamping"
+        );
+        assert!(
+            line.epoch <= chrono::Local::now().timestamp(),
+            "nothing is left sitting in the future, got {}",
+            line.epoch
+        );
+    }
+
+    #[test]
+    fn a_past_timestamp_is_never_moved() {
+        // Clamping is one-sided. History replayed by a relay must keep its own
+        // times or the hour-of-backlog ordering this codebase cares about
+        // collapses into arrival order.
+        let mut app = App::new_with_nickname("me".into());
+        let now = chrono::Local::now().timestamp();
+
+        app.add_channel_line(channel_line("alice", now - 3600, "an hour ago"));
+        app.add_channel_line(channel_line("bob", now - 60, "a minute ago"));
+
+        let epochs: Vec<i64> = lines(&app).iter().map(|message| message.epoch).collect();
+        assert_eq!(
+            epochs,
+            vec![now - 3600, now - 60],
+            "past timestamps pass through exactly"
         );
     }
 
