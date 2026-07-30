@@ -16,6 +16,7 @@
 // hand-computed vectors rather than round-trips. A consistently wrong codec
 // round-trips perfectly; NOTES.md already learned that from `npub`.
 
+pub mod archive;
 pub mod gcs;
 pub mod packet_id;
 pub mod request;
