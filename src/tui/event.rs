@@ -95,7 +95,17 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
         app.should_quit = true;
         return;
     }
-    if matches!(app.phase, crate::tui::app::TuiPhase::Error(_)) && key_event.code == KeyCode::Char('r') {
+    // Not while the search prompt is taking keys. The guard below covers every
+    // shortcut beneath it, but this one sits above — and the connection overlay
+    // is dismissable precisely so the client stays usable offline, which is when
+    // reading back through settled history is most likely. Searching for
+    // "server" or "error" would otherwise reconnect on the `r` and drop the
+    // character, and `trigger_connection_retry` also clears `popup_messages`, so
+    // the failure the user was reading about disappears mid-word.
+    if matches!(app.phase, crate::tui::app::TuiPhase::Error(_))
+        && key_event.code == KeyCode::Char('r')
+        && !app.search.prompt_open
+    {
         app.trigger_connection_retry();
         return;
     }
@@ -866,6 +876,60 @@ mod tests {
         for character in text.chars() {
             handle_key_event(app, press(KeyCode::Char(character)), &sender);
         }
+    }
+
+    /// Every printable character, in both connection phases, must land in the
+    /// query rather than firing a shortcut.
+    ///
+    /// The existing tests name `i` and `m` because those are the shortcuts the
+    /// guard was written for. Naming examples cannot show that nothing *else*
+    /// gets through, and something did: `r` is the connection-retry key and it
+    /// is handled above the guard rather than below it, so it only escaped while
+    /// the client was in the error phase. The overlay is dismissable so the
+    /// client stays usable offline, and reading back through settled history is
+    /// exactly what one does offline — "server", "error" and "brian" all carry
+    /// an r.
+    #[test]
+    fn no_printable_character_is_stolen_from_the_search_prompt() {
+        let (sender, _receiver) = mpsc::channel::<String>(64);
+        for error_phase in [false, true] {
+            let mut stolen = Vec::new();
+            for character in ' '..='~' {
+                let mut app = searchable_app();
+                app.phase = if error_phase {
+                    crate::tui::app::TuiPhase::Error("offline".to_string())
+                } else {
+                    crate::tui::app::TuiPhase::Connected
+                };
+                app.search.open(app.msg_scroll);
+                let before = app.search.query.clone();
+                handle_key_event(&mut app, press(KeyCode::Char(character)), &sender);
+                if app.search.query == before {
+                    stolen.push(character);
+                }
+            }
+            assert!(
+                stolen.is_empty(),
+                "error_phase={error_phase}: these never reached the query: {stolen:?}"
+            );
+        }
+    }
+
+    /// The other direction. Guarding the retry on the prompt must not stop it
+    /// working when the prompt is shut, which is the only time it should.
+    #[test]
+    fn r_still_retries_the_connection_when_no_search_is_open() {
+        let (sender, _receiver) = mpsc::channel::<String>(8);
+        let mut app = searchable_app();
+        app.phase = crate::tui::app::TuiPhase::Error("offline".to_string());
+        assert!(!app.search.prompt_open, "precondition: no prompt");
+
+        handle_key_event(&mut app, press(KeyCode::Char('r')), &sender);
+
+        assert!(
+            app.pending_connection_retry,
+            "with no prompt open, r is still the retry key"
+        );
     }
 
     fn searchable_app() -> App {
