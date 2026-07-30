@@ -1964,3 +1964,123 @@ fn sync_people(app: &mut App, mesh: &MeshService, geo: &GeoService) {
         .and_then(|name| app.people.iter().position(|candidate| *candidate == name));
     app.update_sidebar_flat_selection();
 }
+
+#[cfg(test)]
+mod relay_plan_tests {
+    use super::*;
+    use bitmancer::protocol::MessageType;
+    use std::collections::HashSet;
+
+    fn me() -> MeshService {
+        MeshService::new([1; 32], [2; 32], "me")
+    }
+
+    /// A broadcast from somebody else, of a type the policy carries onward.
+    /// Anything we sent, addressed to us, or presence would be suppressed for a
+    /// reason that has nothing to do with what each test is asking.
+    fn from_a_peer(ttl: u8) -> protocol::Packet {
+        protocol::Packet::new(MessageType::Message, [0xAB; 8], b"pass it on".to_vec(), ttl)
+    }
+
+    fn links(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_relayed_frame_is_the_original_with_one_hop_taken_off() {
+        let original = from_a_peer(5);
+        let on_the_wire = original.encode().expect("encode");
+        let mut forwarded = relay::Forwarded::default();
+
+        let onward = relay_plan(
+            &me(),
+            &on_the_wire,
+            "link-a",
+            &links(&["link-a", "link-b"]),
+            &mut forwarded,
+        )
+        .expect("a broadcast with hops left and somewhere to go is relayed");
+
+        let relayed = protocol::Packet::decode(&onward).expect("the relayed frame decodes");
+        assert_eq!(relayed.ttl, original.ttl - 1, "exactly one hop comes off");
+
+        // And nothing else moved. Asserted by putting the hop back and
+        // comparing the whole frame rather than by listing fields: a packet has
+        // ten of them, `route` and `is_rsr` are carried only on v2, and a list
+        // written by hand is a list that misses whichever field is added next.
+        // Padding is PKCS#7, so two encodings of one packet are byte-identical.
+        let mut restored = relayed;
+        restored.ttl = original.ttl;
+        assert_eq!(
+            restored.encode().expect("re-encode"),
+            on_the_wire,
+            "relaying changed something other than the TTL"
+        );
+    }
+
+    #[test]
+    fn a_packet_already_passed_on_is_not_passed_on_again() {
+        // The same packet reaching us from two neighbours is the flood working.
+        // Relaying it twice is what turns three links into a packet going round
+        // and round until the TTL runs out.
+        let packet = from_a_peer(5);
+        let on_the_wire = packet.encode().expect("encode");
+        let held = links(&["link-a", "link-b", "link-c"]);
+        let mut forwarded = relay::Forwarded::default();
+
+        assert!(
+            relay_plan(&me(), &on_the_wire, "link-a", &held, &mut forwarded).is_some(),
+            "the first sighting is relayed"
+        );
+        assert!(
+            relay_plan(&me(), &on_the_wire, "link-b", &held, &mut forwarded).is_none(),
+            "the same packet from another link is not relayed a second time"
+        );
+    }
+
+    #[test]
+    fn a_packet_the_policy_refused_is_not_remembered_as_forwarded() {
+        // `relay_plan` asks the policy before it records the packet, and that
+        // order is load-bearing rather than tidy. A packet arriving while its
+        // own link is the only one we hold has nowhere to go, so it is refused
+        // — but that is a fact about this moment, not about the packet. Record
+        // it on the way past and the copy that arrives once a second link is up
+        // is silently dropped as a duplicate of something never actually sent.
+        let packet = from_a_peer(5);
+        let on_the_wire = packet.encode().expect("encode");
+        let mut forwarded = relay::Forwarded::default();
+
+        assert!(
+            relay_plan(&me(), &on_the_wire, "link-a", &links(&["link-a"]), &mut forwarded)
+                .is_none(),
+            "with only the link it came from, there is nowhere to relay it"
+        );
+        assert!(
+            relay_plan(
+                &me(),
+                &on_the_wire,
+                "link-a",
+                &links(&["link-a", "link-b"]),
+                &mut forwarded
+            )
+            .is_some(),
+            "once there is somewhere to send it, the earlier refusal must not \
+             have consumed it"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_is_not_a_packet_is_not_relayed() {
+        // Anything can arrive on a BLE characteristic. The decode is the only
+        // thing standing between that and the relay path.
+        let mut forwarded = relay::Forwarded::default();
+        assert!(relay_plan(
+            &me(),
+            b"not a packet",
+            "link-a",
+            &links(&["link-a", "link-b"]),
+            &mut forwarded
+        )
+        .is_none());
+    }
+}
