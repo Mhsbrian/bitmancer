@@ -108,10 +108,16 @@ fn event_child() {
 
     use bitmancer::tui::app::App;
     use bitmancer::tui::event::{handle_mouse_event, handle_paste_event};
-    use bitmancer::tui::tui::{init, TerminalGuard};
+    use bitmancer::tui::tui::{init, init_with, TerminalGuard};
     use crossterm::event::{self, Event};
 
-    let _terminal = init().expect("init");
+    // `nocapture` is the config's `mouse_capture = false` taken all the way to a
+    // real terminal. Everything else goes through `init()` exactly as before.
+    let _terminal = if mode == "nocapture" {
+        init_with(false).expect("init_with")
+    } else {
+        init().expect("init")
+    };
     let _guard = TerminalGuard::new();
     let mut app = App::new_with_nickname("tester".to_string());
 
@@ -155,6 +161,9 @@ fn event_child() {
         }
         "paste" => {
             println!("RESULT compose={:?}", app.input.value());
+        }
+        "nocapture" => {
+            println!("RESULT scroll_after={}", app.msg_scroll);
         }
         other => println!("RESULT unknown-mode={other}"),
     }
@@ -278,4 +287,57 @@ fn compose_value(transcript: &str) -> String {
         .map(|(_, rest)| rest.trim())
         .unwrap_or_default();
     quoted.trim_matches('"').to_string()
+}
+
+#[test]
+fn mouse_capture_false_does_not_ask_the_terminal_for_the_mouse() {
+    // The config setting, driven to a real terminal rather than to a boolean.
+    //
+    // Without this, `init_with` could ignore its argument entirely and every
+    // test still passed — checked by mutation, and it did. That is the same
+    // shape as this file's own first version, where removing
+    // `EnableMouseCapture` from `init()` left all four tests green because the
+    // SGR bytes were injected regardless of whether the terminal had been asked
+    // for them. A setting wired to nothing is worse than an absent setting: it
+    // is documented, so someone will rely on it.
+    if !pty_available() {
+        eprintln!("skipping: script(1) is unavailable, so no pty can be allocated");
+        return;
+    }
+
+    let transcript = drive("nocapture", WHEEL_UP);
+    assert!(
+        !transcript.contains(REQUEST_SGR_MOUSE),
+        "mouse_capture = false must not ask the terminal for SGR mouse \
+         reporting, or the selection it exists to hand back is still \
+         taken.\n{transcript}"
+    );
+
+    // The control. Same bytes, same child, capture on — so a transcript that
+    // simply never contains the sequence, for any reason, cannot pass the
+    // assertion above.
+    let enabled = drive("wheel", WHEEL_UP);
+    assert!(
+        enabled.contains(REQUEST_SGR_MOUSE),
+        "with capture on the sequence must be there, or the check above is \
+         measuring nothing.\n{enabled}"
+    );
+}
+
+#[test]
+fn bracketed_paste_survives_turning_the_mouse_off() {
+    // The two modes are set by the same `execute!` and it would be easy to drop
+    // both while meaning to drop one. Paste is the half that stops a multi-line
+    // paste sending itself a line at a time, so losing it silently is the more
+    // expensive mistake of the two.
+    if !pty_available() {
+        eprintln!("skipping: script(1) is unavailable, so no pty can be allocated");
+        return;
+    }
+
+    let transcript = drive("nocapture", WHEEL_UP);
+    assert!(
+        transcript.contains(REQUEST_BRACKETED_PASTE),
+        "turning the mouse off must not take bracketed paste with it.\n{transcript}"
+    );
 }

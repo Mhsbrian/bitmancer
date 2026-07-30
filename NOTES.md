@@ -510,6 +510,42 @@ business. A test covers exactly that case, and it failed on the first attempt.
 the backend as it goes; there is nothing cached across frames that a resize would
 invalidate.
 
+### The config file is read-only on purpose
+
+`~/.bitmancer/config` sits beside `state.json` and the two are deliberately
+different kinds of file. `state.json` is written by the client and holds an
+X25519 private key, so it is not something to hand-edit or commit. The config is
+only ever *read*, so a stray write cannot destroy what someone typed, and
+nothing secret goes in it.
+
+Plain `key = value`, parsed by hand. TOML would have been a new dependency to
+read two settings, and on a crate whose premise is not leaking a private key the
+bar for that is higher than the convenience. `serde_json` was already available
+and is the wrong shape for the opposite reason: a file a human edits wants
+comments.
+
+**Unknown keys are reported, not ignored.** A typo that silently does nothing is
+the characteristic way a config file wastes an afternoon. The warnings surface in
+the startup overlay rather than on stderr, because by the time the config is read
+the alternate screen has covered stderr — a warning written where nobody can see
+it is the same as no warning.
+
+**A persisted nickname beats a configured one.** The name in `state.json` is what
+peers have already seen and what `/name` last set; a config file silently
+renaming an established identity at every launch is the wrong way round. The
+setting is for a machine that has no identity yet.
+
+`mouse_capture = false` is the escape hatch for the trade documented above:
+capture buys the wheel and costs click-drag selection, and `Shift`+drag reaching
+the selection underneath is the terminal's behaviour, not something this client
+can promise. Where it does not work there was previously no way out.
+
+It is wired as `tui::init_with(bool)` with `init()` kept as the capture-on
+default, rather than as a parameter on `init`. Both pty suites drive `init()` and
+assert on the modes it sets, so a signature change would have turned those
+assertions into a decision about test plumbing — which is exactly how a check
+gets quietly weakened.
+
 ### Searching the scrollback
 
 `/` from the log pane, `n`/`N` to walk, `Esc` to put the log back. Four things

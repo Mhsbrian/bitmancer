@@ -12,6 +12,7 @@ use crossterm::event as crossterm_event;
 use crossterm::event::Event as CrosstermEvent;
 use tokio::sync::mpsc;
 
+use bitmancer::config;
 use bitmancer::commands::{self, CommandOutcome};
 use bitmancer::geo::{self, GeoService};
 use bitmancer::mesh::{DeliveryStatus, MeshEvent, MeshService};
@@ -104,10 +105,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
+    let settings = config::load();
     let mut state = persistence::load_state();
+    // A persisted nickname wins over the configured one. It is the name peers
+    // have already seen and the one `/name` last set, so letting a config file
+    // silently rename an established identity at every launch would be the
+    // wrong way round. The config supplies a name for a machine that does not
+    // have one yet.
     let nickname = state
         .nickname
         .clone()
+        .or_else(|| settings.nickname.clone())
         .unwrap_or_else(|| "anonymous".to_string());
 
     // Both keys are generated and persisted by load_state on first run. The
@@ -162,7 +170,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut geo = GeoService::new(nostr_device_seed, &mesh.nickname);
 
-    let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
+    let mut terminal =
+        tui_mod::init_with(settings.mouse_capture).expect("Failed to initialize TUI");
     // From here to the end of main the terminal is ours. The guard hands it back
     // on every path out — the `?`s below, a panic, or the ordinary quit — so no
     // future early return can strand the user in raw mode.
@@ -171,6 +180,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.short_peer_id = peer_id::short_display(&mesh.my_peer_id);
     app.add_popup_message(format!("You are {} ({})", mesh.nickname, mesh.my_peer_id));
     app.add_popup_message("Esc dismisses this; /geo #<geohash> joins a location channel.".into());
+    // Anything the config file said that could not be read. Reported here
+    // rather than to stderr, which the alternate screen has already covered by
+    // this point — a warning written where nobody can see it is the same as no
+    // warning, and a silently ignored setting is the characteristic way a
+    // config file wastes someone's afternoon.
+    for warning in &settings.warnings {
+        app.add_popup_message(warning.clone());
+    }
 
     let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
     let mut transport = transport::spawn();
