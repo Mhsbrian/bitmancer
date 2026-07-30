@@ -140,6 +140,11 @@ pub enum Outbound {
     /// Every link but one — a packet being passed along, kept off the link it
     /// arrived on so it cannot echo back to whoever sent it.
     Except { link: String, data: Vec<u8> },
+    /// One link and no other — an answer to the peer that asked.
+    ///
+    /// A gossip sync reply can be the whole archive, so putting it on every
+    /// link would spend one peer's question on everyone else's airtime.
+    Only { link: String, data: Vec<u8> },
 }
 
 pub struct Transport {
@@ -196,6 +201,17 @@ impl LinkSet {
             })
             .unwrap_or_default()
     }
+
+    /// The one sender for a link, or none if it has since dropped.
+    ///
+    /// A link can go away between a frame arriving on it and the answer being
+    /// written back, which is why this returns an option rather than assuming.
+    fn sender_for(&self, address: &str) -> Vec<mpsc::Sender<Vec<u8>>> {
+        self.inner
+            .lock()
+            .map(|links| links.get(address).cloned().into_iter().collect())
+            .unwrap_or_default()
+    }
 }
 
 pub fn spawn() -> Transport {
@@ -226,11 +242,12 @@ async fn run(events: mpsc::Sender<TransportEvent>, mut outbound: mpsc::Receiver<
     tokio::spawn(dialler(adapter, links.clone(), events.clone()));
 
     while let Some(frame) = outbound.recv().await {
-        let (except, data) = match frame {
-            Outbound::All(data) => (None, data),
-            Outbound::Except { link, data } => (Some(link), data),
+        let (targets, data) = match frame {
+            Outbound::All(data) => (links.senders_except(None), data),
+            Outbound::Except { link, data } => (links.senders_except(Some(&link)), data),
+            Outbound::Only { link, data } => (links.sender_for(&link), data),
         };
-        for sender in links.senders_except(except.as_deref()) {
+        for sender in targets {
             // A link whose pump has died or fallen behind must not stall the
             // others; its queue draining is that link's problem.
             let _ = sender.try_send(data.clone());
