@@ -433,6 +433,43 @@ sent a number, not that the number is sane.
 
 The connection overlay covers the whole UI while disconnected; `Esc` dismisses it so the client stays usable offline (reconnection continues regardless). Keep `App::MAX_POPUP_MESSAGES` small — the popup's message pane is only about four rows.
 
+### Terminal input: every event kind is dispatched
+
+The loop reads `Key`, `Mouse` and `Paste`. It used to read `Key` and drop the
+rest, which cost two things and gained nothing.
+
+**Mouse capture was on from the first commit with no handler behind it.**
+Capturing the mouse takes the terminal's own click-drag selection away — a
+program cannot both read the wheel and leave the mouse to the terminal — so for
+its whole life the client paid that price and gave back no wheel. It now scrolls
+the log. Keeping capture rather than dropping it is deliberate: on the alternate
+screen there is no scrollback to select *from*, so dropping it would buy
+selection over one visible frame and lose scrolling over the entire log.
+`Shift`+drag reaches the selection underneath in most terminals, which the README
+says as a terminal feature rather than a promise this client can make.
+
+The wheel is not focus-dependent. A wheel over a log scrolls in every other
+application, and no other pane has anything scrollable in it. It is inert while
+an overlay is up, because scrolling something the user cannot see — so that it has
+moved when they close the overlay — is worse than ignoring the notch.
+
+**Bracketed paste is on, and pasted newlines fold to spaces.** Without it a
+multi-line paste arrives as individual keystrokes and each embedded return fires
+`Enter`, sending the first line on its own and then the next — on a network where
+nothing can be unsent. Folding rather than keeping the newlines is the right shape
+because a chat line is one line: the wire format has no multi-line message and the
+compose box draws one logical entry.
+
+One ordering detail worth keeping: the fold to spaces happens *before* the
+control-character filter, so a paste of nothing but newlines becomes blanks that
+the filter cannot see. Emptiness is therefore judged with `trim()`, while the text
+is inserted untrimmed — a deliberate leading space in real text is the user's
+business. A test covers exactly that case, and it failed on the first attempt.
+
+`Resize` needs no arm. The loop redraws every tick and ratatui re-measures from
+the backend as it goes; there is nothing cached across frames that a resize would
+invalidate.
+
 ## Mesh fragments, files and relaying
 
 **Fragments (`0x20`, `fragment.rs`).** A BLE write is small, so larger frames

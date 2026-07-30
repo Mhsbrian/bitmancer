@@ -101,11 +101,23 @@ and flags the ones running BitChat:
 | | |
 |---|---|
 | `Tab` | move between the sidebar, the log and the input box |
+| wheel | scroll the log, wherever the focus is |
 | `m` | world map (also `/map`) |
 | `i` | view the newest image in this conversation (also `/img`) |
 | `:name:` | becomes an emoji as you close the colon; `Tab` takes a suggestion |
 | `Ctrl+C` | quit |
 | `Esc` | dismiss the connection overlay; the client works fine offline |
+
+Pasting several lines at once puts all of it in the compose box and sends none of
+it — the line breaks become spaces, and nothing goes out until you press `Enter`.
+
+The mouse wheel costs the terminal's own click-drag selection, because a program
+cannot both read the wheel and leave the mouse to the terminal. **`Shift`+drag
+usually reaches the selection underneath** — that is a terminal feature rather
+than something this client controls, and it works in most but not all of them.
+The trade is deliberate: on the alternate screen there is no scrollback to select
+from anyway, so what selection loses is one visible frame and what the wheel
+gains is the whole log.
 
 ### Commands
 
