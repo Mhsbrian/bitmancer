@@ -80,11 +80,30 @@ impl PtyRun {
     }
 }
 
+/// Distinguishes concurrent runs of this helper. The mode alone is not enough:
+/// libtest runs these in parallel within one process, so two tests driving the
+/// same mode would name the same transcript and overwrite each other's — a
+/// failure that appears only under parallelism and only once a mode is used
+/// twice. It was not hypothetical. Extending this file with a second
+/// `panic_guarded` check produced exactly that, and it failed while
+/// `--test-threads=1` passed.
+static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Fresh transcript and termios paths for one run. Separated from the run so the
+/// uniqueness can be asserted directly rather than inferred from a race.
+fn paths_for(mode: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir();
+    let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp = format!("{}-{run}", std::process::id());
+    (
+        dir.join(format!("bitmancer-pty-{mode}-{stamp}.log")),
+        dir.join(format!("bitmancer-tty-{mode}-{stamp}.txt")),
+    )
+}
+
 fn run_in_pty(mode: &str) -> PtyRun {
     let exe = std::env::current_exe().expect("the test binary must know its own path");
-    let dir = std::env::temp_dir();
-    let transcript = dir.join(format!("bitmancer-pty-{mode}-{}.log", std::process::id()));
-    let termios = dir.join(format!("bitmancer-tty-{mode}-{}.txt", std::process::id()));
+    let (transcript, termios) = paths_for(mode);
 
     // Run the child, then sample the pty it was using. Both happen inside the
     // one `script` invocation because the pty does not outlive it.
@@ -241,4 +260,56 @@ fn an_ordinary_quit_still_hands_the_terminal_back() {
         "a clean exit must leave the terminal usable.\nstty: {}",
         run.termios
     );
+}
+
+#[test]
+fn every_run_gets_its_own_transcript_even_on_one_mode() {
+    // The deterministic guard, and the reason it is not a race.
+    //
+    // The path was keyed on mode and process id alone, so two tests driving the
+    // same mode overwrote each other's transcript and the loser read nothing. I
+    // first pinned that by racing two threads on one mode — but with the fix
+    // reverted that caught it in only two runs out of three, because which
+    // caller loses is up to the scheduler. A guard that is right most of the time
+    // is how a flaky test gets introduced while fixing one.
+    //
+    // So assert the invariant instead: same mode, different paths, no processes
+    // and no timing involved.
+    let (first_log, first_tty) = paths_for("panic_guarded");
+    let (second_log, second_tty) = paths_for("panic_guarded");
+
+    assert_ne!(
+        first_log, second_log,
+        "two runs of one mode must not share a transcript path"
+    );
+    assert_ne!(
+        first_tty, second_tty,
+        "two runs of one mode must not share a termios path"
+    );
+}
+
+#[test]
+fn two_concurrent_runs_on_one_mode_both_survive() {
+    // The realistic exercise alongside the invariant above: the actual scenario
+    // that broke, run for real. Not the primary guard — see that test for why —
+    // but it is the shape a future extension of this file will take, and it costs
+    // one more pty.
+    if !pty_available() {
+        eprintln!("skipping: script(1) is unavailable, so no pty can be allocated");
+        return;
+    }
+
+    let runs: Vec<_> = (0..2)
+        .map(|_| std::thread::spawn(|| run_in_pty("panic_guarded")))
+        .collect();
+
+    for (index, handle) in runs.into_iter().enumerate() {
+        let run = handle.join().expect("a pty run must not panic in its thread");
+        assert!(run.panicked(), "concurrent run {index} lost its transcript");
+        assert!(
+            !run.raw_mode_left_on(),
+            "concurrent run {index} must still have restored the terminal.\nstty: {}",
+            run.termios
+        );
+    }
 }
