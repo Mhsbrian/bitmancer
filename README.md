@@ -10,22 +10,15 @@ over the internet, via Nostr relays.
 
 bitmancer speaks both from a terminal.
 
-```
-┌ C H A N N E L ──────────────────────────────────────────┐┌ N A V ────────────┐
-│#9q  ·  33 here                                          ││ ▾ PUBLIC          │
-└─────────────────────────────────────────────────────────┘│   public          │
-┌ L O G ──────────────────────────────────────────────────┐│ ▾ CHANNELS        │
-│22:26     anon7956   Aint it offline? Or are channels    ││▏  #9q             │
-│                     online?                             ││ ▾ PEOPLE          │
-│22:27        huh?*   @anon7956 hell yeah                 ││   6ix             │
-│22:28         6ix* ▣ look at this                        ││   nerdetta        │
-│22:28    nerdetta*   ─── live ───                        ││   huh?            │
-└─────────────────────────────────────────────────────────┘│   anon7956        │
-┌ → #9q ───────────────────────────────────────────────────┐│                  │
-│                                                          ││                  │
-└──────────────────────────────────────────────────────────┘└──────────────────┘
- ⏎ send  /map world  /help  tab pane          geo 1  ·  mesh ◈ 4
-```
+**Bitmancer**
+
+<img width="2734" height="1363" alt="image" src="https://github.com/user-attachments/assets/778cf27e-f42f-4fbe-b09d-848a0cb2b365" />
+
+**World Map**
+
+<img width="2406" height="1102" alt="image" src="https://github.com/user-attachments/assets/66648182-dc0c-4e45-b115-37f495a4538b" />
+
+
 
 ## What it does
 
